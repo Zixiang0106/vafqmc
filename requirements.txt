@@ -1,0 +1,6 @@
+flax
+optax
+pyscf
+ml-collections
+tensorboardX
+
