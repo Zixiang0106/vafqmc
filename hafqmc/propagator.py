@@ -11,8 +11,8 @@ from .utils import parse_bool, ensure_mapping
 from .utils import fix_init
 from .utils import pack_spin, unpack_spin, block_spin
 from .utils import chol_qr
-from .operator import OneBody, AuxField, AuxFieldNet
-from .operator import OneBodyPW, AuxFieldPW
+from .ham_operator import OneBody, AuxField, AuxFieldNet
+from .ham_operator import OneBodyPW, AuxFieldPW
 from .hamiltonian import _make_ghf, _has_spin, Hamiltonian, HamiltonianPW
 
 
