@@ -2,6 +2,7 @@ import time
 import logging
 import jax 
 import optax
+import os
 from jax import numpy as jnp
 from optax._src import alias as optax_alias
 from ml_collections import ConfigDict
@@ -218,7 +219,7 @@ def train(cfg: ConfigDict):
     logger.info("Start training")
     printer.print_header(prefix="# ")
     if not os.path.exists(cfg.log.ckpt_path):
-    os.makedirs(cfg.log.ckpt_path, exist_ok=True)
+      os.makedirs(cfg.log.ckpt_path, exist_ok=True)
     for ii in range(total_iter + 1):
         printer.reset_timer()
         # choose sampler
