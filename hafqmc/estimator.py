@@ -13,6 +13,7 @@ def exp_shifted(x, normalize=None):
     # TODO: and the all_mean is important in stablizing the gradient
     # TODO: it is effectively a centering of gradients
     # TODO: fix this by making it explicit in eval_total
+    # TODO: fix the std penalty
     stblz = paxis.all_max(x) 
     exp = jnp.exp(x - stblz)
     if normalize:
@@ -165,3 +166,92 @@ def make_eval_total(hamil: Hamiltonian, braket: BraKet,
             
     return eval_total
 
+
+#TODO:clean up the code
+def make_rdm_local(hamil: Hamiltonian, braket: BraKet):
+    """Create a function that evaluates the RDM, sign, and log of the overlap."""
+    rdm_fn = hamil.calc_rdm
+    slov_fn = hamil.calc_slov
+
+    def rdm_local(params, fields):
+        """Evaluate the RDM, sign, and log-overlap of the bra and ket."""
+        (bra, bra_lw), (ket, ket_lw) = braket.apply(params, fields)
+        rdm = rdm_fn(bra, ket)
+        sign, logov = slov_fn(bra, ket)
+        return rdm, sign, logov + bra_lw + ket_lw
+
+    return rdm_local
+
+
+def make_rdm_total(hamil: Hamiltonian, braket: BraKet,
+                   default_batch: int = 100, calc_stds: bool = False):
+    """Create a function that evaluates the total RDM from a batch of field configurations."""
+    rdm_local = make_rdm_local(hamil, braket)
+    batch_rdm = jax.vmap(rdm_local, in_axes=(None, 0))
+
+    def check_shape(data):
+        fields, logsw = data
+        if isinstance(fields, jnp.ndarray):
+            fields = (fields,)
+        fshape = braket.fields_shape(len(fields) if braket.trial is None
+                                     else tuple(map(len, fields)))
+        _f0 = jax.tree_util.tree_leaves(fields)[0]
+        _fs0 = jax.tree_util.tree_leaves(fshape)[0]
+        if _f0.ndim != _fs0.size + 2:
+            batch = min(_f0.size // _fs0.prod(), default_batch)
+            fields = tree_map(lambda x, s: x.reshape(-1, batch, *s), fields, fshape)
+            if logsw is not None:
+                logsw = logsw.reshape(-1, batch)
+        return fields, logsw
+    def calc_statistics(rdm, sign, logov, logsw, ebar=None):
+        logsw = logsw if logsw is not None else logov
+        logsw = lax.stop_gradient(logsw)
+        # Stabilize and normalize weights
+        rel_w, lshift = exp_shifted(logov - logsw, normalize="mean")
+        # Expand dimensions for broadcasting
+        rel_w = rel_w[..., None, None]
+        sign = sign[..., None, None]
+        # Weighted accumulation of RDM
+        weighted_rdm = rdm * sign * rel_w
+        # Compute mean across batch dimensions
+        batch_axes = (0, 1)  # Batch dimensions are the first two axes
+        exp_rdm = jnp.mean(weighted_rdm, axis=batch_axes)  # Reduce batch axes only
+        exp_s = jnp.mean(sign * rel_w, axis=batch_axes)    # Reduce batch axes only
+        # Normalize RDM by overlap
+        rdm_tot = exp_rdm / exp_s  # Normalize without additional dimensions
+        # Calculate variance and standard deviation
+        rel_w_sum = jnp.sum(rel_w, axis=batch_axes)
+        mean_rdm = exp_rdm / exp_s
+        var_rdm = jnp.sum(
+            rel_w * (rdm - mean_rdm)**2, axis=batch_axes
+        ) / rel_w_sum
+        std_rdm = jnp.sqrt(var_rdm)
+
+        aux_data = {
+            "rdm_tot": rdm_tot,
+            "exp_rdm": exp_rdm,
+            "exp_s": exp_s,
+            "log_shift": lshift,
+            "std_rdm": std_rdm,  # Include standard deviation in auxiliary data
+        }
+
+        if calc_stds:
+            var_s = jnp.mean(jnp.abs(sign - exp_s / rel_w_sum)**2 * rel_w, axis=batch_axes)
+            aux_data.update(std_s=jnp.sqrt(var_s))
+
+        return rdm_tot, aux_data
+
+    def rdm_total(params, data, ebar=None):
+        """Evaluate the total RDM and auxiliary data from batched field configurations."""
+        data = check_shape(data)
+        fields, logsw = data
+        rdm_fn = partial(batch_rdm, params)
+
+        if jax.tree_util.tree_leaves(fields)[0].shape[0] > 1:
+            rdm_fn = jax.checkpoint(rdm_fn, prevent_cse=False)
+        # Execute RDM computation
+        rdm, sign, logov = lax.map(rdm_fn, fields)
+        # Calculate statistics
+        rdm_tot, aux_data = calc_statistics(rdm, sign, logov, logsw, ebar)
+        return rdm_tot, aux_data
+    return rdm_total

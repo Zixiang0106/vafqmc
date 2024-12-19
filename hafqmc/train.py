@@ -12,11 +12,42 @@ from typing import NamedTuple
 from .molecule import build_mf
 from .hamiltonian import Hamiltonian, HamiltonianPW
 from .ansatz import Ansatz, BraKet
-from .estimator import make_eval_total
+from .estimator import make_eval_total, make_rdm_total
 from .sampler import make_sampler, make_multistep, make_batched, SamplerUnion
 from .utils import ensure_mapping, save_pickle, load_pickle, Printer, cfg_to_yaml
 from .utils import make_moving_avg, PyTree, tree_map
 
+def load_rdm(filepath):
+    """
+    Load a density matrix from a file and infer its size.
+
+    Parameters:
+        filepath (str): Path to the file containing the density matrix data.
+
+    Returns:
+        jnp.ndarray: The loaded density matrix as a complex-valued JAX array.
+    """
+    with open(filepath, "r") as file:
+        lines = file.readlines()
+    
+    # Infer L from the total number of lines (L^2 entries)
+    total_entries = len(lines)
+    L = int(total_entries**0.5)
+    if L * L != total_entries:
+        raise ValueError("The number of lines in the file does not correspond to a valid square matrix.")
+
+    # Initialize the density matrix
+    density_matrix = jnp.zeros((L, L), dtype=jnp.complex128)
+
+    # Populate the density matrix
+    entries = []
+    for line in lines:
+        numbers = line.split()
+        numbers_float = list(map(float, numbers))
+        entries.append(complex(numbers_float[0], numbers_float[1]))
+
+    density_matrix = jnp.array(entries).reshape((L, L))
+    return density_matrix
 
 def lower_penalty(s, factor=1., target=1., power=2.):
     return factor * jnp.maximum(target - s, 0) ** power
@@ -39,9 +70,10 @@ def make_lr_schedule(start=1e-4, decay=1., delay=1e4):
     return lambda t: start * jnp.power((1.0 / (1.0 + (t/delay))), decay)
 
 
-def make_loss(expect_fn, 
+def make_loss(expect_fn, rdm_fn,
               sign_factor=0., sign_target=1., sign_power=2.,
-              std_factor=0., std_target=1., std_power=2):
+              std_factor=0., std_target=1., std_power=2,
+              rdm_factor=0., rdm_power=2, rdm_target_path=None, rdm_loss_type="all"):
 
     def loss(params, data, *extra, **kwargs):
         e_tot, aux = expect_fn(params, data, *extra, **kwargs)
@@ -52,6 +84,29 @@ def make_loss(expect_fn,
         if std_factor > 0:
             std_es = aux["std_es"]
             loss += upper_penalty(std_es, std_factor, std_target, std_power)
+        if rdm_factor > 0 and rdm_target is not None:
+            expect_rdm, aux_rdm = rdm_fn(params, data, *extra, **kwargs)
+            rdm_target = load_rdm(rdm_target_path)
+            sample_size = data[0][0].shape[0]
+            rdm_error = aux_rdm["std_rdm"] / jnp.sqrt(sample_size)
+            if rdm_loss_type == "all":
+                rdm_loss = rdm_factor*((expect_rdm - rdm_target)**rdm_power).sum()
+                rdm_loss_error = rdm_factor * (rdm_power * ((expect_rdm - rdm_target) ** (rdm_power - 1)) * rdm_error).sum()
+            elif rdm_loss_type == "Frobenius":
+                rdm_diff = expect_rdm - rdm_target
+                rdm_loss = rdm_factor * (np.linalg.norm(rdm_diff, 'fro') ** rdm_power)
+                rdm_loss_error = rdm_factor * rdm_power * np.sum((rdm_diff / np.linalg.norm(rdm_diff, 'fro')) * rdm_error)
+            elif rdm_loss_type == "trace":
+                rdm_diff = expect_rdm - rdm_target
+                rdm_loss = rdm_factor * (np.trace(rdm_diff @ rdm_diff.T) ** (rdm_power / 2))
+                rdm_loss_error = (rdm_factor
+                               * (rdm_power / 2)
+                               * np.trace((rdm_diff @ rdm_diff.T) ** ((rdm_power / 2) - 1) @ (2 * rdm_diff * rdm_error)))
+            else:
+                raise ValueError("Invalid rdm_loss_type. Choose 'all', 'Frobenius' or 'trace'.")
+            aux['rdm_loss'] = rdm_loss
+            aux['rdm_loss_err'] = rdm_loss_error
+            loss += rdm_loss
         return loss, aux
          
     return loss
@@ -174,7 +229,9 @@ def train(cfg: ConfigDict):
         **ensure_mapping(cfg.optim.optimizer, default_key="name"))
     expect_fn = make_eval_total(hamiltonian, braket, 
         default_batch=eval_batch, calc_stds=True)
-    loss_fn = make_loss(expect_fn, **cfg.loss)
+    rdm_fn = make_rdm_total(hamiltonian, braket, 
+        default_batch=eval_batch, calc_stds=True)
+    loss_fn = make_loss(expect_fn, rdm_fn, **cfg.loss)
     loss_and_grad = jax.value_and_grad(loss_fn, has_aux=True)
     moving_avg_fn = (make_moving_avg(**cfg.optim.baseline)
         if cfg.optim.baseline is not None else None)

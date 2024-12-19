@@ -99,6 +99,10 @@ def default() -> ConfigDict:
             "std_factor": 0.,
             "std_target": 100.,
             "std_power": 2.,
+            "rdm_factor": 1.,
+            "rdm_power": 2.,
+            "rdm_target_path": None,
+            "rdm_loss_type": "all", #{"all", 'Frobenius', "trace"}
         },
         "optim": {
             "batch": None,
