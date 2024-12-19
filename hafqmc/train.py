@@ -37,14 +37,14 @@ def load_rdm(filepath):
         raise ValueError("The number of lines in the file does not correspond to a valid square matrix.")
 
     # Initialize the density matrix
-    density_matrix = jnp.zeros((L, L), dtype=jnp.complex128)
+    density_matrix = jnp.zeros((L, L), dtype=jnp.float64)
 
     # Populate the density matrix
     entries = []
     for line in lines:
         numbers = line.split()
         numbers_float = list(map(float, numbers))
-        entries.append(complex(numbers_float[0], numbers_float[1]))
+        entries.append(numbers_float[0])
 
     density_matrix = jnp.array(entries).reshape((L, L))
     return density_matrix
@@ -84,28 +84,28 @@ def make_loss(expect_fn, rdm_fn,
         if std_factor > 0:
             std_es = aux["std_es"]
             loss += upper_penalty(std_es, std_factor, std_target, std_power)
-        if rdm_factor > 0 and rdm_target is not None:
+        if rdm_factor > 0 and rdm_target_path is not None:
             expect_rdm, aux_rdm = rdm_fn(params, data, *extra, **kwargs)
             rdm_target = load_rdm(rdm_target_path)
             sample_size = data[0][0].shape[0]
             rdm_error = aux_rdm["std_rdm"] / jnp.sqrt(sample_size)
             if rdm_loss_type == "all":
                 rdm_loss = rdm_factor*((expect_rdm - rdm_target)**rdm_power).sum()
-                rdm_loss_error = rdm_factor * (rdm_power * ((expect_rdm - rdm_target) ** (rdm_power - 1)) * rdm_error).sum()
+               # rdm_loss_error = rdm_factor * (rdm_power * ((expect_rdm - rdm_target) ** (rdm_power - 1)) * rdm_error).sum()
             elif rdm_loss_type == "Frobenius":
                 rdm_diff = expect_rdm - rdm_target
-                rdm_loss = rdm_factor * (np.linalg.norm(rdm_diff, 'fro') ** rdm_power)
-                rdm_loss_error = rdm_factor * rdm_power * np.sum((rdm_diff / np.linalg.norm(rdm_diff, 'fro')) * rdm_error)
+                rdm_loss = rdm_factor * (jnp.linalg.norm(rdm_diff, 'fro') ** rdm_power)
+              #  rdm_loss_error = rdm_factor * rdm_power * jnp.sum((rdm_diff / jnp.linalg.norm(rdm_diff, 'fro')) * rdm_error)
             elif rdm_loss_type == "trace":
                 rdm_diff = expect_rdm - rdm_target
-                rdm_loss = rdm_factor * (np.trace(rdm_diff @ rdm_diff.T) ** (rdm_power / 2))
-                rdm_loss_error = (rdm_factor
-                               * (rdm_power / 2)
-                               * np.trace((rdm_diff @ rdm_diff.T) ** ((rdm_power / 2) - 1) @ (2 * rdm_diff * rdm_error)))
+                rdm_loss = rdm_factor * (jnp.trace(rdm_diff @ rdm_diff.T) ** (rdm_power / 2))
+            #    rdm_loss_error = (rdm_factor
+             #                  * (rdm_power / 2)
+             #                  * jnp.trace((rdm_diff @ rdm_diff.T) ** ((rdm_power / 2) - 1) @ (2 * rdm_diff * rdm_error)))
             else:
                 raise ValueError("Invalid rdm_loss_type. Choose 'all', 'Frobenius' or 'trace'.")
             aux['rdm_loss'] = rdm_loss
-            aux['rdm_loss_err'] = rdm_loss_error
+          #  aux['rdm_loss_err'] = rdm_loss_error
             loss += rdm_loss
         return loss, aux
          
@@ -161,7 +161,7 @@ def train(cfg: ConfigDict):
     logger.setLevel(log_level)
     writer = SummaryWriter(cfg.log.stat_path)
     print_fields = {"step": "", "loss": ".4f", "e_tot": ".4f", 
-                    "exp_es": ".4f", "exp_s": ".4f"}
+                    "exp_es": ".4f", "exp_s": ".4f", "rdm_loss": ".4f"}
     if cfg.loss.std_factor >= 0:
         print_fields.update({"std_es": ".4f", "std_s": ".4f"})
     print_fields["lr"] = ".1e"

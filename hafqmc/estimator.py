@@ -117,7 +117,7 @@ def make_eval_total(hamil: Hamiltonian, braket: BraKet,
         rel_w, lshift = exp_shifted(logov - logsw, normalize="mean")
         exp_es = paxis.all_mean((eloc * sign) * rel_w)
         exp_s = paxis.all_mean(sign * rel_w)
-        etot = exp_es.real / exp_s.real
+        etot = (exp_es / exp_s).real
         aux_data = {"e_tot": etot, 
                     "exp_es": exp_es.real, 
                     "exp_s": exp_s.real,
@@ -218,13 +218,13 @@ def make_rdm_total(hamil: Hamiltonian, braket: BraKet,
         exp_rdm = jnp.mean(weighted_rdm, axis=batch_axes)  # Reduce batch axes only
         exp_s = jnp.mean(sign * rel_w, axis=batch_axes)    # Reduce batch axes only
         # Normalize RDM by overlap
-        rdm_tot = exp_rdm / exp_s  # Normalize without additional dimensions
+        rdm_tot = (exp_rdm / exp_s).real  # Normalize without additional dimensions
         # Calculate variance and standard deviation
         rel_w_sum = jnp.sum(rel_w, axis=batch_axes)
         mean_rdm = exp_rdm / exp_s
-        var_rdm = jnp.sum(
+        var_rdm = (jnp.sum(
             rel_w * (rdm - mean_rdm)**2, axis=batch_axes
-        ) / rel_w_sum
+        ) / rel_w_sum).real
         std_rdm = jnp.sqrt(var_rdm)
 
         aux_data = {
