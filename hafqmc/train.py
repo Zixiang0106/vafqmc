@@ -10,7 +10,7 @@ from tensorboardX import SummaryWriter
 from typing import NamedTuple
 
 from .molecule import build_mf
-from .hamiltonian import Hamiltonian, HamiltonianPW
+from .hamiltonian import Hamiltonian, HamiltonianPW, Hamiltonian_sym
 from .ansatz import Ansatz, BraKet
 from .estimator import make_eval_total
 from .sampler import make_sampler, make_multistep, make_batched, SamplerUnion
@@ -146,7 +146,8 @@ def train(cfg: ConfigDict):
     else:
         logger.info("Loading Hamiltonian from saved file")
         hamil_data = load_pickle(cfg.restart.hamiltonian)
-        HamCls = Hamiltonian if len(hamil_data) <= 5 else HamiltonianPW
+        #HamCls = Hamiltonian if len(hamil_data) <= 5 else HamiltonianPW
+        HamCls = Hamiltonian_sym
         hamiltonian = HamCls(*hamil_data)
         print(f"# HF energy from loaded: {hamiltonian.local_energy()}")
 

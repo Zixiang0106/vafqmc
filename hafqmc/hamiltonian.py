@@ -353,6 +353,129 @@ class Hamiltonian:
         return cls(*ints, wfn0, aux, full_eri=full_eri)
 
 
+class Hamiltonian_sym:
+
+    def __init__(self, h1e, ceri, enuc, wfn0, aux=None, *, full_eri=False):
+        self.h1e = jnp.asarray(h1e)
+        self.ceri = jnp.asarray(ceri)
+        self._eri = jnp.einsum("kpr,kqs->prqs", ceri, ceri) if full_eri else None
+        self.enuc = enuc
+        self.wfn0 = tree_map(jnp.asarray, wfn0)
+        self.aux = aux if aux is not None else {}
+        self.nbasis = self.h1e.shape[-1]
+
+    def calc_e1b(self, rdm):
+        return calc_e1b(self.h1e, rdm)
+    
+    def calc_e2b(self, rdm):
+        eri = self.ceri if self._eri is None else self._eri
+        return calc_e2b(eri, rdm)
+    
+    def calc_e2b_opt(self, bra, theta):
+        return calc_e2b_opt(self.ceri, bra, theta)
+
+    calc_ovlp  = staticmethod(calc_ovlp)
+    calc_slov  = staticmethod(calc_slov)
+    calc_rdm   = staticmethod(calc_rdm)
+    calc_theta = staticmethod(calc_theta)
+
+    def local_energy(self, bra=None, ket=None, optimize=True):
+        """the normalized energy from two slater determinants"""
+        bra = bra if bra is not None else self.wfn0
+        ket = ket if ket is not None else self.wfn0
+        le_fn = (self.local_energy_opt 
+            if optimize and self._eri is None else self.local_energy_raw)
+        return le_fn(bra, ket)
+
+    def local_energy_raw(self, bra, ket):
+        rdm = calc_rdm(bra, ket)
+        return self.enuc + self.calc_e1b(rdm) + self.calc_e2b(rdm)
+    
+    def local_energy_opt(self, bra, ket):
+        bra, ket = _align_wfn(bra, ket)
+        theta = calc_theta(bra, ket)
+        rdm = calc_rdm_opt(bra, theta)
+        return self.enuc + self.calc_e1b(rdm) + self.calc_e2b_opt(bra, theta)
+
+    def make_proj_op(self, trial):
+        """generate the modified hmf, vhs and enuc for projection"""
+        eri = self.ceri if self._eri is None else self._eri
+        hmf_raw = self.h1e - 0.5 * calc_v0(eri)
+        vhs_raw = self.ceri # vhs is real here, will time 1j in propagator
+        if trial is None:
+            return hmf_raw, vhs_raw, self.enuc
+        rdm_t = calc_rdm(trial, trial)
+        if rdm_t.ndim == 3:
+            rdm_t = rdm_t.sum(0)
+        vbar = jnp.einsum("kpq,pq->k", vhs_raw, rdm_t)
+        enuc = self.enuc - 0.5 * (vbar**2).sum()
+        hmf = hmf_raw + jnp.einsum('kpq,k->pq', vhs_raw, vbar)
+        vhs = vhs_raw - vbar.reshape(-1,1,1) * jnp.eye(vhs_raw.shape[-1]) / rdm_t.trace()
+        return hmf, vhs, enuc
+    
+    def make_proj_op_sym(self, trial):
+        """generate the modified hmf, vhs and enuc for projection, vhs is diagonal"""
+        eri = self.ceri if self._eri is None else self._eri
+        hmf_raw = self.h1e - 0.5 * calc_v0(eri)
+        vhs_raw = self.ceri # vhs is real here, will time 1j in propagator
+        if trial is None:
+            # take diagonal elements as Jastrow initial
+            vhs_raw_dia = jnp.array ([jnp.diag (vhs_raw [i]) for i in range (vhs_raw.shape [0])])
+            return hmf_raw, vhs_raw_dia, self.enuc
+        rdm_t = calc_rdm(trial, trial)
+        if rdm_t.ndim == 3:
+            rdm_t = rdm_t.sum(0)
+        vbar = jnp.einsum("kpq,pq->k", vhs_raw, rdm_t)
+        enuc = self.enuc - 0.5 * (vbar**2).sum()
+        hmf = hmf_raw + jnp.einsum('kpq,k->pq', vhs_raw, vbar)
+        vhs = vhs_raw - vbar.reshape(-1,1,1) * jnp.eye(vhs_raw.shape[-1]) / rdm_t.trace()
+        # take diagonal elements as Jastrow initial
+        vhs_dia = jnp.array ([jnp.diag (vhs [i]) for i in range (vhs.shape [0])])
+        return hmf, vhs_dia, enuc
+
+    def make_ccsd_op(self):
+        """generate hmf, vhs and corresponding masks from ccsd amps"""
+        if "cc_t1" not in self.aux:
+            raise ValueError("cc data not found in hamiltonian")
+        t1, t2 = self.aux["cc_t1"], self.aux["cc_t2"]
+        t1 = t1[0] if isinstance(t1, tuple) else t1
+        t2 = t2[0] if isinstance(t2, tuple) else t2
+        nocc, nvir = t1.shape
+        noxv = nocc * nvir
+        nbas = nocc + nvir
+        hmf = jnp.zeros((nbas, nbas)).at[nocc:, :nocc].set(t1.swapaxes(0,1))
+        evs, vecs = jnp.linalg.eigh(t2.swapaxes(1,2).reshape(noxv, noxv))
+        tmpv = (jnp.sqrt(evs + 0j) * vecs).T.reshape(noxv, nocc, nvir)
+        vhs = jnp.zeros((noxv, nbas, nbas), tmpv.dtype)
+        vhs = vhs.at[:, nocc:, :nocc].set(tmpv.swapaxes(-1, -2))
+        mask = jnp.zeros((nbas, nbas), bool).at[nocc:, :nocc].set(True)
+        return hmf, vhs, mask
+    
+    def to_tuple(self):
+        return (self.h1e, self.ceri, self.enuc, self.wfn0, self.aux)
+
+    @classmethod
+    def from_pyscf(cls, mol_or_mf,
+                   chol_cut=1e-6, orth_ao=None, full_eri=False, 
+                   with_cc=False, with_ghf=False):
+        if not hasattr(mol_or_mf, "mo_coeff"):
+            mf = mol_or_mf.HF().run()
+        else:
+            mf = mol_or_mf
+        orth_mat = get_orth_ao(mf, orth_ao)
+        aux = {"orth_mat": orth_mat}
+        if with_cc:
+            assert orth_ao is None, "only support MO basis for CCSD amplitudes"
+            mcc = with_cc if hasattr(with_cc, "t1") else mf.CCSD().run()
+            aux.update(cc_t1=mcc.t1, cc_t2=mcc.t2)
+        if with_ghf:
+            mghf = with_ghf if hasattr(with_ghf, "mo_coeff") else solve_ghf(mf.mol)
+            aux.update(ghf_wfn=initwfn_from_ghf(mghf, mf, orth_mat))
+        ints = integrals_from_scf(mf, 
+            use_mcd=True, chol_cut=chol_cut, orth_ao=orth_mat)
+        wfn0 = initwfn_from_scf(mf, orth_mat)
+        return cls(*ints, wfn0, aux, full_eri=full_eri)
+        
 # below are methods for plane wave UEG calculations
 from .utils import symrange, rawcorr, fftconvolve
 

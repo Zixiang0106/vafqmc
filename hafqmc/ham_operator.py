@@ -72,16 +72,17 @@ class AuxField(nn.Module):
     def __call__(self, step, fields, curr_wfn=None):
         vhs = symmetrize(self.vhs) if self.hermite_out else self.vhs
         log_weight = - 0.5 * (fields ** 2).sum()
-        if self.trial_rdm is not None:
-            vhs, vbar0 = meanfield_subtract(vhs, self.trial_rdm)
-            fields += step * vbar0
-        # this dynamic shift is buggy, keep it here for reference
-        if curr_wfn is not None and self.trial_wfn is not None:
-            trdm = calc_rdm(self.trial_wfn, curr_wfn)
-            _, vbar = meanfield_subtract(vhs, lax.stop_gradient(trdm), 0.1)
-            fshift = step * vbar
-            log_weight += - fields @ fshift - 0.5 * (fshift ** 2).sum()
-            fields += fshift
+        if (isinstance(self.expm_option, (list, tuple)) and len(self.expm_option) > 0 and self.expm_option[0] != "diag"):
+          if self.trial_rdm is not None:
+              vhs, vbar0 = meanfield_subtract(vhs, self.trial_rdm)
+              fields += step * vbar0
+          # this dynamic shift is buggy, keep it here for reference
+          if curr_wfn is not None and self.trial_wfn is not None:
+              trdm = calc_rdm(self.trial_wfn, curr_wfn)
+              _, vbar = meanfield_subtract(vhs, lax.stop_gradient(trdm), 0.1)
+              fshift = step * vbar
+              log_weight += - fields @ fshift - 0.5 * (fshift ** 2).sum()
+              fields += fshift
         vhs_sum = jnp.tensordot(fields, vhs, axes=1)
         vhs_sum = cmult(step, vhs_sum)
         return vhs_sum, log_weight
