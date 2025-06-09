@@ -55,22 +55,18 @@ class Propagator(nn.Module):
             **init_kwargs):
         # prepare data
         twfn = hamiltonian.wfn0
-        if (isinstance(expm_option, (list, tuple)) and len(expm_option) > 0 and expm_option[0] == "diag"):
-            init_hmf, init_vhs, init_enuc = hamiltonian.make_proj_op_sym(twfn)
-        else:
-            init_hmf, init_vhs, init_enuc = hamiltonian.make_proj_op(twfn)
+        init_hmf, init_vhs, init_enuc = hamiltonian.make_proj_op_sym(twfn)
         if max_nhs is not None:
             init_vhs = init_vhs[:max_nhs]
         if spin_mixing:
             ptb = (spin_mixing 
                 if isinstance(spin_mixing, (float, complex)) else 0.01)
             init_hmf = block_spin(init_hmf, init_hmf, ptb)
-            # 判断 expm_option
-            if (isinstance(expm_option, (list, tuple)) and len(expm_option) > 0 and expm_option[0] == "diag"):
-                init_vhs = jnp.array([jnp.concatenate((init_vhs[i], init_vhs[i])) for i in range(init_vhs.shape[0])])
-            else:
-                init_vhs = jax.vmap(block_spin, (0,0,None))(init_vhs, init_vhs, ptb)
+            ##################################
+            init_vhs = jnp.array ([jnp.concatenate((init_vhs[i], init_vhs[i])) for i in range (init_vhs.shape [0])])
+            # init_vhs = jax.vmap(block_spin, (0,0,None))(init_vhs, init_vhs, ptb)
             print("init_vhs in make_proj_op: ", init_vhs.shape)
+            ##################################
             twfn = _make_ghf(twfn)
         mfwfn = twfn if mf_subtract else None
         # handle parameter options

@@ -12,6 +12,7 @@ import pickle
 import time
 
 
+
 _t_real = jnp.float64
 _t_cplx = jnp.complex128
 
@@ -476,6 +477,7 @@ def rawcorr(in1, in2, mode='full', *, precision=None):
     result = lax.conv_general_dilated(in1[None, None], in2[None, None], strides,
                                                                         padding, precision=precision)
     return result[0, 0]
+
 
 
 import os

@@ -146,8 +146,8 @@ def train(cfg: ConfigDict):
     else:
         logger.info("Loading Hamiltonian from saved file")
         hamil_data = load_pickle(cfg.restart.hamiltonian)
-        #HamCls = Hamiltonian if len(hamil_data) <= 5 else HamiltonianPW
-        HamCls = Hamiltonian_sym
+        # HamCls = Hamiltonian if len(hamil_data) <= 5 else HamiltonianPW
+        HamCls = Hamiltonian_sym 
         hamiltonian = HamCls(*hamil_data)
         print(f"# HF energy from loaded: {hamiltonian.local_energy()}")
 
@@ -219,8 +219,6 @@ def train(cfg: ConfigDict):
     # the actual training iteration
     logger.info("Start training")
     printer.print_header(prefix="# ")
-    if not os.path.exists(cfg.log.ckpt_path):
-      os.makedirs(cfg.log.ckpt_path, exist_ok=True)
     for ii in range(total_iter + 1):
         printer.reset_timer()
         # choose sampler
@@ -239,8 +237,7 @@ def train(cfg: ConfigDict):
             printer.print_fields({"step": ii, "loss": loss, **aux, "lr": _lr})
             writer.add_scalars("stat", {"loss": loss, **aux, "lr": _lr}, global_step=ii)
         if ii % cfg.log.ckpt_freq == 0:
-            checkpoint_filename = f"./{cfg.log.ckpt_path}/ckpt_{ii}.pkl"
-            save_pickle(checkpoint_filename, (key, tuple(train_state)))
+            save_pickle(cfg.log.ckpt_path, (key, tuple(train_state)))
     writer.close()
     
     return train_state

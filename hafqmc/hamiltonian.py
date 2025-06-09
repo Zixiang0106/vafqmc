@@ -475,7 +475,7 @@ class Hamiltonian_sym:
             use_mcd=True, chol_cut=chol_cut, orth_ao=orth_mat)
         wfn0 = initwfn_from_scf(mf, orth_mat)
         return cls(*ints, wfn0, aux, full_eri=full_eri)
-        
+    
 # below are methods for plane wave UEG calculations
 from .utils import symrange, rawcorr, fftconvolve
 
