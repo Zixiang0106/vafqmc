@@ -98,3 +98,4 @@ class BraKet(nn.Module):
         (bra, bra_lw), (ket, ket_lw) = self(fields)
         sign, logov = calc_slov(bra, ket)
         return sign, logov + bra_lw + ket_lw
+

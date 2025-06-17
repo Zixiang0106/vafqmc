@@ -2,7 +2,6 @@ import time
 import logging
 import jax 
 import optax
-import os
 from jax import numpy as jnp
 from optax._src import alias as optax_alias
 from ml_collections import ConfigDict
@@ -10,7 +9,7 @@ from tensorboardX import SummaryWriter
 from typing import NamedTuple
 
 from .molecule import build_mf
-from .hamiltonian import Hamiltonian, HamiltonianPW, Hamiltonian_sym
+from .hamiltonian import Hamiltonian, Hamiltonian_sym, HamiltonianPW
 from .ansatz import Ansatz, BraKet
 from .estimator import make_eval_total
 from .sampler import make_sampler, make_multistep, make_batched, SamplerUnion
