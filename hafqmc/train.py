@@ -1,4 +1,3 @@
-import time
 import logging
 import jax 
 import optax
@@ -16,6 +15,7 @@ from .estimator import make_eval_total
 from .sampler import make_sampler, make_multistep, make_batched, SamplerUnion
 from .utils import ensure_mapping, save_pickle, load_pickle, Printer, cfg_to_yaml
 from .utils import make_moving_avg, PyTree, tree_map
+from flax import jax_utils
 
 
 def lower_penalty(s, factor=1., target=1., power=2.):
@@ -84,6 +84,30 @@ def make_training_step(loss_and_grad, mc_sampler, optimizer, accumulator=None):
     return step
 
 
+def make_training_step_pmap(loss_and_grad, mc_sampler, optimizer, accumulator=None):
+    #multi-gpu training step
+    is_union = isinstance(mc_sampler, SamplerUnion)
+
+    def step(key, train_state, sample_flag=None):
+        ii, params, mc_state, opt_state, ebar = train_state
+        sampler = mc_sampler.switch(sample_flag) if is_union else mc_sampler
+        mc_state = sampler.refresh(mc_state, params)
+        mc_state, data = sampler.sample(key, params, mc_state)
+        (loss, aux), grads = loss_and_grad(params, data, ebar)
+        grads = tree_map(jnp.conj, grads) # for complex parameters
+        
+        # sync grads in multi-gpu environment
+        grads = jax.lax.pmean(grads, axis_name="device")
+        
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        if accumulator is not None: ebar = accumulator(ebar, aux["e_tot"], ii)
+        new_state = TrainingState(ii+1, params, mc_state, opt_state, ebar)
+        return new_state, (loss, aux)
+
+    return step
+
+
 def make_evaluation_step(expect_fn, mc_sampler):
     is_union = isinstance(mc_sampler, SamplerUnion)
     
@@ -104,6 +128,16 @@ def train(cfg: ConfigDict):
     logger = logging.getLogger("train")
     log_level = getattr(logging, cfg.log.level.upper())
     logger.setLevel(log_level)
+    n_devices = jax.local_device_count()
+    is_multi_gpu = n_devices > 1
+    
+    if is_multi_gpu:
+        n_gpu_devices = jax.local_device_count("gpu")
+        logger.info(f"JAX detected {n_devices} local devices")
+        logger.info(f"Running on {n_gpu_devices} GPUs with pmap for data parallelism")
+    else:
+        logger.info("Running on single device")
+    
     writer = SummaryWriter(cfg.log.stat_path)
     print_fields = {"step": "", "loss": ".4f", "e_tot": ".4f", 
                     "exp_es": ".4f", "exp_s": ".4f"}
@@ -119,6 +153,16 @@ def train(cfg: ConfigDict):
     total_iter = cfg.optim.iteration
     sample_size = cfg.sample.size
     sample_batch = cfg.sample.batch
+    
+    if is_multi_gpu:
+        local_batch = sample_batch // n_devices
+        if sample_batch % n_devices != 0:
+            logger.warning(f"Batch size {sample_batch} not divisible by {n_devices} devices, "
+                         f"adjusting to {local_batch * n_devices}")
+            sample_batch = local_batch * n_devices
+    else:
+        local_batch = sample_batch
+    
     if sample_size % sample_batch != 0:
         logger.warning("Sample size not divisible by batch size, rounding up")
     sample_step = -(-sample_size // sample_batch)
@@ -146,7 +190,6 @@ def train(cfg: ConfigDict):
     else:
         logger.info("Loading Hamiltonian from saved file")
         hamil_data = load_pickle(cfg.restart.hamiltonian)
-        #HamCls = Hamiltonian if len(hamil_data) <= 5 else HamiltonianPW
         HamCls = Hamiltonian_sym
         hamiltonian = HamCls(*hamil_data)
         print(f"# HF energy from loaded: {hamiltonian.local_energy()}")
@@ -159,6 +202,7 @@ def train(cfg: ConfigDict):
                     cfg.trial.lower() in ("same", "share", "ansatz")
              else Ansatz.create(hamiltonian, **cfg.trial))
     braket = BraKet(ansatz, trial)
+    
     if (sample_prop is None or isinstance(sample_prop, int)
       or (isinstance(sample_prop, (tuple, list)) and len(sample_prop) == 2)):
         sampler_1s_1c = make_sampler(braket, max_prop=sample_prop,
@@ -168,24 +212,34 @@ def train(cfg: ConfigDict):
             mp: make_sampler(braket, max_prop=mp,
                 **ensure_mapping(cfg.sample.sampler, default_key="name"))
             for mp in sample_prop})
-    sampler_1s_nc = make_batched(sampler_1s_1c, sample_batch, concat=False)
+    
+    sampler_1s_nc = make_batched(sampler_1s_1c, local_batch if is_multi_gpu else sample_batch, concat=False)
     mc_sampler = make_multistep(sampler_1s_nc, sample_step, concat=True)
     lr_schedule = make_lr_schedule(**cfg.optim.lr)
     optimizer = make_optimizer(lr_schedule=lr_schedule, grad_clip=cfg.optim.grad_clip,
         **ensure_mapping(cfg.optim.optimizer, default_key="name"))
-    expect_fn = make_eval_total(hamiltonian, braket, 
+    assert eval_batch % n_devices == 0, f"Eval batch size {eval_batch} must be divisible by {n_devices} devices"
+    eval_batch = eval_batch // n_devices
+    expect_fn = make_eval_total(hamiltonian, braket,
         default_batch=eval_batch, calc_stds=True)
     loss_fn = make_loss(expect_fn, **cfg.loss)
     loss_and_grad = jax.value_and_grad(loss_fn, has_aux=True)
     moving_avg_fn = (make_moving_avg(**cfg.optim.baseline)
         if cfg.optim.baseline is not None else None)
 
-    # the core training iteration, to be pmaped
+    # the core training iteration
     if cfg.optim.lr.start > 0:
-        train_step = make_training_step(loss_and_grad, mc_sampler, optimizer, moving_avg_fn)
+        if is_multi_gpu:
+            train_step = make_training_step_pmap(loss_and_grad, mc_sampler, optimizer, moving_avg_fn)
+        else:
+            train_step = make_training_step(loss_and_grad, mc_sampler, optimizer, moving_avg_fn)
     else:
         train_step = make_evaluation_step(expect_fn, mc_sampler)
-    train_step = jax.jit(train_step, static_argnames="sample_flag")
+    
+    if is_multi_gpu:
+        train_step = jax.pmap(train_step, axis_name="device", static_broadcasted_argnums=(2,))
+    else:
+        train_step = jax.jit(train_step, static_argnums=(2,))
     
     # set up all states
     if cfg.restart.states is None:
@@ -193,6 +247,7 @@ def train(cfg: ConfigDict):
         key = jax.random.PRNGKey(cfg.seed)
         key, pakey, mckey = jax.random.split(key, 3)
         fshape = braket.fields_shape()
+        
         if cfg.restart.params is None:
             params = jax.jit(braket.init)(pakey, tree_map(jnp.zeros, fshape))
         else:
@@ -200,14 +255,20 @@ def train(cfg: ConfigDict):
             params = load_pickle(cfg.restart.params)
             if isinstance(params, tuple): params = params[1]
             if isinstance(params, tuple): params = params[1]
+        
         mc_state = mc_sampler.init(mckey, params)
         opt_state = optimizer.init(params)
+        
         if cfg.sample.burn_in > 0:
             logger.info(f"Burning in the sampler for {cfg.sample.burn_in} steps")
             key, subkey = jax.random.split(key)
             mc_state = sampler_1s_nc.burn_in(subkey, params, mc_state, cfg.sample.burn_in)
+        
         ebar = hamiltonian.local_energy() if cfg.optim.baseline is not None else None
         train_state = TrainingState(0, params, mc_state, opt_state, ebar)
+        
+        if is_multi_gpu:
+            train_state = jax_utils.replicate(train_state)
     else:
         logger.info("Loading parameters and states from saved file")
         key, *rest = load_pickle(cfg.restart.states)
@@ -215,32 +276,66 @@ def train(cfg: ConfigDict):
         if len(rest) < 5 and cfg.optim.baseline is not None:
             rest = (*rest, hamiltonian.local_energy())
         train_state = TrainingState(*rest)
+        
+        if is_multi_gpu:
+            train_state = jax_utils.replicate(train_state)
 
+    if is_multi_gpu:
+        keys = jax.random.split(key, n_devices)
+    
     # the actual training iteration
     logger.info("Start training")
     printer.print_header(prefix="# ")
     if not os.path.exists(cfg.log.ckpt_path):
-      os.makedirs(cfg.log.ckpt_path, exist_ok=True)
+        os.makedirs(cfg.log.ckpt_path, exist_ok=True)
+    
     for ii in range(total_iter + 1):
         printer.reset_timer()
+        
         # choose sampler
         sflag = None
         if not (sample_prop is None or isinstance(sample_prop, int)):
-            key, flagkey = jax.random.split(key)
+            if is_multi_gpu:
+                keys = jax.vmap(lambda k: jax.random.split(k, 2))(keys)
+                keys, flagkeys = keys[:, 0], keys[:, 1]
+                flagkey = flagkeys[0] 
+            else:
+                key, flagkey = jax.random.split(key)
             sflag = sample_prop[jax.random.choice(flagkey, len(sample_prop))]
+        
         # core training step
-        key, subkey = jax.random.split(key)
-        train_state, (loss, aux) = train_step(subkey, train_state, sample_flag=sflag)
-        # logging anc checkpointing
+        if is_multi_gpu:
+            keys = jax.vmap(lambda k: jax.random.split(k, 2))(keys)
+            subkeys, keys = keys[:, 0], keys[:, 1]
+            train_state, (loss, aux) = train_step(subkeys, train_state, sflag)
+            loss = float(loss[0])
+            aux = jax.tree_map(lambda x: float(x[0]) if jnp.isscalar(x[0]) else x[0], aux)
+        else:
+            key, subkey = jax.random.split(key)
+            train_state, (loss, aux) = train_step(subkey, train_state, sample_flag=sflag)
+        
+        # logging and checkpointing
         if ii % cfg.log.stat_freq == 0:
             if sflag is not None: aux["nprop"] = sflag
-            _lr = (lr_schedule(train_state.opt_state[-1][0].count) 
-                if callable(lr_schedule) else lr_schedule)
+            if callable(lr_schedule):
+                if is_multi_gpu:
+                    opt_state_first = jax.tree_map(lambda x: x[0], train_state.opt_state)
+                    step_count = opt_state_first[1][1].count
+                else:
+                    step_count = train_state.opt_state[-1][0].count
+                _lr = lr_schedule(step_count)
+            else:
+                _lr = lr_schedule
             printer.print_fields({"step": ii, "loss": loss, **aux, "lr": _lr})
             writer.add_scalars("stat", {"loss": loss, **aux, "lr": _lr}, global_step=ii)
+            
         if ii % cfg.log.ckpt_freq == 0:
             checkpoint_filename = f"./{cfg.log.ckpt_path}/ckpt_{ii}.pkl"
-            save_pickle(checkpoint_filename, (key, tuple(train_state)))
-    writer.close()
+            if is_multi_gpu:
+                unreplicated_state = jax.tree_map(lambda x: x[0], train_state)
+                save_pickle(checkpoint_filename, (keys[0], tuple(unreplicated_state)))
+            else:
+                save_pickle(checkpoint_filename, (key, tuple(train_state)))
     
+    writer.close()
     return train_state
