@@ -104,10 +104,13 @@ def make_eval_total(hamil: Hamiltonian, braket: BraKet,
         _f0 = jax.tree_util.tree_leaves(fields)[0]
         _fs0 = jax.tree_util.tree_leaves(fshape)[0]
         if _f0.ndim != _fs0.size + 2:
-            batch = min(_f0.size // _fs0.prod(), default_batch)
-            fields = tree_map(lambda x,s: x.reshape(-1, batch, *s), fields, fshape)
+            n_samples = _f0.shape[0]
+            batch = min(n_samples, default_batch)
+            n_loops = n_samples // batch
+            new_shape = (n_loops, batch) + _f0.shape[1:]
+            fields = tree_map(lambda x: x.reshape(*new_shape), fields)
             if logsw is not None:
-                logsw = logsw.reshape(-1, batch)
+                logsw = logsw.reshape(n_loops, batch)
         return fields, logsw
 
     def calc_statistics(eloc, sign, logov, logsw, ebar=None):

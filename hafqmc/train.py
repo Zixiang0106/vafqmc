@@ -160,18 +160,43 @@ def train(cfg: ConfigDict):
             logger.warning(f"Batch size {sample_batch} not divisible by {n_devices} devices, "
                          f"adjusting to {local_batch * n_devices}")
             sample_batch = local_batch * n_devices
+        local_sample_size = sample_size // n_devices
+        sample_step = -(-local_sample_size // local_batch)
     else:
         local_batch = sample_batch
+        sample_step = -(-sample_size // sample_batch)
     
-    if sample_size % sample_batch != 0:
-        logger.warning("Sample size not divisible by batch size, rounding up")
-    sample_step = -(-sample_size // sample_batch)
-    sample_size = sample_batch * sample_step
+    if is_multi_gpu:
+        sample_size = local_batch * sample_step * n_devices
+    else:
+        if sample_size % sample_batch != 0:
+            logger.warning("Sample size not divisible by batch size, rounding up")
+        sample_size = sample_batch * sample_step
+    
     sample_prop = cfg.sample.prop_steps
     eval_batch = cfg.optim.batch if cfg.optim.batch is not None else sample_batch
+    
     if sample_size % eval_batch != 0:
         logger.warning("Eval batch size not dividing sample size, using sample batch size")
         eval_batch = sample_batch
+    
+    if is_multi_gpu:
+        local_eval_batch = eval_batch // n_devices
+        if eval_batch % n_devices != 0:
+            logger.warning(f"Eval batch size {eval_batch} not divisible by {n_devices} devices, "
+                         f"adjusting to {local_eval_batch * n_devices}")
+            eval_batch = local_eval_batch * n_devices
+            local_eval_batch = eval_batch // n_devices
+    else:
+        local_eval_batch = eval_batch
+    logger.info(f"Sample configuration:")
+    logger.info(f"  Total sample_size: {sample_size}")
+    logger.info(f"  Sample batch: {sample_batch}")
+    logger.info(f"  Local batch per device: {local_batch}")
+    logger.info(f"  Sample steps: {sample_step}")
+    if is_multi_gpu:
+        logger.info(f"  Local sample size per device: {local_sample_size}")
+        logger.info(f"  Expected samples per device: {local_batch * sample_step}")
 
     # set up the hamiltonian
     if cfg.restart.hamiltonian is None:
@@ -218,10 +243,10 @@ def train(cfg: ConfigDict):
     lr_schedule = make_lr_schedule(**cfg.optim.lr)
     optimizer = make_optimizer(lr_schedule=lr_schedule, grad_clip=cfg.optim.grad_clip,
         **ensure_mapping(cfg.optim.optimizer, default_key="name"))
-    assert eval_batch % n_devices == 0, f"Eval batch size {eval_batch} must be divisible by {n_devices} devices"
-    eval_batch = eval_batch // n_devices
+    
     expect_fn = make_eval_total(hamiltonian, braket,
-        default_batch=eval_batch, calc_stds=True)
+        default_batch=local_eval_batch, calc_stds=True)
+    
     loss_fn = make_loss(expect_fn, **cfg.loss)
     loss_and_grad = jax.value_and_grad(loss_fn, has_aux=True)
     moving_avg_fn = (make_moving_avg(**cfg.optim.baseline)
