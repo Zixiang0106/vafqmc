@@ -12,6 +12,7 @@ from .molecule import build_mf
 from .hamiltonian import Hamiltonian, HamiltonianPW, Hamiltonian_sym
 from .ansatz import Ansatz, BraKet
 from .estimator import make_eval_total
+from .ovlp import make_ovlp_total
 from .sampler import make_sampler, make_multistep, make_batched, SamplerUnion
 from .utils import ensure_mapping, save_pickle, load_pickle, Printer, cfg_to_yaml
 from .utils import make_moving_avg, PyTree, tree_map
@@ -44,22 +45,33 @@ def make_lr_schedule(start=1e-4, decay=1., delay=1e4):
     return lambda t: start * jnp.power((1.0 / (1.0 + (t/delay))), decay)
 
 
-def make_loss(expect_fn, 
-              sign_factor=0., sign_target=1., sign_power=2.,
-              std_factor=0., std_target=1., std_power=2):
 
-    def loss(params, data, *extra, **kwargs):
+def make_loss(expect_fn, ovlp_fn, num_states, weights,
+              sign_factor=0., sign_target=1., sign_power=2.,
+              std_factor=0., std_target=1., std_power=2,):
+    def loss(params, data, params_lower, data_lower, *extra, **kwargs):
         e_tot, aux = expect_fn(params, data, *extra, **kwargs)
         loss = e_tot
+        ovlps = []
+        energies = []
         if sign_factor > 0:
             exp_s = aux["exp_s"]
             loss += lower_penalty(exp_s, sign_factor, sign_target, sign_power)
         if std_factor > 0:
             std_es = aux["std_es"]
             loss += upper_penalty(std_es, std_factor, std_target, std_power)
+        for i in range(num_states):
+            ovlp, _ = ovlp_fn(params_lower[i], params, data_lower[i], data)
+            e, _ = expect_fn(params_lower[i], data_lower[i], *extra, **kwargs)
+            loss += weights[i] * ovlp
+            ovlps.append(ovlp)
+            energies.append(e)
+        for i in range(num_states):
+            aux[f'e{i}'] = energies[i]
+            aux[f"ovlp{i}"] = ovlps[i]
         return loss, aux
-         
     return loss
+
 
 
 class TrainingState(NamedTuple):
@@ -67,38 +79,62 @@ class TrainingState(NamedTuple):
     params: PyTree
     mc_state: PyTree
     opt_state: PyTree
+    est_state: PyTree
+    params_lower: PyTree
+    mc_state_lower: PyTree
+
+class TrainingStateSave(NamedTuple):
+    step: int
+    params: PyTree
+    mc_state: PyTree
+    opt_state: PyTree
     est_state: PyTree = None
 
 
-def make_training_step(loss_and_grad, mc_sampler, optimizer, accumulator=None):
+def make_training_step(loss_and_grad, mc_sampler, optimizer, accumulator=None, num_states=1):
     is_union = isinstance(mc_sampler, SamplerUnion)
 
     def step(key, train_state, sample_flag=None):
-        ii, params, mc_state, opt_state, ebar = train_state
+        keys = jax.random.split(key, num_states)
+        ii, params, mc_state, opt_state, ebar, params_lower, mc_state_lower = train_state
         sampler = mc_sampler.switch(sample_flag) if is_union else mc_sampler
         mc_state = sampler.refresh(mc_state, params)
         mc_state, data = sampler.sample(key, params, mc_state)
-        (loss, aux), grads = loss_and_grad(params, data, ebar)
+        data_lower = []
+        mc_state_new = []
+        for i in range(num_states):
+            mc_statei = sampler.refresh(mc_state_lower[i], params_lower[i])
+            mc_statei, datai = sampler.sample(keys[i], params_lower[i], mc_statei)
+            data_lower.append(datai)
+            mc_state_new.append(mc_statei)
+        (loss, aux), grads = loss_and_grad(params, data, params_lower, data_lower, ebar)
         grads = tree_map(jnp.conj, grads) # for complex parameters
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
         if accumulator is not None: ebar = accumulator(ebar, aux["e_tot"], ii)
-        new_state = TrainingState(ii+1, params, mc_state, opt_state, ebar)
+        new_state = TrainingState(ii+1, params, mc_state, opt_state, ebar, params_lower, mc_state_new)
         return new_state, (loss, aux)
 
     return step
 
-
-def make_training_step_pmap(loss_and_grad, mc_sampler, optimizer, accumulator=None):
+def make_training_step_pmap(loss_and_grad, mc_sampler, optimizer, accumulator=None, num_states=1):
     #multi-gpu training step
     is_union = isinstance(mc_sampler, SamplerUnion)
 
     def step(key, train_state, sample_flag=None):
-        ii, params, mc_state, opt_state, ebar = train_state
+        keys = jax.random.split(key, num_states)
+        ii, params, mc_state, opt_state, ebar, params_lower, mc_state_lower = train_state
         sampler = mc_sampler.switch(sample_flag) if is_union else mc_sampler
         mc_state = sampler.refresh(mc_state, params)
         mc_state, data = sampler.sample(key, params, mc_state)
-        (loss, aux), grads = loss_and_grad(params, data, ebar)
+        data_lower = []
+        mc_state_new = []
+        for i in range(num_states):
+            mc_statei = sampler.refresh(mc_state_lower[i], params_lower[i])
+            mc_statei, datai = sampler.sample(keys[i], params_lower[i], mc_statei)
+            data_lower.append(datai)
+            mc_state_new.append(mc_statei)
+        (loss, aux), grads = loss_and_grad(params, data, params_lower, data_lower, ebar)
         grads = tree_map(jnp.conj, grads) # for complex parameters
         
         # sync grads in multi-gpu environment
@@ -107,40 +143,68 @@ def make_training_step_pmap(loss_and_grad, mc_sampler, optimizer, accumulator=No
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
         if accumulator is not None: ebar = accumulator(ebar, aux["e_tot"], ii)
-        new_state = TrainingState(ii+1, params, mc_state, opt_state, ebar)
+        new_state = TrainingState(ii+1, params, mc_state, opt_state, ebar, params_lower, mc_state_new)
         return new_state, (loss, aux)
 
     return step
 
 
-def make_evaluation_step(expect_fn, mc_sampler):
+def make_evaluation_step(expect_fn, ovlp_fn, mc_sampler, num_states):
     is_union = isinstance(mc_sampler, SamplerUnion)
     
     def step(key, train_state, sample_flag=None):
-        ii, params, mc_state, *other = train_state
+        keys = jax.random.split(key, num_states)
+        ii, params, mc_state, opt_state, ebar, params_lower, mc_state_lower = train_state
         sampler = mc_sampler.switch(sample_flag) if is_union else mc_sampler
         mc_state, data = sampler.sample(key, params, mc_state)
         e_tot, aux = expect_fn(params, data)
-        new_state = TrainingState(ii+1, params, mc_state, *other)
+        ovlps = []
+        energies = []
+        mc_state_new = []
+        for i in range(num_states):
+            mc_statei = sampler.refresh(mc_state_lower[i], params_lower[i])
+            mc_statei, datai = sampler.sample(keys[i], params[i], mc_statei)
+            ovlp, _ = ovlp_fn(params_lower[i], datai, params, data)
+            e, _ = expect_fn(params_lower[i], datai)
+            ovlps.append(ovlp)
+            energies.append(e)
+            mc_state_new.append(mc_statei)
+        new_state = TrainingState(ii+1, params, mc_state, opt_state, ebar, params_lower, mc_state_new)
+        for i in range(num_states):
+            aux[f"e{i}"] = energies[i]
+            aux[f"ovlp{i}"] = ovlps[i]
         return new_state, (e_tot, aux)
     
     return step
         
-def make_evaluation_step_pmap(expect_fn, mc_sampler):
-    """Multi-GPU evaluation step with pmap support"""
+
+def make_evaluation_step_pmap(expect_fn, ovlp_fn, mc_sampler, num_states):
     is_union = isinstance(mc_sampler, SamplerUnion)
     
     def step(key, train_state, sample_flag=None):
-        ii, params, mc_state, *other = train_state
+        keys = jax.random.split(key, num_states)
+        ii, params, mc_state, opt_state, ebar, params_lower, mc_state_lower = train_state
         sampler = mc_sampler.switch(sample_flag) if is_union else mc_sampler
         mc_state, data = sampler.sample(key, params, mc_state)
         e_tot, aux = expect_fn(params, data)
-        
-        # Sync results across devices - average the energy and auxiliary values
         e_tot = jax.lax.pmean(e_tot, axis_name="device")
         aux = jax.lax.pmean(aux, axis_name="device")
-        
-        new_state = TrainingState(ii+1, params, mc_state, *other)
+        ovlps = []
+        energies = []
+        mc_state_new = []
+        for i in range(num_states):
+            mc_statei = sampler.refresh(mc_state_lower[i], params_lower[i])
+            mc_statei, datai = sampler.sample(keys[i], params_lower[i], mc_statei)
+            ovlp, _ = ovlp_fn(params_lower[i], datai, params, data)
+            e, _ = expect_fn(params_lower[i], datai)
+            ovlp = jax.lax.pmean(ovlp, axis_name="device")
+            ovlps.append(ovlp)
+            energies.append(e)
+            mc_state_new.append(mc_statei)
+        new_state = TrainingState(ii+1, params, mc_state, opt_state, ebar, params_lower, mc_state_new)
+        for i in range(num_states):
+            aux[f"e{i}"] = energies[i]
+            aux[f"ovlp{i}"] = ovlps[i]
         return new_state, (e_tot, aux)
     
     return step
@@ -150,7 +214,6 @@ def train(cfg: ConfigDict):
     logger = logging.getLogger("train")
     log_level = getattr(logging, cfg.log.level.upper())
     logger.setLevel(log_level)
-    #jax.distributed.initialize(local_device_ids=[0, 1, 2, 3])
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
     n_visible_gpus = len(cuda_visible.split(","))
     jax.distributed.initialize(local_device_ids=list(range(n_visible_gpus)))
@@ -159,16 +222,16 @@ def train(cfg: ConfigDict):
     process_index = jax.process_index()
     n_processes = jax.process_count()
     is_multi_gpu = n_devices > 1
-    #n_devices = jax.local_device_count()
-    #is_multi_gpu = n_devices > 1
+    lower_params_paths = cfg.restart.lower_state_params
+    weights = cfg.restart.weights
+    num_states = len(lower_params_paths)
+    assert len(weights) == num_states, \
+    f"weight list length must be num_state = {num_states}, got {len(weights)}"
     
     if is_multi_gpu:
         log_once(logger, process_index,f"JAX detected {n_devices} total devices across {n_processes} processes")
         log_once(logger, process_index,f"Current process {process_index} has {n_local_devices} local devices")
         log_once(logger, process_index,f"Running on {n_devices} GPUs with pmap for data parallelism")
-#        n_gpu_devices = jax.local_device_count("gpu")
-#        logger.info(f"JAX detected {n_devices} local devices")
-#        logger.info(f"Running on {n_gpu_devices} GPUs with pmap for data parallelism")
     else:
         logger.info("Running on single device")
     if process_index == 0:
@@ -179,6 +242,9 @@ def train(cfg: ConfigDict):
                     "exp_es": ".4f", "exp_s": ".4f"}
     if cfg.loss.std_factor >= 0:
         print_fields.update({"std_es": ".4f", "std_s": ".4f"})
+    for i in range(num_states):
+        print_fields[f"e{i}"] = ".4f"
+        print_fields[f"ovlp{i}"] = ".4f"
     print_fields["lr"] = ".1e"
     printer = Printer(print_fields, time_format=".4f")
     if cfg.log.hpar_path and process_index == 0:
@@ -284,8 +350,10 @@ def train(cfg: ConfigDict):
     
     expect_fn = make_eval_total(hamiltonian, braket,
         default_batch=local_eval_batch, calc_stds=True)
+    ovlp_fn = make_ovlp_total(hamiltonian, braket,
+        default_batch=local_eval_batch, calc_stds=True)
     
-    loss_fn = make_loss(expect_fn, **cfg.loss)
+    loss_fn = make_loss(expect_fn, ovlp_fn, num_states, weights, **cfg.loss)
     loss_and_grad = jax.value_and_grad(loss_fn, has_aux=True)
     moving_avg_fn = (make_moving_avg(**cfg.optim.baseline)
         if cfg.optim.baseline is not None else None)
@@ -293,9 +361,9 @@ def train(cfg: ConfigDict):
     # the core training iteration
     if cfg.optim.lr.start > 0:
         if is_multi_gpu:
-            train_step = make_training_step_pmap(loss_and_grad, mc_sampler, optimizer, moving_avg_fn)
+            train_step = make_training_step_pmap(loss_and_grad, mc_sampler, optimizer, moving_avg_fn, num_states=num_states)
         else:
-            train_step = make_training_step(loss_and_grad, mc_sampler, optimizer, moving_avg_fn)
+            train_step = make_training_step(loss_and_grad, mc_sampler, optimizer, moving_avg_fn, num_states=num_states)
     else:
         log_once(logger, process_index,"Running inference mode")
         if is_multi_gpu:
@@ -310,6 +378,20 @@ def train(cfg: ConfigDict):
         train_step = jax.jit(train_step, static_argnums=(2,))
     
     # set up all states
+    log_once(logger, process_index, "Loading lower states parameters from saved file")
+    key = jax.random.PRNGKey(cfg.seed)
+    keys = jax.random.split(key, num_states)
+    params_lower = []
+    mc_state_lower = []
+
+    for i,p in enumerate(lower_params_paths):
+        paramsi = load_pickle(p)
+        if isinstance(paramsi, tuple): paramsi = paramsi[1]
+        if isinstance(paramsi, tuple): paramsi = paramsi[1]
+        mc_statei = mc_sampler.init(keys[i], paramsi)
+        params_lower.append(paramsi)
+        mc_state_lower.append(mc_statei)
+
     if cfg.restart.states is None:
         log_once(logger, process_index,"Initializing parameters and states")
         key = jax.random.PRNGKey(cfg.seed)
@@ -327,12 +409,15 @@ def train(cfg: ConfigDict):
         opt_state = optimizer.init(params)
         
         if cfg.sample.burn_in > 0:
-            log_once(logger, process_index, f"Burning in the sampler for {cfg.sample.burn_in} steps")
+            log_once(logger, process_index, f"Burning in the {num_states} samplers for {cfg.sample.burn_in} steps")
             key, subkey = jax.random.split(key)
             mc_state = sampler_1s_nc.burn_in(subkey, params, mc_state, cfg.sample.burn_in)
+            subkeys = jax.random.split(subkey, num_states)
+            for i in range(num_states):
+                mc_state_lower[i] = sampler_1s_nc.burn_in(subkeys[i], params_lower[i], mc_state_lower[i], cfg.sample.burn_in)
         
         ebar = hamiltonian.local_energy() if cfg.optim.baseline is not None else None
-        train_state = TrainingState(0, params, mc_state, opt_state, ebar)
+        train_state = TrainingState(0, params, mc_state, opt_state, ebar, params_lower, mc_state_lower)
         
         if is_multi_gpu:
             train_state = jax_utils.replicate(train_state)
@@ -406,11 +491,13 @@ def train(cfg: ConfigDict):
         if ii % cfg.log.ckpt_freq == 0:
             if process_index == 0:
                 checkpoint_filename = f"./{cfg.log.ckpt_path}/ckpt_{ii}.pkl"
+                ii, params, mc_state, opt_state, ebar, params_lower, mc_state_lower = train_state
+                train_state_save = TrainingStateSave(ii, params, mc_state, opt_state, ebar)
                 if is_multi_gpu:
-                    unreplicated_state = jax.tree_map(lambda x: x[0], train_state)
+                    unreplicated_state = jax.tree_map(lambda x: x[0], train_state_save)
                     save_pickle(checkpoint_filename, (keys[0], tuple(unreplicated_state)))
                 else:
-                    save_pickle(checkpoint_filename, (key, tuple(train_state)))
+                    save_pickle(checkpoint_filename, (key, tuple(train_state_save)))
     if process_index == 0: 
         writer.close()
     return train_state

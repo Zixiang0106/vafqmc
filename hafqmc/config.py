@@ -64,6 +64,8 @@ def default() -> ConfigDict:
             "hamiltonian": None,
             "params": None,
             "states": None,
+            "lower_state_params": [],
+            "weights":[]
         },
         "seed": None,
         "molecule": {},
@@ -99,6 +101,8 @@ def default() -> ConfigDict:
             "std_factor": 0.,
             "std_target": 100.,
             "std_power": 2.,
+#            "num_states": 1,
+#            "weights": [],
         },
         "optim": {
             "batch": None,
