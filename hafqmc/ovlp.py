@@ -66,8 +66,8 @@ def make_ovlp_local(hamil: Hamiltonian, braket: BraKet):
         logD_b = logov_b + bra_beta_lw + ket_beta_lw
         Sab, logov_ab = slov_fn(bra_alpha, ket_beta)
         Sba, logov_ba = slov_fn(bra_beta, ket_alpha)
-        logR_ab = logov_ab + bra_alpha_lw + ket_beta_lw - logov_a - bra_alpha_lw - ket_alpha_lw
-        logR_ba = logov_ba + bra_beta_lw + ket_alpha_lw - logov_b - bra_beta_lw - ket_beta_lw
+        logR_ab = logov_ab + ket_beta_lw - logov_a - ket_alpha_lw
+        logR_ba = logov_ba + ket_alpha_lw - logov_b - ket_beta_lw
         return Sa, Sb, logD_a, logD_b, logR_ab, logR_ba, Sab, Sba
         #eloc = eloc_fn(bra, ket)
         #sign, logov = slov_fn(bra, ket)
@@ -118,7 +118,7 @@ def make_ovlp_total(hamil: Hamiltonian, braket: BraKet,
             if logsw is not None:
                 logsw = logsw.reshape(n_loops, batch)
         return fields, logsw
-    def calc_statistics(Sa, Sb, R_ab, R_ba, logD_a, logD_b, logsw_a, logsw_b):
+    def calc_statistics(Sa, Sb, R_ab, R_ba, logD_a, logD_b, logsw_a, logsw_b, Sab, Sba):
         logsw_a = logsw_a if logsw_a is not None else logD_a
         logsw_b = logsw_b if logsw_b is not None else logD_b
         logsw_a = lax.stop_gradient(logsw_a)
@@ -129,15 +129,19 @@ def make_ovlp_total(hamil: Hamiltonian, braket: BraKet,
         Numb = paxis.all_mean((Sb * R_ba) * rel_wb)
         Dema = paxis.all_mean(Sa * rel_wa)
         Demb = paxis.all_mean(Sb * rel_wb)
-        ovlp = ((Numa*Numb)/(Dema*Demb)).real
-        #ovlp = Numa.real*Numb.real/(Dema.real*Demb.real)
+        S_ab = paxis.all_mean(Sab * rel_wa)
+        S_ba = paxis.all_mean(Sba * rel_wb)
+        #ovlp = ((Numa*Numb)/(Dema*Demb)).real
+        ovlp = Numa.real*Numb.real/(Dema.real*Demb.real)
         aux_data = {"ovlp": ovlp,
                     "Numa": Numa,
                     "Numb": Numb,
                     "Dema": Dema,
                     "Demb": Demb,
                     "log_shift_a": lshifta,
-                    "log_shift_b": lshiftb}
+                    "log_shift_b": lshiftb,
+                    "S_ab": S_ab.real,
+                    "S_ba": S_ba.real}
         return ovlp, aux_data
     def eval_ovlp(params_alpha, params_beta, data_alpha, data_beta):
         data_alpha = check_shape(data_alpha)
@@ -151,6 +155,6 @@ def make_ovlp_total(hamil: Hamiltonian, braket: BraKet,
         _, Sb, _, logD_b, _, logR_ba, _, Sba = lax.map(ovlp_fn, fields_b)
         R_ab = jnp.exp(logR_ab) * Sab / Sa
         R_ba = jnp.exp(logR_ba) * Sba / Sb
-        ovlp, aux_data = calc_statistics(Sa, Sb, R_ab, R_ba, logD_a, logD_b, logsw_a, logsw_b)
+        ovlp, aux_data = calc_statistics(Sa, Sb, R_ab, R_ba, logD_a, logD_b, logsw_a, logsw_b, Sab, Sba)
         return ovlp, aux_data
     return eval_ovlp

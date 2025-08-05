@@ -876,3 +876,30 @@ def writeInputForModel_forGeneralHamiltonian_HAFQMC(mol=None, rhf=None, canonic=
     enuc_icf    = gto.energy_nuc(mol)
     hamil = t, choleskyVecMO_matrix, enuc_icf, (wfn_a_icf, wfn_b_icf), {"orth_mat": canonic.XT.conj().T} 
     save_pickle(hamiltonian_path, hamil)
+
+from pyscf import lib
+from pyscf.gto import mole
+def basis_change(mol1, mol2, params):
+    #convert from the basis of mol1 to mol2, params is the params for mol1
+    s22 = mol2.intor_symmetric('int1e_ovlp')
+    s21 = mole.intor_cross('int1e_ovlp', mol2, mol1)
+    A = lib.cho_solve(s22, s21, strict_sym_pos=False)
+    dt = params['params']['ansatz']['wfn_a'].dtype 
+    A = A.astype(dt) 
+    wfn_a_new = A @ params['params']['ansatz']['wfn_a']
+    wfn_b_new = A @ params['params']['ansatz']['wfn_b']
+    n2, n1 = A.shape
+    A_spin = jnp.block([
+    [   A,                jnp.zeros((n2, n1), dtype=dt)],
+    [jnp.zeros((n2, n1), dtype=dt),                A   ]])
+    hmf_0_new = A_spin @ params['params']['ansatz']['propagators_0']['hmf_ops_0']['hmf'] @ A_spin.conj().T
+    hmf_1_new = A_spin @ params['params']['ansatz']['propagators_0']['hmf_ops_1']['hmf'] @ A_spin.conj().T
+    vhs_new = jnp.stack([ A_spin @ L1 @ A_spin.conj().T
+            for L1 in params['params']['ansatz']['propagators_0']['vhs_ops_0']['vhs'] ], axis=0)
+    vhs_new = jnp.asarray(vhs_new, dt)
+    params['params']['ansatz']['wfn_a'] = wfn_a_new
+    params['params']['ansatz']['wfn_b'] = wfn_b_new
+    params['params']['ansatz']['propagators_0']['hmf_ops_0']['hmf'] = hmf_0_new
+    params['params']['ansatz']['propagators_0']['hmf_ops_1']['hmf'] = hmf_1_new
+    params['params']['ansatz']['propagators_0']['vhs_ops_0']['vhs'] = vhs_new
+    return params

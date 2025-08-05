@@ -53,6 +53,7 @@ def make_loss(expect_fn, ovlp_fn, num_states, weights,
         e_tot, aux = expect_fn(params, data, *extra, **kwargs)
         loss = e_tot
         ovlps = []
+        s_ovlps = []
         energies = []
         if sign_factor > 0:
             exp_s = aux["exp_s"]
@@ -61,14 +62,19 @@ def make_loss(expect_fn, ovlp_fn, num_states, weights,
             std_es = aux["std_es"]
             loss += upper_penalty(std_es, std_factor, std_target, std_power)
         for i in range(num_states):
-            ovlp, _ = ovlp_fn(params_lower[i], params, data_lower[i], data)
+            ovlp, aux_ovlp = ovlp_fn(params_lower[i], params, data_lower[i], data)
+            s_ovlp = aux_ovlp["S_ab"] * aux_ovlp["S_ba"]
             e, _ = expect_fn(params_lower[i], data_lower[i], *extra, **kwargs)
             loss += weights[i] * ovlp
+            if sign_factor > 0:
+                loss += lower_penalty(s_ovlp, sign_factor, sign_target, sign_power)
+            s_ovlps.append(s_ovlp)
             ovlps.append(ovlp)
             energies.append(e)
         for i in range(num_states):
             aux[f'e{i}'] = energies[i]
             aux[f"ovlp{i}"] = ovlps[i]
+            aux[f's{i}'] = s_ovlps[i]
         return loss, aux
     return loss
 
@@ -159,13 +165,16 @@ def make_evaluation_step(expect_fn, ovlp_fn, mc_sampler, num_states):
         mc_state, data = sampler.sample(key, params, mc_state)
         e_tot, aux = expect_fn(params, data)
         ovlps = []
+        s_ovlps = []
         energies = []
         mc_state_new = []
         for i in range(num_states):
             mc_statei = sampler.refresh(mc_state_lower[i], params_lower[i])
             mc_statei, datai = sampler.sample(keys[i], params[i], mc_statei)
-            ovlp, _ = ovlp_fn(params_lower[i], datai, params, data)
+            ovlp, aux_ovlp = ovlp_fn(params_lower[i], datai, params, data)
+            s_ovlp = aux_ovlp["S_ab"] * aux_ovlp["S_ba"]
             e, _ = expect_fn(params_lower[i], datai)
+            s_ovlps.append(s_ovlp)
             ovlps.append(ovlp)
             energies.append(e)
             mc_state_new.append(mc_statei)
@@ -173,6 +182,7 @@ def make_evaluation_step(expect_fn, ovlp_fn, mc_sampler, num_states):
         for i in range(num_states):
             aux[f"e{i}"] = energies[i]
             aux[f"ovlp{i}"] = ovlps[i]
+            aux[f"s{i}"] = s_ovlps[i]
         return new_state, (e_tot, aux)
     
     return step
@@ -245,6 +255,7 @@ def train(cfg: ConfigDict):
     for i in range(num_states):
         print_fields[f"e{i}"] = ".4f"
         print_fields[f"ovlp{i}"] = ".4f"
+        print_fields[f"s{i}"] = ".4f"
     print_fields["lr"] = ".1e"
     printer = Printer(print_fields, time_format=".4f")
     if cfg.log.hpar_path and process_index == 0:

@@ -22,7 +22,22 @@ def log_once(logger, process_index, message, level='info'):
     if process_index == 0:
         getattr(logger, level)(message)
 
-
+# def zero_V(arr):
+#     _, N, _ = arr.shape
+#     assert N % 2 == 0, "N has to be odd"
+#     half = N // 2
+#     zero = arr.dtype.type(0)   
+#     arr = arr.at[:, :half, half:].set(zero)
+#     arr = arr.at[:, half:, :half].set(zero)
+#     return arr
+# def zero_K(arr):
+#     N,_ = arr.shape
+#     assert N % 2 == 0, "N has to be odd"
+#     half = N // 2
+#     zero = arr.dtype.type(0)   
+#     arr = arr.at[:half, half:].set(zero)
+#     arr = arr.at[half:, :half].set(zero)
+#     return arr
 def lower_penalty(s, factor=1., target=1., power=2.):
     return factor * jnp.maximum(target - s, 0) ** power
 
@@ -323,6 +338,12 @@ def train(cfg: ConfigDict):
             params = load_pickle(cfg.restart.params)
             if isinstance(params, tuple): params = params[1]
             if isinstance(params, tuple): params = params[1]
+            # vhs = zero_V(params['params']['ansatz']['propagators_0']['vhs_ops_0']['vhs'])
+            # params['params']['ansatz']['propagators_0']['vhs_ops_0']['vhs'] = vhs
+            # hmf_0 = zero_K(params['params']['ansatz']['propagators_0']['hmf_ops_0']['hmf'])
+            # hmf_1 = zero_K(params['params']['ansatz']['propagators_0']['hmf_ops_1']['hmf'])
+            # params['params']['ansatz']['propagators_0']['hmf_ops_0']['hmf'] = hmf_0
+            # params['params']['ansatz']['propagators_0']['hmf_ops_1']['hmf'] = hmf_1
         mc_state = mc_sampler.init(mckey, params)
         opt_state = optimizer.init(params)
         
@@ -405,7 +426,12 @@ def train(cfg: ConfigDict):
             
         if ii % cfg.log.ckpt_freq == 0:
             if process_index == 0:
-                checkpoint_filename = f"./{cfg.log.ckpt_path}/ckpt_{ii}.pkl"
+                if cfg.log.ckpt_choice == 'all':
+                    checkpoint_filename = f"./{cfg.log.ckpt_path}/ckpt_{ii}.pkl"
+                elif cfg.log.ckpt_choice == 'last':
+                    checkpoint_filename = f"./{cfg.log.ckpt_path}/checkpoint.pkl"
+                else:
+                    raise ValueError(f"invalid ckpt_choice: {cfg.log.ckpt_choice}, please choose from 'all' and 'last'.")
                 if is_multi_gpu:
                     unreplicated_state = jax.tree_map(lambda x: x[0], train_state)
                     save_pickle(checkpoint_filename, (keys[0], tuple(unreplicated_state)))
