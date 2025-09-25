@@ -903,3 +903,76 @@ def basis_change(mol1, mol2, params):
     params['params']['ansatz']['propagators_0']['hmf_ops_1']['hmf'] = hmf_1_new
     params['params']['ansatz']['propagators_0']['vhs_ops_0']['vhs'] = vhs_new
     return params
+def getCholesky_MO(eri,norb, tol=1e-8):
+
+    nbasis  = norb
+    V   = ao2mo.restore(1, eri, nbasis)
+    V   = V.reshape( nbasis*nbasis, nbasis*nbasis )
+
+    choleskyVecMO = []; choleskyNum = 0
+    Vdiag = V.diagonal().copy()
+    while True:
+        imax = np.argmax(Vdiag); vmax = Vdiag[imax]
+        print( "Inside modified Cholesky {:<9} {:26.18e}.".format(choleskyNum, vmax) )
+        if(vmax<tol or choleskyNum==nbasis*nbasis):
+            print( "Number of Cholesky fields is {:9}".format(choleskyNum) )
+            print('\n')
+            break
+        else:
+            oneVec = V[imax]/np.sqrt(vmax)
+            #
+            choleskyVecMO.append( oneVec )
+            choleskyNum+=1
+            V -= np.dot(oneVec[:, None], oneVec[None,:])
+            Vdiag -= oneVec**2
+        #
+    return choleskyNum, choleskyVecMO
+
+def writeInputForModel_for_MO_Hamiltonian_2s_HAFQMC(h1 , h2,  norb, nelec,e_nuc, tol=1e-8, hamiltonian_path="AFQMC_hamiltonian.pkl", name="model_param"):
+    Nup, Ndn = nelec  # assumed to be Restricted Hartree-Fock
+    choleskyNum,  choleskyVecMO = getCholesky_MO(h2, norb, tol)
+    #
+    # t = np.dot( canonic.XT, np.dot( rhf.get_hcore(), canonic.X ) )
+    t = h1
+    #
+    K = t.copy()
+    for i in range(choleskyNum):
+        oneVec = choleskyVecMO[i].reshape(norb, norb)
+        K += (-0.5)*np.dot( oneVec, oneVec )
+
+    wfn_a_icf = np.eye(norb)[:, 0:Nup]
+    wfn_b_icf = np.eye(norb)[:, 0:Ndn]
+    #
+    choleskyVecMO_matrix=np.array(choleskyVecMO)
+    choleskyVecMO_matrix = choleskyVecMO_matrix.reshape(choleskyNum, norb, norb)
+    ###############################
+    svdVecs=choleskyVecMO
+    svdNumber=choleskyNum
+    ############################
+    #ATTention: there is a transpose between python and c++ i/o trans
+    KT=np.zeros((norb, norb),dtype=np.complex128)
+    KT[0: norb,0:norb]=K.transpose()
+    # KT[norb:2*norb,norb:2*norb]=K.transpose()
+    #
+    svdVecsT=np.zeros((svdNumber, norb, norb),dtype=np.complex128)
+    for i in range(svdNumber):
+        svdVecsT[i,0:norb,0:norb]=svdVecs[i].reshape(norb, norb).transpose()
+        # svdVecsT[i,norb:2*norb,norb:2*norb]=svdVecs[i].reshape(norb, norb).transpose()
+    #
+    f = h5py.File(name, "w")
+    f.create_dataset("L",              (1,),                                data=[norb],           dtype='int')
+    f.create_dataset("Nup",              (1,),                                data=[Nup],           dtype='int')
+    f.create_dataset("Ndn",              (1,),                                data=[Ndn],           dtype='int')
+    f.create_dataset("N",            (1,),                                data=[Nup+Ndn],                     dtype='int')
+    f.create_dataset("svdNumber", (1,),                                data=[svdNumber],           dtype='int')
+    f.create_dataset("K_r",              ((norb)**2,),                 data=KT.real.ravel(),                 dtype='float64')    #ATTention: there is a transpose between python and c++ i/o trans
+    f.create_dataset("svdVecs_r",   (svdNumber*(norb)**2,), data=svdVecsT.real.ravel(),     dtype='float64')      #ATTention: there is a transpose between python and c++ i/o trans
+    f.create_dataset("svdBg_r",     (svdNumber,), data=np.zeros(svdNumber),   dtype='float64')
+    f.create_dataset("K_i",              ((norb)**2,),                 data=KT.imag.ravel(),                 dtype='float64')    #ATTention: there is a transpose between python and c++ i/o trans
+    f.create_dataset("svdVecs_i",   (svdNumber*(norb)**2,), data=svdVecsT.imag.ravel(),     dtype='float64')      #ATTention: there is a transpose between python and c++ i/o trans
+    f.create_dataset("svdBg_i",     (svdNumber,),                  data=np.zeros(svdNumber),   dtype='float64')
+    f.close()
+    #############################
+    enuc_icf    = e_nuc
+    hamil = t, choleskyVecMO_matrix, enuc_icf, (wfn_a_icf, wfn_b_icf), {"orth_mat": np.eye(norb)}
+    save_pickle(hamiltonian_path, hamil)
