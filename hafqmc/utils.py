@@ -10,7 +10,13 @@ from functools import partial, reduce
 import dataclasses
 import pickle
 import time
-
+import pickle
+def save_pickle(filename, data):
+    with open(filename, 'wb') as file:
+        pickle.dump(data, file)
+def load_pickle(filename):
+    with open(filename, 'rb') as file:
+        return pickle.load(file)
 
 _t_real = jnp.float64
 _t_cplx = jnp.complex128
@@ -19,6 +25,45 @@ _t_cplx = jnp.complex128
 Array = jnp.ndarray
 PyTree = Any
 
+def fill_V(arr):
+    Nchol, N, _ = arr.shape
+    new_arr = jnp.zeros((Nchol, N*2, N*2), dtype=arr.dtype)
+    new_arr = new_arr.at[:, :N, :N].set(arr)
+    new_arr = new_arr.at[:, N:, N:].set(arr)
+    return new_arr
+def fill_K(arr):
+    N, _ = arr.shape
+    new_arr = jnp.zeros((2 * N, 2 * N), dtype=arr.dtype)
+    new_arr = new_arr.at[:N, :N].set(arr)
+    new_arr = new_arr.at[N:, N:].set(arr)
+    return new_arr
+def mix2pure(mix_path, pure_path):
+    ckpt = load_pickle(mix_path)
+    params = ckpt[1][1]
+    vhs = params['params']['ansatz']['propagators_0']['vhs_ops_0']['vhs']
+    _, N, _ = vhs.shape
+    vhs_pure = vhs[:,:N//2,:N//2]
+    hmf_0 = params['params']['ansatz']['propagators_0']['hmf_ops_0']['hmf']
+    hmf_1 = params['params']['ansatz']['propagators_0']['hmf_ops_1']['hmf']
+    hmf_0_pure = hmf_0[:N//2,:N//2]
+    hmf_1_pure = hmf_1[:N//2,:N//2]
+    params['params']['ansatz']['propagators_0']['vhs_ops_0']['vhs'] = vhs_pure
+    params['params']['ansatz']['propagators_0']['hmf_ops_0']['hmf'] = hmf_0_pure
+    params['params']['ansatz']['propagators_0']['hmf_ops_1']['hmf'] = hmf_1_pure
+    save_pickle(pure_path, ckpt)
+def pure2mix(pure_path, mix_path):
+    ckpt = load_pickle(pure_path)
+    params = ckpt[1][1]
+    vhs = params['params']['ansatz']['propagators_0']['vhs_ops_0']['vhs']
+    vhs_mix = fill_V(vhs)
+    hmf_0 = params['params']['ansatz']['propagators_0']['hmf_ops_0']['hmf']
+    hmf_1 = params['params']['ansatz']['propagators_0']['hmf_ops_1']['hmf']
+    hmf_0_mix = fill_K(hmf_0)
+    hmf_1_mix = fill_K(hmf_1)
+    params['params']['ansatz']['propagators_0']['vhs_ops_0']['vhs'] = vhs_mix
+    params['params']['ansatz']['propagators_0']['hmf_ops_0']['hmf'] = hmf_0_mix
+    params['params']['ansatz']['propagators_0']['hmf_ops_1']['hmf'] = hmf_1_mix
+    save_pickle(mix_path, ckpt)
 
 def compose(*funcs):
     def c2(f, g):
@@ -552,13 +597,6 @@ def writeUHFSD_icf(mol=None, uhf=None, canonic=None, filename=None, noise=0.0):
                 f.write( '{:26.18e} {:26.18e} \n'.format( wfDn[j-canonic.L,i]+noise*random.random(),0.0 ) )
     f.close()
 
-import pickle
-def save_pickle(filename, data):
-    with open(filename, 'wb') as file:
-        pickle.dump(data, file)
-def load_pickle(filename):
-    with open(filename, 'rb') as file:
-        return pickle.load(file)
 
 def chunked_cholesky(mol, max_error=1e-6, verbose=False, cmax=10):
     import time
@@ -671,10 +709,10 @@ def chunked_cholesky(mol, max_error=1e-6, verbose=False, cmax=10):
     
 class CanonicalBais:
 
-    def __init__(self, mol, rhf, lindep=1e-8):
+    def __init__(self, hf, lindep=1e-8):
 
-        self.nbasis = mol.nao_nr()
-        ovlp   = rhf.get_ovlp()
+        self.nbasis = hf.mol.nao
+        ovlp   = hf.get_ovlp()
 
         value, vector = np.linalg.eigh( ovlp )
         print( "Eigenvalue of overlap matrix: " )
@@ -928,7 +966,18 @@ def getCholesky_MO(eri,norb, tol=1e-8):
         #
     return choleskyNum, choleskyVecMO
 
-def writeInputForModel_for_MO_Hamiltonian_2s_HAFQMC(h1 , h2,  norb, nelec,e_nuc, tol=1e-8, hamiltonian_path="AFQMC_hamiltonian.pkl", name="model_param"):
+def prepare_hamil_from_pickle(filename, mf=None, tol=1e-8, hamiltonian_path="AFQMC_hamiltonian.pkl", name="model_param"):
+    sys.path.append('/mnt/home/zlu10/ceph/AFQMC/utils')
+    from afqmctools.hamiltonian.converter import read_fcidump
+    import pyscf.tools.fcidump as dmp
+    HF = dmp.to_scf(filename, mf=mf)
+    hf = HF.newton()
+    hf.max_cycle   = 1000
+    hf.kernel()
+    canonic = CanonicalBais(hf, 1e-8)
+    (hcore, eri, ecore, nelec) = read_fcidump(filename, symmetry=8, verbose=False)
+    h1, h2 = hcore.real, eri.real
+    norb = h1.shape[0]
     Nup, Ndn = nelec  # assumed to be Restricted Hartree-Fock
     choleskyNum,  choleskyVecMO = getCholesky_MO(h2, norb, tol)
     #
@@ -940,8 +989,18 @@ def writeInputForModel_for_MO_Hamiltonian_2s_HAFQMC(h1 , h2,  norb, nelec,e_nuc,
         oneVec = choleskyVecMO[i].reshape(norb, norb)
         K += (-0.5)*np.dot( oneVec, oneVec )
 
-    wfn_a_icf = np.eye(norb)[:, 0:Nup]
-    wfn_b_icf = np.eye(norb)[:, 0:Ndn]
+    # wfn_a_icf = np.eye(norb)[:, 0:Nup]
+    # wfn_b_icf = np.eye(norb)[:, 0:Ndn]
+    if not mf:
+        wfn_a_icf = hf.mo_coeff[:, 0:Nup]
+        wfn_b_icf = hf.mo_coeff[:, 0:Ndn]
+        wfn_a_icf = np.dot( canonic.XInv, wfn_a_icf )
+        wfn_b_icf = np.dot( canonic.XInv, wfn_b_icf )
+    else:
+        wfn_a_icf = hf.mo_coeff[0][:, 0:Nup]
+        wfn_b_icf = hf.mo_coeff[1][:, 0:Ndn]
+        wfn_a_icf = np.dot( canonic.XInv, wfn_a_icf )
+        wfn_b_icf = np.dot( canonic.XInv, wfn_b_icf )
     #
     choleskyVecMO_matrix=np.array(choleskyVecMO)
     choleskyVecMO_matrix = choleskyVecMO_matrix.reshape(choleskyNum, norb, norb)
@@ -973,6 +1032,6 @@ def writeInputForModel_for_MO_Hamiltonian_2s_HAFQMC(h1 , h2,  norb, nelec,e_nuc,
     f.create_dataset("svdBg_i",     (svdNumber,),                  data=np.zeros(svdNumber),   dtype='float64')
     f.close()
     #############################
-    enuc_icf    = e_nuc
+    enuc_icf    = ecore
     hamil = t, choleskyVecMO_matrix, enuc_icf, (wfn_a_icf, wfn_b_icf), {"orth_mat": np.eye(norb)}
     save_pickle(hamiltonian_path, hamil)
