@@ -36,6 +36,16 @@ def _extract_params(obj):
     return obj
 
 
+def _extract_ansatz_params(trial_params):
+    """Return params tree compatible with Ansatz.apply (handle nested 'ansatz' key)."""
+    if not isinstance(trial_params, dict):
+        return trial_params
+    params = trial_params.get("params", trial_params)
+    if isinstance(params, dict) and "ansatz" in params and isinstance(params["ansatz"], dict):
+        return {"params": params["ansatz"]}
+    return trial_params
+
+
 def _stack_walkers(wfn, nwalkers: int):
     """Tile a single walker wavefunction into a batched walker array."""
     def _stack(x):
@@ -194,7 +204,8 @@ def _load_trial_cfg_from_hparams(cfg, trial_params_path, logger):
 def _propagate_one(hmf, vhs_raw, step, expm_apply, dt, walker, aux):
     """Apply one Trotter step to a single walker with given aux fields."""
     wfn_packed, nelec = pack_spin(walker)
-    wfn = expm_apply(-0.5 * dt * hmf, wfn_packed)
+    wfn = wfn_packed.astype(step.dtype)
+    wfn = expm_apply(-0.5 * dt * hmf, wfn)
     vhs_sum = jnp.tensordot(aux, vhs_raw, axes=1)
     wfn = expm_apply(cmult(step, vhs_sum), wfn)
     wfn = expm_apply(-0.5 * dt * hmf, wfn)
@@ -314,17 +325,29 @@ def make_afqmc_step(trial, trial_params, hamiltonian, hmf, vhs_raw, vbar0, step,
                 (walkers_new, logw_new),
             )
 
-        # Optional ET shift feedback from population weights.
+        # Weighted mixed estimator (AFQMC energy) using current walker weights.
+        max_logw = jnp.max(logw_new)
+        weights = jnp.exp(logw_new - max_logw)
+        block_weight = jnp.sum(weights)
+        block_energy = jnp.sum(weights * eloc.real) / jnp.clip(block_weight, 1e-30)
+
+        # Optional ET shift update aligned with ad_afqmc population-control scheme.
         et_shift = state.et_shift
         if et_update and et_gamma > 0:
-            max_log = jnp.max(logw_new)
-            weights = jnp.exp(logw_new - max_log)
-            wsum = jnp.sum(weights)
-            et_corr = -et_gamma * (jnp.log(jnp.clip(wsum, 1e-30)) + max_log - jnp.log(weights.shape[0])) / dt
-            et_shift = et_shift + et_corr
+            pop_log = (jnp.log(jnp.clip(block_weight, 1e-30))
+                       + max_logw
+                       - jnp.log(weights.shape[0]))
+            et_shift = block_energy - et_gamma * pop_log / dt
 
         new_state = AFQMCState(state.step + 1, walkers_new, logw_new, y_state_new, key, alive, et_shift)
-        stats = {"eloc": eloc.real, "phase": phase_whole, "alive": alive, "et": et_shift}
+        stats = {
+            "eloc": eloc.real,
+            "block_energy": block_energy,
+            "block_weight": block_weight,
+            "phase": phase_whole,
+            "alive": alive,
+            "et": et_shift,
+        }
         return new_state, stats
 
     return step_fn
@@ -354,7 +377,7 @@ def run(cfg):
         trial_cfg = cfg.ansatz
     trial = Ansatz.create(hamiltonian, **trial_cfg)
     params_raw = load_pickle(trial_params_path)
-    trial_params = _extract_params(params_raw)
+    trial_params = _extract_ansatz_params(_extract_params(params_raw))
 
     bg_flag = cfg.afqmc.force_background
     bg_wfn = hamiltonian.wfn0 if bg_flag and str(bg_flag).lower() == "hf" else None
@@ -368,6 +391,7 @@ def run(cfg):
 
     n_walkers = cfg.afqmc.walkers
     walkers = _stack_walkers(hamiltonian.wfn0, n_walkers)
+    walkers = tree_map(lambda x: x.astype(step.dtype), walkers)
     logw = jnp.zeros((n_walkers,))
     alive = jnp.ones((n_walkers,), dtype=bool)
 
@@ -391,7 +415,7 @@ def run(cfg):
                 trial, trial_params, hamiltonian, vhs_raw, vbar0, w, f
             )[-1]
             eloc = jax.vmap(per_walker, in_axes=(0, 0))(walkers, fields)
-            logger.info(f"burn-in mean_eloc={float(jnp.mean(eloc)):.6f}")
+            logger.info(f"burn-in E={float(jnp.mean(eloc).real):.6f}")
 
     state = AFQMCState(0, walkers, logw, y_state, key, alive, jnp.array(cfg.afqmc.ET))
     step_fn = make_afqmc_step(
@@ -419,9 +443,17 @@ def run(cfg):
     if cfg.log.stat_freq > 0:
         stat_freq = int(cfg.log.stat_freq)
         for ii in range(0, steps, stat_freq):
-            mean_eloc = jnp.mean(stats["eloc"][ii])
+            block_energy = stats["block_energy"][ii]
+            block_weight = stats["block_weight"][ii]
             alive_count = jnp.sum(stats["alive"][ii])
             et_now = stats["et"][ii]
-            logger.info(f"step={ii} eloc={mean_eloc:.6f} alive={int(alive_count)} ET={float(et_now):.6f}")
+            logger.info(
+                "step=%d E=% .6f W=% .6f alive=%d ET=% .6f",
+                ii,
+                float(block_energy),
+                float(block_weight),
+                int(alive_count),
+                float(et_now),
+            )
 
     return state
