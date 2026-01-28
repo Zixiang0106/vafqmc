@@ -19,6 +19,7 @@ cfg.afqmc.phase_metro = True
 cfg.afqmc.pop_control = {"enabled": True, "freq": 5, "cap": 0.2}
 cfg.afqmc.et_update = {"enabled": True, "gamma": 0.1}
 cfg.afqmc.log_burnin_energy = True
+cfg.afqmc.trial_config_path = "hparams.yml"
 
 cfg.afqmc.hmc.dt = 0.1
 cfg.afqmc.hmc.length = 1.0

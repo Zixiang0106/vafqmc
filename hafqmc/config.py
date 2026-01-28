@@ -79,6 +79,7 @@ def afqmc_default() -> ConfigDict:
             "gamma": 0.1,
         },
         "log_burnin_energy": True,
+        "trial_config_path": None,
         "hmc": {
             "dt": 0.1,
             "length": 1.0,

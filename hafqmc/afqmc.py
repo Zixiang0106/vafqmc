@@ -1,4 +1,6 @@
 import logging
+import os
+import yaml
 from typing import NamedTuple
 
 import jax
@@ -8,7 +10,7 @@ from jax import numpy as jnp
 from .ansatz import Ansatz
 from .hamiltonian import calc_rdm, calc_slov, calc_v0, _align_rdm
 from .utils import (cmult, pack_spin, unpack_spin, ravel_shape, tree_map,
-                    make_expm_apply, warp_spin_expm, load_pickle)
+                    make_expm_apply, warp_spin_expm, load_pickle, dict_to_cfg)
 from .sampler import make_hamiltonian, make_batched, make_multistep
 from .propagator import orthonormalize
 
@@ -168,6 +170,27 @@ def _stochastic_reconfiguration(walkers, logw, key):
     return walkers, logw, key
 
 
+def _load_trial_cfg_from_hparams(cfg, trial_params_path, logger):
+    """Try to load ansatz config from a saved hparams.yml near params."""
+    cfg_path = getattr(cfg.afqmc, "trial_config_path", None)
+    if cfg_path is None and trial_params_path:
+        cfg_path = os.path.join(os.path.dirname(trial_params_path), "hparams.yml")
+    if cfg_path is None and getattr(cfg, "log", None) is not None:
+        cfg_path = getattr(cfg.log, "hpar_path", None)
+    if not cfg_path or not os.path.exists(cfg_path):
+        return None
+    try:
+        with open(cfg_path, "r") as fh:
+            data = yaml.safe_load(fh)
+        if not isinstance(data, dict) or "ansatz" not in data:
+            logger.warning(f"Trial config not found in {cfg_path}, falling back to cfg.ansatz")
+            return None
+        return dict_to_cfg(data["ansatz"], type_safe=False, convert_dict=True)
+    except Exception as exc:
+        logger.warning(f"Failed to read trial config from {cfg_path}: {exc}")
+        return None
+
+
 def _propagate_one(hmf, vhs_raw, step, expm_apply, dt, walker, aux):
     """Apply one Trotter step to a single walker with given aux fields."""
     wfn_packed, nelec = pack_spin(walker)
@@ -319,13 +342,17 @@ def run(cfg):
     from .hamiltonian import Hamiltonian_sym
     hamiltonian = Hamiltonian_sym(*hamil_data)
 
-    trial_cfg = cfg.afqmc.trial if ("trial" in cfg.afqmc and cfg.afqmc.trial) else cfg.ansatz
-    trial = Ansatz.create(hamiltonian, **trial_cfg)
     trial_params_path = (cfg.afqmc.trial_params
                          if "trial_params" in cfg.afqmc and cfg.afqmc.trial_params
                          else cfg.restart.params)
     if trial_params_path is None:
         raise ValueError("AFQMC requires cfg.afqmc.trial_params or cfg.restart.params.")
+    trial_cfg = cfg.afqmc.trial if ("trial" in cfg.afqmc and cfg.afqmc.trial) else None
+    if trial_cfg is None:
+        trial_cfg = _load_trial_cfg_from_hparams(cfg, trial_params_path, logger)
+    if trial_cfg is None:
+        trial_cfg = cfg.ansatz
+    trial = Ansatz.create(hamiltonian, **trial_cfg)
     params_raw = load_pickle(trial_params_path)
     trial_params = _extract_params(params_raw)
 
