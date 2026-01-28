@@ -247,7 +247,7 @@ def train(cfg: ConfigDict):
     else:
         log_once(logger, process_index,"Loading Hamiltonian from saved file")
         hamil_data = load_pickle(cfg.restart.hamiltonian)
-        HamCls = Hamiltonian_sym
+        HamCls = Hamiltonian
         hamiltonian = HamCls(*hamil_data)
         if process_index == 0:
             print(f"# HF energy from loaded: {hamiltonian.local_energy()}")

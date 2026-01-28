@@ -7,7 +7,88 @@ from .utils import tree_map, scatter
 from .molecule import integrals_from_scf, initwfn_from_scf
 from .molecule import initwfn_from_ghf, get_orth_ao, solve_ghf
 
+#######################################
+# JAX 版 sorted_eigen（适配厄米矩阵，支持 GPU）
+def sorted_eigen_jax(A, ascending=False, sort_by='abs'):
+    """
+    JAX 版：计算厄米/对称方阵的特征值/特征向量并排序（GPU 兼容）
+    若矩阵非厄米，自动降级到 CPU 用 eig 计算
+    """
+    A = jnp.asarray(A)
+    n = A.shape[0]
+    
+    if A.shape != (n, n):
+        raise ValueError(f"输入必须是方阵，当前形状：{A.shape}")
+    
+    # 步骤1：判断矩阵是否为厄米矩阵（量子化学中 hmf 通常是厄米的）
+    is_hermitian = jnp.allclose(A, jnp.conj(A.T), atol=1e-8)
+    
+    if is_hermitian:
+        # 厄米矩阵用 eigh（支持 GPU，返回实特征值）
+        eigenvalues, eigenvectors = jnp.linalg.eigh(A)
+    else:
+        # 非厄米矩阵：强制 CPU 后端用 eig 计算
+        with jax.default_device(jax.devices('cpu')[0]):
+            A_cpu = jnp.asarray(A)  # 转到 CPU
+            eigenvalues, eigenvectors = jnp.linalg.eig(A_cpu)
+    
+    # 步骤2：排序逻辑（与原版本一致）
+    if sort_by == 'real':
+        sort_values = jnp.real(eigenvalues)
+    elif sort_by == 'abs':
+        sort_values = jnp.abs(eigenvalues)
+    else:
+        raise ValueError("sort_by 必须为 'real' 或 'abs'")
+    
+    idx = jnp.argsort(sort_values)
+    if not ascending:
+        idx = idx[::-1]
+    
+    sorted_eigenvalues = eigenvalues[idx]
+    sorted_eigenvectors = eigenvectors[:, idx]
+    
+    return sorted_eigenvalues, sorted_eigenvectors
 
+# JAX 版 截断+对角化核心函数（兼容 cutoff_order=-1）
+def truncate_and_diagonalize_matrix_jax(matrix, cutoff_order):
+    """
+    适配 GPU + 兼容 cutoff_order=-1（保留所有特征值）
+    """
+    matrix = jnp.asarray(matrix)
+    n = matrix.shape[0]
+    
+    # 基础校验：兼容 cutoff_order=-1（保留所有）
+    if not isinstance(cutoff_order, int):
+        raise ValueError(f"截断阶数必须是整数，当前值：{cutoff_order}")
+    if cutoff_order == -1:
+        cutoff_order = n  # -1 表示保留所有特征值
+    elif cutoff_order <= 0:
+        raise ValueError(f"截断阶数必须是正整数或 -1，当前值：{cutoff_order}")
+    if cutoff_order > n:
+        raise ValueError(f"截断阶数({cutoff_order})不能超过矩阵维度({n})")
+    
+    # 对角化（用适配 GPU 的 sorted_eigen_jax）
+    eigenvalues, eigenvectors = sorted_eigen_jax(
+        matrix, ascending=False, sort_by='abs'
+    )
+    
+    # 检查复数特征值（厄米矩阵特征值应为实数，此处仅做兜底）
+    complex_mask = jnp.abs(eigenvalues.imag) > 1e-8
+    if jax.device_get(jnp.any(complex_mask)):
+        complex_eigs = jax.device_get(eigenvalues[complex_mask])
+        raise ValueError(f"检测到显著复数特征值：{complex_eigs}（虚部绝对值>1e-8）")
+    
+    # 截断（兼容 -1 的情况）
+    eigenvalues_truncated = eigenvalues[:cutoff_order]
+    eigenvectors_truncated = eigenvectors[:, :cutoff_order]
+    
+    # 构建结果
+    U = eigenvectors_truncated
+    D = jnp.diag(eigenvalues_truncated)
+    Vdagger = jnp.conj(eigenvectors_truncated).T
+    
+    return U, D, Vdagger
+#######################################
 def _has_spin(wfn):
     return not (isinstance(wfn, (jnp.ndarray, onp.ndarray)) 
                 and wfn.ndim == 2)
@@ -251,9 +332,15 @@ def calc_ejk_opt_g(ceri, bra, theta):
 
 class Hamiltonian:
 
-    def __init__(self, h1e, ceri, enuc, wfn0, aux=None, *, full_eri=False):
+    def __init__(self, h1e, ceri, h1e_U, h1e_D, h1e_Vdagger, ceri_U, ceri_D, ceri_Vdagger, enuc, wfn0, aux=None, *, full_eri=False):
         self.h1e = jnp.asarray(h1e)
         self.ceri = jnp.asarray(ceri)
+        self.h1e_U = jnp.asarray(h1e_U)
+        self.h1e_D = jnp.asarray(h1e_D)
+        self.h1e_Vdagger = jnp.asarray(h1e_Vdagger)
+        self.ceri_U = jnp.asarray(ceri_U)
+        self.ceri_D = jnp.asarray(ceri_D)
+        self.ceri_Vdagger = jnp.asarray(ceri_Vdagger)
         self._eri = jnp.einsum("kpr,kqs->prqs", ceri, ceri) if full_eri else None
         self.enuc = enuc
         self.wfn0 = tree_map(jnp.asarray, wfn0)
@@ -295,11 +382,48 @@ class Hamiltonian:
 
     def make_proj_op(self, trial):
         """generate the modified hmf, vhs and enuc for projection"""
-        eri = self.ceri if self._eri is None else self._eri
-        hmf_raw = self.h1e - 0.5 * calc_v0(eri)
-        vhs_raw = self.ceri # vhs is real here, will time 1j in propagator
+        ##########################
+        ceri = jnp.zeros((self.ceri_U.shape[0],self.ceri_U.shape[1],self.ceri_U.shape[1]))
+        for i in range(self.ceri_U.shape[0]):
+            ceri = ceri.at[i].set(self.ceri_U[0] @ self.ceri_D[i] @ self.ceri_Vdagger[0])
+        ##########################
+        h1e = self.h1e_U @ self.h1e_D @ self.h1e_Vdagger
+        eri = ceri if self._eri is None else self._eri
+        hmf_raw = h1e - 0.5 * calc_v0(eri)
+        vhs_raw = ceri # vhs is real here, will time 1j in propagator
+        #
+        truncated_order = self.ceri_D.shape[1]
+        #
         if trial is None:
-            return hmf_raw, vhs_raw, self.enuc
+            #
+            hmf_D = self.h1e_Vdagger @ hmf_raw @ self.h1e_U
+            #################
+            # hmf_U, hmf_D, hmd_Vdagger = truncate_and_diagonalize_matrix_jax(hmf_raw,truncated_order)
+            #################
+            vhs_D_vector = jnp.zeros((vhs_raw.shape[0],hmf_D.shape[0],hmf_D.shape[0]))
+            for i in range(vhs_raw.shape[0]):
+                vhs_D = self.ceri_Vdagger[0] @ vhs_raw[i] @ self.ceri_U[0]
+                vhs_D_vector = vhs_D_vector.at[i].set(vhs_D)
+            #################
+            # 
+            print(f"# hmf_D truncated_order: {hmf_D.shape[0]}")
+            print(f"# vhs_D_vector[0] truncated_order: {vhs_D_vector.shape[1]}")
+            #
+            return self.h1e_U, hmf_D, self.h1e_Vdagger, self.ceri_U, vhs_D_vector, self.ceri_Vdagger, self.enuc
+            #################
+            # vhs_U_vector = jnp.zeros((vhs_raw.shape[0],hmf_U.shape[0],hmf_D.shape[0]))
+            # vhs_D_vector = jnp.zeros((vhs_raw.shape[0],hmf_D.shape[0],hmf_D.shape[0]))
+            # vhs_Vdagger_vector = jnp.zeros((vhs_raw.shape[0],hmf_D.shape[0],hmf_U.shape[0]))
+            # for i in range(vhs_raw.shape[0]):
+            #     vhs_U, vhs_D, vhs_Vdagger = truncate_and_diagonalize_matrix_jax(vhs_raw,truncated_order)
+            #     vhs_U_vector = vhs_U_vector.at[i].set(vhs_U)
+            #     vhs_D_vector = vhs_D_vector.at[i].set(vhs_D)
+            #     vhs_Vdagger_vector = vhs_Vdagger_vector.at[i].set(vhs_Vdagger)
+            # print(f"# hmf_D truncated_order: {hmf_D.shape[0]}")
+            # print(f"# vhs_D_vector truncated_order: {vhs_D_vector.shape[1]}")
+            # #
+            # return hmf_U, hmf_D, hmd_Vdagger, vhs_U_vector, vhs_D_vector, vhs_Vdagger_vector, self.enuc
+            #################
         rdm_t = calc_rdm(trial, trial)
         if rdm_t.ndim == 3:
             rdm_t = rdm_t.sum(0)
@@ -307,7 +431,36 @@ class Hamiltonian:
         enuc = self.enuc - 0.5 * (vbar**2).sum()
         hmf = hmf_raw + jnp.einsum('kpq,k->pq', vhs_raw, vbar)
         vhs = vhs_raw - vbar.reshape(-1,1,1) * jnp.eye(vhs_raw.shape[-1]) / rdm_t.trace()
-        return hmf, vhs, enuc
+        #
+        hmf_D = self.h1e_Vdagger @ hmf @ self.h1e_U
+        #################
+        # hmf_U, hmf_D, hmd_Vdagger = truncate_and_diagonalize_matrix_jax(hmf,truncated_order)
+        #################
+        vhs_D_vector = jnp.zeros((vhs.shape[0],hmf_D.shape[0],hmf_D.shape[0]))
+        for i in range(vhs.shape[0]):
+            vhs_D = self.ceri_Vdagger[0] @ vhs[i] @ self.ceri_U[0]
+            vhs_D_vector = vhs_D_vector.at[i].set(vhs_D)
+        #################
+        # 
+        print(f"# hmf_D truncated_order: {hmf_D.shape[0]}")
+        print(f"# vhs_D_vector truncated_order: {vhs_D_vector.shape[1]}")
+        #
+        return self.h1e_U, hmf_D, self.h1e_Vdagger, self.ceri_U, vhs_D_vector, self.ceri_Vdagger, enuc
+        #################
+        # vhs_U_vector = jnp.zeros((vhs_raw.shape[0],hmf_U.shape[0],hmf_D.shape[0]))
+        # vhs_D_vector = jnp.zeros((vhs_raw.shape[0],hmf_D.shape[0],hmf_D.shape[0]))
+        # vhs_Vdagger_vector = jnp.zeros((vhs_raw.shape[0],hmf_D.shape[0],hmf_U.shape[0]))
+        # for i in range(vhs.shape[0]):
+        #     vhs_U, vhs_D, vhs_Vdagger = truncate_and_diagonalize_matrix_jax(vhs[i],truncated_order)
+        #     vhs_U_vector = vhs_U_vector.at[i].set(vhs_U)
+        #     vhs_D_vector = vhs_D_vector.at[i].set(vhs_D)
+        #     vhs_Vdagger_vector = vhs_Vdagger_vector.at[i].set(vhs_Vdagger)
+        # #
+        # print(f"# hmf_D truncated_order: {hmf_D.shape[0]}")
+        # print(f"# vhs_D_vector truncated_order: {vhs_D_vector.shape[1]}")
+        # #
+        # return hmf_U, hmf_D, hmd_Vdagger, vhs_U_vector, vhs_D_vector, vhs_Vdagger_vector, enuc
+        #################
 
     def make_ccsd_op(self):
         """generate hmf, vhs and corresponding masks from ccsd amps"""
@@ -353,129 +506,6 @@ class Hamiltonian:
         return cls(*ints, wfn0, aux, full_eri=full_eri)
 
 
-class Hamiltonian_sym:
-
-    def __init__(self, h1e, ceri, enuc, wfn0, aux=None, *, full_eri=False):
-        self.h1e = jnp.asarray(h1e)
-        self.ceri = jnp.asarray(ceri)
-        self._eri = jnp.einsum("kpr,kqs->prqs", ceri, ceri) if full_eri else None
-        self.enuc = enuc
-        self.wfn0 = tree_map(jnp.asarray, wfn0)
-        self.aux = aux if aux is not None else {}
-        self.nbasis = self.h1e.shape[-1]
-
-    def calc_e1b(self, rdm):
-        return calc_e1b(self.h1e, rdm)
-    
-    def calc_e2b(self, rdm):
-        eri = self.ceri if self._eri is None else self._eri
-        return calc_e2b(eri, rdm)
-    
-    def calc_e2b_opt(self, bra, theta):
-        return calc_e2b_opt(self.ceri, bra, theta)
-
-    calc_ovlp  = staticmethod(calc_ovlp)
-    calc_slov  = staticmethod(calc_slov)
-    calc_rdm   = staticmethod(calc_rdm)
-    calc_theta = staticmethod(calc_theta)
-
-    def local_energy(self, bra=None, ket=None, optimize=True):
-        """the normalized energy from two slater determinants"""
-        bra = bra if bra is not None else self.wfn0
-        ket = ket if ket is not None else self.wfn0
-        le_fn = (self.local_energy_opt 
-            if optimize and self._eri is None else self.local_energy_raw)
-        return le_fn(bra, ket)
-
-    def local_energy_raw(self, bra, ket):
-        rdm = calc_rdm(bra, ket)
-        return self.enuc + self.calc_e1b(rdm) + self.calc_e2b(rdm)
-    
-    def local_energy_opt(self, bra, ket):
-        bra, ket = _align_wfn(bra, ket)
-        theta = calc_theta(bra, ket)
-        rdm = calc_rdm_opt(bra, theta)
-        return self.enuc + self.calc_e1b(rdm) + self.calc_e2b_opt(bra, theta)
-
-    def make_proj_op(self, trial):
-        """generate the modified hmf, vhs and enuc for projection"""
-        eri = self.ceri if self._eri is None else self._eri
-        hmf_raw = self.h1e - 0.5 * calc_v0(eri)
-        vhs_raw = self.ceri # vhs is real here, will time 1j in propagator
-        if trial is None:
-            return hmf_raw, vhs_raw, self.enuc
-        rdm_t = calc_rdm(trial, trial)
-        if rdm_t.ndim == 3:
-            rdm_t = rdm_t.sum(0)
-        vbar = jnp.einsum("kpq,pq->k", vhs_raw, rdm_t)
-        enuc = self.enuc - 0.5 * (vbar**2).sum()
-        hmf = hmf_raw + jnp.einsum('kpq,k->pq', vhs_raw, vbar)
-        vhs = vhs_raw - vbar.reshape(-1,1,1) * jnp.eye(vhs_raw.shape[-1]) / rdm_t.trace()
-        return hmf, vhs, enuc
-    
-    def make_proj_op_sym(self, trial):
-        """generate the modified hmf, vhs and enuc for projection, vhs is diagonal"""
-        eri = self.ceri if self._eri is None else self._eri
-        hmf_raw = self.h1e - 0.5 * calc_v0(eri)
-        vhs_raw = self.ceri # vhs is real here, will time 1j in propagator
-        if trial is None:
-            # take diagonal elements as Jastrow initial
-            vhs_raw_dia = jnp.array ([jnp.diag (vhs_raw [i]) for i in range (vhs_raw.shape [0])])
-            return hmf_raw, vhs_raw_dia, self.enuc
-        rdm_t = calc_rdm(trial, trial)
-        if rdm_t.ndim == 3:
-            rdm_t = rdm_t.sum(0)
-        vbar = jnp.einsum("kpq,pq->k", vhs_raw, rdm_t)
-        enuc = self.enuc - 0.5 * (vbar**2).sum()
-        hmf = hmf_raw + jnp.einsum('kpq,k->pq', vhs_raw, vbar)
-        vhs = vhs_raw - vbar.reshape(-1,1,1) * jnp.eye(vhs_raw.shape[-1]) / rdm_t.trace()
-        # take diagonal elements as Jastrow initial
-        vhs_dia = jnp.array ([jnp.diag (vhs [i]) for i in range (vhs.shape [0])])
-        return hmf, vhs_dia, enuc
-
-    def make_ccsd_op(self):
-        """generate hmf, vhs and corresponding masks from ccsd amps"""
-        if "cc_t1" not in self.aux:
-            raise ValueError("cc data not found in hamiltonian")
-        t1, t2 = self.aux["cc_t1"], self.aux["cc_t2"]
-        t1 = t1[0] if isinstance(t1, tuple) else t1
-        t2 = t2[0] if isinstance(t2, tuple) else t2
-        nocc, nvir = t1.shape
-        noxv = nocc * nvir
-        nbas = nocc + nvir
-        hmf = jnp.zeros((nbas, nbas)).at[nocc:, :nocc].set(t1.swapaxes(0,1))
-        evs, vecs = jnp.linalg.eigh(t2.swapaxes(1,2).reshape(noxv, noxv))
-        tmpv = (jnp.sqrt(evs + 0j) * vecs).T.reshape(noxv, nocc, nvir)
-        vhs = jnp.zeros((noxv, nbas, nbas), tmpv.dtype)
-        vhs = vhs.at[:, nocc:, :nocc].set(tmpv.swapaxes(-1, -2))
-        mask = jnp.zeros((nbas, nbas), bool).at[nocc:, :nocc].set(True)
-        return hmf, vhs, mask
-    
-    def to_tuple(self):
-        return (self.h1e, self.ceri, self.enuc, self.wfn0, self.aux)
-
-    @classmethod
-    def from_pyscf(cls, mol_or_mf,
-                   chol_cut=1e-6, orth_ao=None, full_eri=False, 
-                   with_cc=False, with_ghf=False):
-        if not hasattr(mol_or_mf, "mo_coeff"):
-            mf = mol_or_mf.HF().run()
-        else:
-            mf = mol_or_mf
-        orth_mat = get_orth_ao(mf, orth_ao)
-        aux = {"orth_mat": orth_mat}
-        if with_cc:
-            assert orth_ao is None, "only support MO basis for CCSD amplitudes"
-            mcc = with_cc if hasattr(with_cc, "t1") else mf.CCSD().run()
-            aux.update(cc_t1=mcc.t1, cc_t2=mcc.t2)
-        if with_ghf:
-            mghf = with_ghf if hasattr(with_ghf, "mo_coeff") else solve_ghf(mf.mol)
-            aux.update(ghf_wfn=initwfn_from_ghf(mghf, mf, orth_mat))
-        ints = integrals_from_scf(mf, 
-            use_mcd=True, chol_cut=chol_cut, orth_ao=orth_mat)
-        wfn0 = initwfn_from_scf(mf, orth_mat)
-        return cls(*ints, wfn0, aux, full_eri=full_eri)
-        
 # below are methods for plane wave UEG calculations
 from .utils import symrange, rawcorr, fftconvolve
 

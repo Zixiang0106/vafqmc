@@ -55,22 +55,26 @@ class Propagator(nn.Module):
             **init_kwargs):
         # prepare data
         twfn = hamiltonian.wfn0
-        if (isinstance(expm_option, (list, tuple)) and len(expm_option) > 0 and expm_option[0] == "diag"):
-            init_hmf, init_vhs, init_enuc = hamiltonian.make_proj_op_sym(twfn)
-        else:
-            init_hmf, init_vhs, init_enuc = hamiltonian.make_proj_op(twfn)
+        init_hmf_U, init_hmf_D, init_hmf_Vdagger, init_vhs_U, init_vhs_D, init_vhs_Vdagger, init_enuc = hamiltonian.make_proj_op(twfn)
         if max_nhs is not None:
-            init_vhs = init_vhs[:max_nhs]
+            init_vhs_U = init_vhs_U[:max_nhs]
+            init_vhs_D = init_vhs_D[:max_nhs]
+            init_vhs_Vdagger = init_vhs_Vdagger[:max_nhs]
         if spin_mixing:
             ptb = (spin_mixing 
                 if isinstance(spin_mixing, (float, complex)) else 0.01)
-            init_hmf = block_spin(init_hmf, init_hmf, ptb)
-            # 判断 expm_option
-            if (isinstance(expm_option, (list, tuple)) and len(expm_option) > 0 and expm_option[0] == "diag"):
-                init_vhs = jnp.array([jnp.concatenate((init_vhs[i], init_vhs[i])) for i in range(init_vhs.shape[0])])
+            # if input UDVdagger is single spin, generate a new UDVdagger in spin mix style
+            if hamiltonian.nbasis == init_hmf_U.shape[0]:
+                init_hmf_U = block_spin(init_hmf_U, init_hmf_U, 0.0)
+                init_hmf_D = block_spin(init_hmf_D, init_hmf_D, ptb)
+                init_hmf_Vdagger = block_spin(init_hmf_Vdagger, init_hmf_Vdagger, 0.0)
+                init_vhs_U = jax.vmap(block_spin, (0,0,None))(init_vhs_U, init_vhs_U, 0.0)
+                init_vhs_D = jax.vmap(block_spin, (0,0,None))(init_vhs_D, init_vhs_D, ptb)
+                init_vhs_Vdagger = jax.vmap(block_spin, (0,0,None))(init_vhs_Vdagger, init_vhs_Vdagger, 0.0)
             else:
-                init_vhs = jax.vmap(block_spin, (0,0,None))(init_vhs, init_vhs, ptb)
-            print("init_vhs in make_proj_op: ", init_vhs.shape)
+                if 2*hamiltonian.nbasis != init_hmf_U.shape[0]:
+                    raise ValueError("Error: 2*hamiltonian.nbasis != init_hmf_U.shape[0]")
+            #
             twfn = _make_ghf(twfn)
         mfwfn = twfn if mf_subtract else None
         # handle parameter options
@@ -79,7 +83,9 @@ class Propagator(nn.Module):
         _cd = parse_bool(("hmf", "vhs", "tsteps"), use_complex)
         # make one body operator
         hmf_op = OneBody(
-            init_hmf, 
+            init_hmf_U, 
+            init_hmf_D, 
+            init_hmf_Vdagger, 
             parametrize=_pd["hmf"], 
             init_random=init_random,
             hermite_out=hermite_ops,
@@ -93,7 +99,9 @@ class Propagator(nn.Module):
             AuxFieldCls = AuxFieldNet
             network_args = ensure_mapping(aux_network, "hidden_sizes")
         vhs_op = AuxFieldCls(
-            init_vhs,
+            init_vhs_U,
+            init_vhs_D,
+            init_vhs_Vdagger,
             trial_wfn=mfwfn,
             parametrize=_pd["vhs"],
             init_random=init_random,

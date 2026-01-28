@@ -12,7 +12,9 @@ from .hamiltonian import _align_rdm, calc_rdm
 
 
 class OneBody(nn.Module):
-    init_hmf: jnp.ndarray
+    init_hmf_U: jnp.ndarray
+    init_hmf_D: jnp.ndarray
+    init_hmf_Vdagger: jnp.ndarray
     parametrize: bool = False
     init_random: float = 0.
     hermite_out: bool = False
@@ -21,17 +23,25 @@ class OneBody(nn.Module):
 
     @property
     def nbasis(self):
-        return self.init_hmf.shape[-1]
+        return self.init_hmf_U.shape[-1]
 
     def setup(self):
         if self.parametrize:
-            self.hmf = self.param("hmf", fix_init, 
-                self.init_hmf, self.dtype, self.init_random)
+            self.hmf_U = self.param("hmf_U", fix_init, 
+                self.init_hmf_U, self.dtype, self.init_random)
+            self.hmf_D = self.param("hmf_D", fix_init, 
+                self.init_hmf_D, self.dtype, self.init_random)
+            self.hmf_Vdagger = self.param("hmf_Vdagger", fix_init, 
+                self.init_hmf_Vdagger, self.dtype, self.init_random)
         else:
-            self.hmf = self.init_hmf
+            self.hmf_U = self.init_hmf_U
+            self.hmf_D = self.init_hmf_D
+            self.hmf_Vdagger = self.init_hmf_Vdagger
 
     def __call__(self, step):
-        hmf = symmetrize(self.hmf) if self.hermite_out else self.hmf
+        # hmf = self.init_hmf_U @ self.hmf_D @ self.init_hmf_Vdagger
+        hmf = self.hmf_U @ self.hmf_D @ self.hmf_Vdagger
+        hmf = symmetrize(hmf) if self.hermite_out else hmf
         hmf = cmult(step, hmf)
         return hmf
     
@@ -43,7 +53,9 @@ class OneBody(nn.Module):
 
 
 class AuxField(nn.Module):
-    init_vhs: jnp.ndarray
+    init_vhs_U: jnp.ndarray
+    init_vhs_D: jnp.ndarray
+    init_vhs_Vdagger: jnp.ndarray
     trial_wfn: Optional[jnp.ndarray] = None
     parametrize: bool = False
     init_random: float = 0.
@@ -53,36 +65,45 @@ class AuxField(nn.Module):
 
     @property
     def nbasis(self):
-        return self.init_vhs.shape[-1]
+        return self.init_vhs_U.shape[1]
 
     @property
     def nfield(self):
-        return self.init_vhs.shape[0]
+        return self.init_vhs_U.shape[0]
 
     def setup(self):
         if self.parametrize:
-            self.vhs = self.param("vhs", fix_init, 
-                self.init_vhs, self.dtype, self.init_random)
+            self.vhs_U0 = self.param("vhs_U0", fix_init, 
+                self.init_vhs_U[0], self.dtype, self.init_random)
+            self.vhs_D = self.param("vhs_D", fix_init, 
+                self.init_vhs_D, self.dtype, self.init_random)
+            self.vhs_Vdagger0 = self.param("vhs_Vdagger0", fix_init, 
+                self.init_vhs_Vdagger[0], self.dtype, self.init_random)
         else:
-            self.vhs = self.init_vhs
-        self.nhs = self.init_vhs.shape[0]
+            self.vhs_U0 = self.init_vhs_U[0]
+            self.vhs_D = self.init_vhs_D
+            self.vhs_Vdagger0 = self.init_vhs_Vdagger[0]
+        self.nhs = self.init_vhs_U.shape[0]
         self.trial_rdm = (calc_rdm(self.trial_wfn, self.trial_wfn) 
             if self.trial_wfn is not None else None)
 
     def __call__(self, step, fields, curr_wfn=None):
-        vhs = symmetrize(self.vhs) if self.hermite_out else self.vhs
+        # check the rank to ensure low rank form of VHS
+        # vhs = jnp.einsum('ijk,ikl,ilm->ijm', self.init_vhs_U, self.vhs_D, self.init_vhs_Vdagger)
+        vhs = jnp.einsum('jk,ikl,lm->ijm', self.vhs_U0, self.vhs_D, self.vhs_Vdagger0)
+        vhs = symmetrize(vhs) if self.hermite_out else vhs
+        #
         log_weight = - 0.5 * (fields ** 2).sum()
-        if (isinstance(self.expm_option, (list, tuple)) and len(self.expm_option) > 0 and self.expm_option[0] != "diag"):
-          if self.trial_rdm is not None:
-              vhs, vbar0 = meanfield_subtract(vhs, self.trial_rdm)
-              fields += step * vbar0
-          # this dynamic shift is buggy, keep it here for reference
-          if curr_wfn is not None and self.trial_wfn is not None:
-              trdm = calc_rdm(self.trial_wfn, curr_wfn)
-              _, vbar = meanfield_subtract(vhs, lax.stop_gradient(trdm), 0.1)
-              fshift = step * vbar
-              log_weight += - fields @ fshift - 0.5 * (fshift ** 2).sum()
-              fields += fshift
+        if self.trial_rdm is not None:
+            vhs, vbar0 = meanfield_subtract(vhs, self.trial_rdm)
+            fields += step * vbar0
+        # this dynamic shift is buggy, keep it here for reference
+        if curr_wfn is not None and self.trial_wfn is not None:
+            trdm = calc_rdm(self.trial_wfn, curr_wfn)
+            _, vbar = meanfield_subtract(vhs, lax.stop_gradient(trdm), 0.1)
+            fshift = step * vbar
+            log_weight += - fields @ fshift - 0.5 * (fshift ** 2).sum()
+            fields += fshift
         vhs_sum = jnp.tensordot(fields, vhs, axes=1)
         vhs_sum = cmult(step, vhs_sum)
         return vhs_sum, log_weight
@@ -122,7 +143,14 @@ class AuxFieldNet(AuxField):
             self.network = None
         
     def __call__(self, step, fields, curr_wfn=None):
-        vhs = symmetrize(self.vhs) if self.hermite_out else self.vhs
+        # check the rank to ensure low rank form of VHS
+        if self.vhs.shape[2] < self.vhs.shape[1]:
+            A = self.vhs
+            B = jnp.conj(self.vhs.transpose(0,2,1))
+            vhs = jnp.einsum('ijk,inl->ijl', A, B)
+        else:
+            vhs = symmetrize(self.vhs) if self.hermite_out else self.vhs
+        #
         log_weight = - 0.5 * (fields ** 2).sum()
         tmp = fields
         if self.network is not None:
