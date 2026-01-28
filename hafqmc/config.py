@@ -58,6 +58,40 @@ def ueg_prop() -> ConfigDict:
     type_safe=False, convert_dict=True)
 
 
+def afqmc_default() -> ConfigDict:
+    return ConfigDict({
+        "dt": 0.01,
+        "steps": 1000,
+        "walkers": 200,
+        "force_cap": 1.5,
+        "force_background": "hf",  # "hf" or None
+        "ET": 0.0,
+        "stabilize_step": 5,
+        "expm_option": ["scan", 6, 1],
+        "phase_metro": True,
+        "pop_control": {
+            "enabled": True,
+            "freq": 5,
+            "cap": 0.2,
+        },
+        "et_update": {
+            "enabled": True,
+            "gamma": 0.1,
+        },
+        "log_burnin_energy": True,
+        "hmc": {
+            "dt": 0.1,
+            "length": 1.0,
+            "n_chains": 20,
+            "sweeps": 1,
+            "burn_in": 10,
+        },
+        "trial_params": None,
+        "trial": None,
+    },
+    type_safe=False, convert_dict=True)
+
+
 def default() -> ConfigDict:
     return ConfigDict({
         "restart": {
@@ -120,7 +154,8 @@ def default() -> ConfigDict:
             "hpar_path": "hparams.yml",
             "hamil_path": "hamiltonian.pkl",
             "level": "WARNING",
-        }
+        },
+        "afqmc": afqmc_default(),
     }, 
     type_safe=False, convert_dict=True)
 
