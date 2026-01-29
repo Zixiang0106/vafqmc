@@ -212,11 +212,12 @@ def _propagate_one(hmf, vhs_raw, step, expm_apply, dt, walker, aux):
     return unpack_spin(wfn, nelec)
 
 
-def make_afqmc_step(trial, trial_params, hamiltonian, hmf, vhs_raw, vbar0, step,
+def make_afqmc_step(trial, trial_params, hamiltonian, hmf, vhs_raw, vbar0, enuc, step,
                     expm_apply, sampler, unravel_fn, cfg):
     """Build one AFQMC propagation step function."""
     n_chains = cfg["hmc"]["n_chains"]
     dt = cfg["dt"]
+    force_scale = jnp.sqrt(dt)
     force_cap = cfg["force_cap"]
     et_gamma = cfg.get("et_gamma", 0.0)
     et_update = cfg.get("et_update", False)
@@ -240,7 +241,7 @@ def make_afqmc_step(trial, trial_params, hamiltonian, hmf, vhs_raw, vbar0, step,
             trial, trial_params, hamiltonian, vhs_raw, vbar0, w, f)
         phi_t, logw_t, o_old, vbar, eloc = jax.vmap(per_walker, in_axes=(0, 0))(state.walkers, fields)
 
-        force = step * (vbar - vbar0)
+        force = force_scale * (vbar - vbar0).real
         if force_cap is not None and force_cap > 0:
             mag = jnp.abs(force)
             force = jnp.where(mag > force_cap, force * (force_cap / mag), force)
@@ -250,8 +251,7 @@ def make_afqmc_step(trial, trial_params, hamiltonian, hmf, vhs_raw, vbar0, step,
         aux = noise + force
 
         # Force-bias contribution to the weight.
-        logw_fb = (0.5 * jnp.sum(force * force, axis=-1) - jnp.sum(aux * force, axis=-1)
-                   - step * jnp.sum(aux * vbar0, axis=-1)).real
+        logw_fb = (0.5 * jnp.sum(force * force, axis=-1) - jnp.sum(aux * force, axis=-1))
 
         # Propagate walkers with Trotterized propagator.
         prop_one = lambda w, a: _propagate_one(hmf, vhs_raw, step, expm_apply, dt, w, a)
@@ -266,13 +266,14 @@ def make_afqmc_step(trial, trial_params, hamiltonian, hmf, vhs_raw, vbar0, step,
         log_abs_ratio = jnp.log(jnp.abs(ratio) + 1e-12)
 
         # Base log-weight update before phase constraint.
-        logw_base = state.logw + logw_fb + dt * state.et_shift + log_abs_ratio
+        logw_base = state.logw + logw_fb + dt * (state.et_shift - eloc.real) + log_abs_ratio
 
         # Update trial-path HMC state.
         keys = jax.random.split(key_hmc, state.logw.shape[0])
         sample_one = lambda k, w, s: sampler.sample(k, w, s)
         y_state_new, _ = jax.vmap(sample_one, in_axes=(0, 0, 0))(keys, walkers_new, state.y_state)
 
+        fields_new = None
         if phase_metro:
             # Phase-Metro correction via overlap phase change after HMC update.
             flat_fields_new = y_state_new[0]
@@ -326,10 +327,23 @@ def make_afqmc_step(trial, trial_params, hamiltonian, hmf, vhs_raw, vbar0, step,
             )
 
         # Weighted mixed estimator (AFQMC energy) using current walker weights.
+        if fields_new is None:
+            flat_fields_new = y_state_new[0]
+            fields_new = _unravel_batched(unravel_fn, flat_fields_new, (state.logw.shape[0], n_chains))
+        eloc_measure = jax.vmap(
+            lambda w, f: _compute_force_and_overlap(
+                trial, trial_params, hamiltonian, vhs_raw, vbar0, w, f
+            )[-1],
+            in_axes=(0, 0),
+        )(walkers_new, fields_new).real
+        clip_ref = state.et_shift
+        clip_thr = jnp.sqrt(2.0 / dt)
+        eloc_measure = jnp.where(jnp.abs(eloc_measure - clip_ref) > clip_thr, clip_ref, eloc_measure)
+
         max_logw = jnp.max(logw_new)
         weights = jnp.exp(logw_new - max_logw)
         block_weight = jnp.sum(weights)
-        block_energy = jnp.sum(weights * eloc.real) / jnp.clip(block_weight, 1e-30)
+        block_energy = jnp.sum(weights * eloc_measure) / jnp.clip(block_weight, 1e-30)
 
         # Optional ET shift update aligned with ad_afqmc population-control scheme.
         et_shift = state.et_shift
@@ -341,7 +355,7 @@ def make_afqmc_step(trial, trial_params, hamiltonian, hmf, vhs_raw, vbar0, step,
 
         new_state = AFQMCState(state.step + 1, walkers_new, logw_new, y_state_new, key, alive, et_shift)
         stats = {
-            "eloc": eloc.real,
+            "eloc": eloc_measure,
             "block_energy": block_energy,
             "block_weight": block_weight,
             "phase": phase_whole,
@@ -419,7 +433,7 @@ def run(cfg):
 
     state = AFQMCState(0, walkers, logw, y_state, key, alive, jnp.array(cfg.afqmc.ET))
     step_fn = make_afqmc_step(
-        trial, trial_params, hamiltonian, hmf, vhs_raw, vbar0, step,
+        trial, trial_params, hamiltonian, hmf, vhs_raw, vbar0, enuc, step,
         expm_apply, sampler, unravel_fn, {
             "dt": cfg.afqmc.dt,
             "force_cap": cfg.afqmc.force_cap,
