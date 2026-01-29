@@ -80,12 +80,30 @@ def afqmc_default() -> ConfigDict:
         },
         "log_burnin_energy": True,
         "trial_config_path": None,
+        "trial_mode": "hf",  # "hf" (fixed HF baseline) or "hmc" (VAFQMC trial paths)
+        "blocking": {
+            "enabled": False,
+            "writes": 50,        # number of output blocks
+            "measures": 2,       # measurements per write block
+            "skip_steps": 5,     # AFQMC steps between measurements
+            "equil_writes": 0,   # equilibration blocks before sampling (0 = off)
+        },
+        "icf": {
+            "enabled": False,
+            "thermal_steps": 0,
+            "et_adjust_step": 0,
+            "et_adjust_max": 0,
+            "et_bg_estimate_step": 0,
+            "et_bg_estimate_max": 0,
+        },
         "hmc": {
             "dt": 0.1,
             "length": 1.0,
             "n_chains": 20,
             "sweeps": 1,
             "burn_in": 10,
+            "measure_thermal_sweeps": 0,
+            "measure_sweeps": 1,
         },
         "trial_params": None,
         "trial": None,
