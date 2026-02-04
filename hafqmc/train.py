@@ -9,7 +9,7 @@ from tensorboardX import SummaryWriter
 from typing import NamedTuple
 
 from .molecule import build_mf
-from .hamiltonian import Hamiltonian, HamiltonianPW, Hamiltonian_sym
+from .hamiltonian import Hamiltonian, HamiltonianPW
 from .ansatz import Ansatz, BraKet
 from .estimator import make_eval_total
 from .sampler import make_sampler, make_multistep, make_batched, SamplerUnion

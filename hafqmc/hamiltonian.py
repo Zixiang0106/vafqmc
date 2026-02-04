@@ -332,15 +332,15 @@ def calc_ejk_opt_g(ceri, bra, theta):
 
 class Hamiltonian:
 
-    def __init__(self, h1e, ceri, h1e_U, h1e_D, h1e_Vdagger, ceri_U, ceri_D, ceri_Vdagger, enuc, wfn0, aux=None, *, full_eri=False):
+    def __init__(self, h1e, ceri, h1e_U, h1e_D, h1e_Vdagger, ceri_U0, ceri_D, ceri_V0dagger, enuc, wfn0, aux=None, *, full_eri=False):
         self.h1e = jnp.asarray(h1e)
         self.ceri = jnp.asarray(ceri)
         self.h1e_U = jnp.asarray(h1e_U)
         self.h1e_D = jnp.asarray(h1e_D)
         self.h1e_Vdagger = jnp.asarray(h1e_Vdagger)
-        self.ceri_U = jnp.asarray(ceri_U)
+        self.ceri_U0 = jnp.asarray(ceri_U0)
         self.ceri_D = jnp.asarray(ceri_D)
-        self.ceri_Vdagger = jnp.asarray(ceri_Vdagger)
+        self.ceri_V0dagger = jnp.asarray(ceri_V0dagger)
         self._eri = jnp.einsum("kpr,kqs->prqs", ceri, ceri) if full_eri else None
         self.enuc = enuc
         self.wfn0 = tree_map(jnp.asarray, wfn0)
@@ -383,46 +383,31 @@ class Hamiltonian:
     def make_proj_op(self, trial):
         """generate the modified hmf, vhs and enuc for projection"""
         ##########################
-        ceri = jnp.zeros((self.ceri_U.shape[0],self.ceri_U.shape[1],self.ceri_U.shape[1]))
-        for i in range(self.ceri_U.shape[0]):
-            ceri = ceri.at[i].set(self.ceri_U[0] @ self.ceri_D[i] @ self.ceri_Vdagger[0])
+        ceri = jnp.zeros((self.ceri_D.shape[0],self.ceri_U0.shape[0],self.ceri_U0.shape[0]))
+        for i in range(self.ceri_D.shape[0]):
+            ceri = ceri.at[i].set(self.ceri_U0 @ self.ceri_D[i] @ self.ceri_V0dagger)
         ##########################
         h1e = self.h1e_U @ self.h1e_D @ self.h1e_Vdagger
         eri = ceri if self._eri is None else self._eri
         hmf_raw = h1e - 0.5 * calc_v0(eri)
         vhs_raw = ceri # vhs is real here, will time 1j in propagator
         #
-        truncated_order = self.ceri_D.shape[1]
-        #
         if trial is None:
             #
             hmf_D = self.h1e_Vdagger @ hmf_raw @ self.h1e_U
             #################
-            # hmf_U, hmf_D, hmd_Vdagger = truncate_and_diagonalize_matrix_jax(hmf_raw,truncated_order)
             #################
             vhs_D_vector = jnp.zeros((vhs_raw.shape[0],hmf_D.shape[0],hmf_D.shape[0]))
             for i in range(vhs_raw.shape[0]):
-                vhs_D = self.ceri_Vdagger[0] @ vhs_raw[i] @ self.ceri_U[0]
+                vhs_D = self.ceri_V0dagger @ vhs_raw[i] @ self.ceri_U0
                 vhs_D_vector = vhs_D_vector.at[i].set(vhs_D)
             #################
             # 
             print(f"# hmf_D truncated_order: {hmf_D.shape[0]}")
             print(f"# vhs_D_vector[0] truncated_order: {vhs_D_vector.shape[1]}")
             #
-            return self.h1e_U, hmf_D, self.h1e_Vdagger, self.ceri_U, vhs_D_vector, self.ceri_Vdagger, self.enuc
+            return self.h1e_U, hmf_D, self.h1e_Vdagger, self.ceri_U0, vhs_D_vector, self.ceri_V0dagger, self.enuc
             #################
-            # vhs_U_vector = jnp.zeros((vhs_raw.shape[0],hmf_U.shape[0],hmf_D.shape[0]))
-            # vhs_D_vector = jnp.zeros((vhs_raw.shape[0],hmf_D.shape[0],hmf_D.shape[0]))
-            # vhs_Vdagger_vector = jnp.zeros((vhs_raw.shape[0],hmf_D.shape[0],hmf_U.shape[0]))
-            # for i in range(vhs_raw.shape[0]):
-            #     vhs_U, vhs_D, vhs_Vdagger = truncate_and_diagonalize_matrix_jax(vhs_raw,truncated_order)
-            #     vhs_U_vector = vhs_U_vector.at[i].set(vhs_U)
-            #     vhs_D_vector = vhs_D_vector.at[i].set(vhs_D)
-            #     vhs_Vdagger_vector = vhs_Vdagger_vector.at[i].set(vhs_Vdagger)
-            # print(f"# hmf_D truncated_order: {hmf_D.shape[0]}")
-            # print(f"# vhs_D_vector truncated_order: {vhs_D_vector.shape[1]}")
-            # #
-            # return hmf_U, hmf_D, hmd_Vdagger, vhs_U_vector, vhs_D_vector, vhs_Vdagger_vector, self.enuc
             #################
         rdm_t = calc_rdm(trial, trial)
         if rdm_t.ndim == 3:
@@ -438,28 +423,14 @@ class Hamiltonian:
         #################
         vhs_D_vector = jnp.zeros((vhs.shape[0],hmf_D.shape[0],hmf_D.shape[0]))
         for i in range(vhs.shape[0]):
-            vhs_D = self.ceri_Vdagger[0] @ vhs[i] @ self.ceri_U[0]
+            vhs_D = self.ceri_V0dagger @ vhs[i] @ self.ceri_U0
             vhs_D_vector = vhs_D_vector.at[i].set(vhs_D)
         #################
         # 
         print(f"# hmf_D truncated_order: {hmf_D.shape[0]}")
         print(f"# vhs_D_vector truncated_order: {vhs_D_vector.shape[1]}")
         #
-        return self.h1e_U, hmf_D, self.h1e_Vdagger, self.ceri_U, vhs_D_vector, self.ceri_Vdagger, enuc
-        #################
-        # vhs_U_vector = jnp.zeros((vhs_raw.shape[0],hmf_U.shape[0],hmf_D.shape[0]))
-        # vhs_D_vector = jnp.zeros((vhs_raw.shape[0],hmf_D.shape[0],hmf_D.shape[0]))
-        # vhs_Vdagger_vector = jnp.zeros((vhs_raw.shape[0],hmf_D.shape[0],hmf_U.shape[0]))
-        # for i in range(vhs.shape[0]):
-        #     vhs_U, vhs_D, vhs_Vdagger = truncate_and_diagonalize_matrix_jax(vhs[i],truncated_order)
-        #     vhs_U_vector = vhs_U_vector.at[i].set(vhs_U)
-        #     vhs_D_vector = vhs_D_vector.at[i].set(vhs_D)
-        #     vhs_Vdagger_vector = vhs_Vdagger_vector.at[i].set(vhs_Vdagger)
-        # #
-        # print(f"# hmf_D truncated_order: {hmf_D.shape[0]}")
-        # print(f"# vhs_D_vector truncated_order: {vhs_D_vector.shape[1]}")
-        # #
-        # return hmf_U, hmf_D, hmd_Vdagger, vhs_U_vector, vhs_D_vector, vhs_Vdagger_vector, enuc
+        return self.h1e_U, hmf_D, self.h1e_Vdagger, self.ceri_U0, vhs_D_vector, self.ceri_V0dagger, enuc
         #################
 
     def make_ccsd_op(self):

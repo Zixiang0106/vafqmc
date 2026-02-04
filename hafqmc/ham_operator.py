@@ -53,9 +53,9 @@ class OneBody(nn.Module):
 
 
 class AuxField(nn.Module):
-    init_vhs_U: jnp.ndarray
+    init_vhs_U0: jnp.ndarray
     init_vhs_D: jnp.ndarray
-    init_vhs_Vdagger: jnp.ndarray
+    init_vhs_V0dagger: jnp.ndarray
     trial_wfn: Optional[jnp.ndarray] = None
     parametrize: bool = False
     init_random: float = 0.
@@ -65,46 +65,64 @@ class AuxField(nn.Module):
 
     @property
     def nbasis(self):
-        return self.init_vhs_U.shape[1]
+        return self.init_vhs_U0.shape[1]
 
     @property
     def nfield(self):
-        return self.init_vhs_U.shape[0]
+        return self.init_vhs_D.shape[0]
 
     def setup(self):
         if self.parametrize:
             self.vhs_U0 = self.param("vhs_U0", fix_init, 
-                self.init_vhs_U[0], self.dtype, self.init_random)
+                self.init_vhs_U0, self.dtype, self.init_random)
             self.vhs_D = self.param("vhs_D", fix_init, 
                 self.init_vhs_D, self.dtype, self.init_random)
-            self.vhs_Vdagger0 = self.param("vhs_Vdagger0", fix_init, 
-                self.init_vhs_Vdagger[0], self.dtype, self.init_random)
+            self.vhs_V0dagger = self.param("vhs_V0dagger", fix_init, 
+                self.init_vhs_V0dagger, self.dtype, self.init_random)
         else:
-            self.vhs_U0 = self.init_vhs_U[0]
+            self.vhs_U0 = self.init_vhs_U0
             self.vhs_D = self.init_vhs_D
-            self.vhs_Vdagger0 = self.init_vhs_Vdagger[0]
-        self.nhs = self.init_vhs_U.shape[0]
+            self.vhs_V0dagger = self.init_vhs_V0dagger
+        self.nhs = self.init_vhs_U0.shape[0]
         self.trial_rdm = (calc_rdm(self.trial_wfn, self.trial_wfn) 
             if self.trial_wfn is not None else None)
 
     def __call__(self, step, fields, curr_wfn=None):
         # check the rank to ensure low rank form of VHS
         # vhs = jnp.einsum('ijk,ikl,ilm->ijm', self.init_vhs_U, self.vhs_D, self.init_vhs_Vdagger)
-        vhs = jnp.einsum('jk,ikl,lm->ijm', self.vhs_U0, self.vhs_D, self.vhs_Vdagger0)
-        vhs = symmetrize(vhs) if self.hermite_out else vhs
+        ###########
+        # vhs = jnp.einsum('jk,ikl,lm->ijm', self.vhs_U0, self.vhs_D, self.vhs_V0dagger)
+        # vhs = symmetrize(vhs) if self.hermite_out else vhs
+        # #
+        # log_weight = - 0.5 * (fields ** 2).sum()
+        # if self.trial_rdm is not None:
+        #     vhs, vbar0 = meanfield_subtract(vhs, self.trial_rdm)
+        #     fields += step * vbar0
+        # # this dynamic shift is buggy, keep it here for reference
+        # if curr_wfn is not None and self.trial_wfn is not None:
+        #     trdm = calc_rdm(self.trial_wfn, curr_wfn)
+        #     _, vbar = meanfield_subtract(vhs, lax.stop_gradient(trdm), 0.1)
+        #     fshift = step * vbar
+        #     log_weight += - fields @ fshift - 0.5 * (fshift ** 2).sum()
+        #     fields += fshift
+        # vhs_sum = jnp.tensordot(fields, vhs, axes=1)
+        # vhs_sum = cmult(step, vhs_sum)
+        # return vhs_sum, log_weight
+        ###########
+        vhs_D = self.vhs_D
+        # 
+        if self.hermite_out:
+            raise ValueError("Error: hermite_out not implemented for low rank VHS!")
         #
         log_weight = - 0.5 * (fields ** 2).sum()
         if self.trial_rdm is not None:
-            vhs, vbar0 = meanfield_subtract(vhs, self.trial_rdm)
-            fields += step * vbar0
+            raise ValueError("Error: trial_rdm not implemented for low rank VHS!")
         # this dynamic shift is buggy, keep it here for reference
         if curr_wfn is not None and self.trial_wfn is not None:
-            trdm = calc_rdm(self.trial_wfn, curr_wfn)
-            _, vbar = meanfield_subtract(vhs, lax.stop_gradient(trdm), 0.1)
-            fshift = step * vbar
-            log_weight += - fields @ fshift - 0.5 * (fshift ** 2).sum()
-            fields += fshift
-        vhs_sum = jnp.tensordot(fields, vhs, axes=1)
+            raise ValueError("Error: dynamic shift not implemented for low rank VHS!")
+        #
+        vhs_D_sum = jnp.tensordot(fields, vhs_D, axes=1)
+        vhs_sum = self.vhs_U0 @ vhs_D_sum @ self.vhs_V0dagger
         vhs_sum = cmult(step, vhs_sum)
         return vhs_sum, log_weight
     
