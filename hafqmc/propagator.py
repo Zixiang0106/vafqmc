@@ -57,9 +57,7 @@ class Propagator(nn.Module):
         twfn = hamiltonian.wfn0
         init_hmf_U, init_hmf_D, init_hmf_Vdagger, init_vhs_U, init_vhs_D, init_vhs_Vdagger, init_enuc = hamiltonian.make_proj_op(twfn)
         if max_nhs is not None:
-            init_vhs_U = init_vhs_U[:max_nhs]
             init_vhs_D = init_vhs_D[:max_nhs]
-            init_vhs_Vdagger = init_vhs_Vdagger[:max_nhs]
         if spin_mixing:
             ptb = (spin_mixing 
                 if isinstance(spin_mixing, (float, complex)) else 0.01)
