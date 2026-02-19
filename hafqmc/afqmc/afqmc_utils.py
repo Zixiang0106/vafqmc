@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Optional, Tuple, Union
 
 import jax
+import numpy as onp
 from jax import numpy as jnp
 from jax import scipy as jsp
 
@@ -38,7 +39,9 @@ class PropagationData:
 
 
 def _is_det_trial(trial: Any) -> bool:
-    return isinstance(trial, (tuple, jnp.ndarray))
+    if isinstance(trial, (tuple, list)):
+        return True
+    return isinstance(trial, (jnp.ndarray, onp.ndarray))
 
 
 def _is_custom_trial(trial: Any) -> bool:
@@ -84,9 +87,9 @@ def build_propagation_data(hamil: Hamiltonian, trial: Any, dt: float) -> Propaga
     vbar = jnp.einsum("kpq,pq->k", vhs, rdm_t)
     v1 = jnp.einsum("k,kpq->pq", vbar, vhs)
 
-    h1_mod = h1 - v0 - v1
+    h1_mod = h1 - v0 + v1
     mf_shifts = 1.0j * vbar
-    h0_prop = -hamil.enuc - 0.5 * jnp.sum(mf_shifts * mf_shifts)
+    h0_prop = hamil.enuc + 0.5 * jnp.sum(mf_shifts * mf_shifts)
     exp_h1 = jsp.linalg.expm(-0.5 * dt * h1_mod)
 
     return PropagationData(

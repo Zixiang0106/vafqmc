@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 import jax
 from jax import lax, numpy as jnp
+import numpy as onp
 
 from ..hamiltonian import Hamiltonian
 from ..propagator import orthonormalize
@@ -101,6 +102,12 @@ def _propagate_step(
     )
 
 
+def _calc_mixed_energy(hamil: Hamiltonian, trial: Any, state: AFQMCState) -> Array:
+    e_loc = jnp.real(calc_local_energy_batch(hamil, trial, state.walkers))
+    wsum = jnp.maximum(jnp.sum(state.weights), 1.0e-12)
+    return jnp.sum(state.weights * e_loc) / wsum
+
+
 def _calc_force_bias_det(trial: Any, walkers: Any, prop_data: PropagationData) -> Any:
     rdm = calc_rdm_batch(trial, walkers)
     rdm_sum = _spin_sum_rdm(rdm)
@@ -171,7 +178,7 @@ def _propagate_step_det(
     )
 
 
-def _maybe_orthonormalize_det(
+def _orthonormalize_det(
     trial: Any,
     state: AFQMCState,
     do_ortho: jnp.ndarray,
@@ -209,7 +216,7 @@ def _scan_steps_det(
         st = _propagate_step_det(trial, st, prop_data, min_weight, max_weight)
         if ortho_interval_i > 0:
             do_ortho = ((idx + 1) % ortho_interval_i) == 0
-            st = _maybe_orthonormalize_det(trial, st, do_ortho)
+            st = _orthonormalize_det(trial, st, do_ortho)
         wsum = jnp.sum(st.weights)
         return (st, idx + 1), wsum
 
@@ -297,19 +304,48 @@ def afqmc_energy(
                     time.time() - start,
                 )
     else:
+        pure_err_logged = False
         for step in range(cfg.n_eq_steps):
+            if (
+                _is_custom_trial(trial)
+                and hasattr(trial, "refresh_samples")
+                and int(getattr(trial, "refresh_interval", 0)) > 0
+                and (step % int(getattr(trial, "refresh_interval", 0)) == 0)
+            ):
+                state.key, subkey = jax.random.split(state.key)
+                seed = int(onp.asarray(jax.random.randint(subkey, (), 0, 2**31 - 1)))
+                trial.refresh_samples(seed=seed)
+
             state = _propagate_step(hamil, trial, state, prop_data, cfg)
             state = maybe_orthonormalize(trial, state, step, cfg.ortho_interval)
             if cfg.log_interval > 0 and (
                 (step + 1) % cfg.log_interval == 0 or step + 1 == cfg.n_eq_steps
             ):
                 wsum = float(jnp.sum(state.weights))
+                e_mix = float(_calc_mixed_energy(hamil, trial, state))
+                e_trial_msg = ""
+                pure_pairs = int(getattr(trial, "pure_eval_pairs", 1))
+                if pure_pairs > 0 and hasattr(trial, "calc_pure_energy_inference"):
+                    try:
+                        e_trial = float(jnp.real(trial.calc_pure_energy_inference(hamil)))
+                        e_trial_msg = f" e_trial_pure={e_trial:.12f}"
+                    except Exception as exc:
+                        if (not pure_err_logged) and logger is not None:
+                            logger.warning(
+                                "trial pure-energy diagnostic failed; disabling pure log in AFQMC eql. error=%s",
+                                str(exc),
+                            )
+                            pure_err_logged = True
+                        if hasattr(trial, "pure_eval_pairs"):
+                            trial.pure_eval_pairs = 0
                 logger.info(
-                    "Eql %d/%d wsum=%.3e e_est=%.12f elapsed=%.2fs",
+                    "Eql %d/%d wsum=%.3e e_mix=%.12f e_est=%.12f%s elapsed=%.2fs",
                     step + 1,
                     cfg.n_eq_steps,
                     wsum,
+                    e_mix,
                     float(state.e_estimate),
+                    e_trial_msg,
                     time.time() - start,
                 )
 
@@ -330,6 +366,16 @@ def afqmc_energy(
         )
 
     for blk in range(cfg.n_blocks):
+        if (
+            _is_custom_trial(trial)
+            and hasattr(trial, "refresh_samples")
+            and int(getattr(trial, "refresh_interval", 0)) > 0
+            and (blk % int(getattr(trial, "refresh_interval", 0)) == 0)
+        ):
+            state.key, subkey = jax.random.split(state.key)
+            seed = int(onp.asarray(jax.random.randint(subkey, (), 0, 2**31 - 1)))
+            trial.refresh_samples(seed=seed)
+
         if use_jit:
             state, _ = block_scan(state)
         else:
