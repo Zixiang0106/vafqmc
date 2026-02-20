@@ -8,7 +8,6 @@ from typing import Any, Optional
 
 import jax
 from jax import lax, numpy as jnp
-import numpy as onp
 
 from ..hamiltonian import Hamiltonian
 from ..propagator import orthonormalize
@@ -67,11 +66,11 @@ def _propagate_step(
     )
 
     walkers_new = apply_trotter(state.walkers, shifted_fields, prop_data)
-    sign_new, logov_new = calc_slov_batch(trial, walkers_new)
+    sign_prop, logov_prop = calc_slov_batch(trial, walkers_new)
 
     valid = jnp.isfinite(state.logov)
-    log_ratio = jnp.where(valid, logov_new - state.logov, -jnp.inf)
-    sign_ratio = jnp.where(valid, sign_new / state.sign, 0.0 + 0.0j)
+    log_ratio = jnp.where(valid, logov_prop - state.logov, -jnp.inf)
+    sign_ratio = jnp.where(valid, sign_prop / state.sign, 0.0 + 0.0j)
     ovlp_ratio = sign_ratio * jnp.exp(log_ratio)
 
     imp = jnp.exp(
@@ -86,6 +85,21 @@ def _propagate_step(
     imp_ph = jnp.where(imp_ph < cfg.min_weight, 0.0, imp_ph)
     imp_ph = jnp.where(imp_ph > cfg.max_weight, 0.0, imp_ph)
 
+    # For tethered custom trials, update per-walker sample pools immediately
+    # after walker propagation, then apply an extra hand-off phaseless factor.
+    sign_new, logov_new = sign_prop, logov_prop
+    walker_fields = state.walker_fields
+    if _is_custom_trial(trial) and hasattr(trial, "update_tethered_samples"):
+        handoff, sign_new, logov_new = trial.update_tethered_samples(walkers_new)
+        if hasattr(trial, "walker_fields") and getattr(trial, "walker_fields") is not None:
+            walker_fields = trial.walker_fields
+        handoff = jnp.real(handoff)
+        handoff = jnp.where(jnp.isnan(handoff), 0.0, handoff)
+        handoff = jnp.where(handoff < 0.0, 0.0, handoff)
+        handoff = jnp.where(handoff < cfg.min_weight, 0.0, handoff)
+        handoff = jnp.where(handoff > cfg.max_weight, 0.0, handoff)
+        imp_ph = imp_ph * handoff
+
     weights = state.weights * imp_ph
     weights = jnp.where(weights > cfg.max_weight, 0.0, weights)
     wsum = jnp.maximum(jnp.sum(weights), 1.0e-12)
@@ -99,6 +113,7 @@ def _propagate_step(
         key=key,
         e_estimate=state.e_estimate,
         pop_control_shift=pop_control_shift,
+        walker_fields=walker_fields,
     )
 
 
@@ -175,6 +190,7 @@ def _propagate_step_det(
         key=key,
         e_estimate=state.e_estimate,
         pop_control_shift=pop_control_shift,
+        walker_fields=state.walker_fields,
     )
 
 
@@ -194,6 +210,7 @@ def _orthonormalize_det(
             key=state.key,
             e_estimate=state.e_estimate,
             pop_control_shift=state.pop_control_shift,
+            walker_fields=state.walker_fields,
         )
 
     return lax.cond(do_ortho, _apply, lambda _: state, operand=None)
@@ -245,6 +262,9 @@ def afqmc_energy(
     prop_data = build_propagation_data(hamil, trial, cfg.dt)
     key = jax.random.PRNGKey(cfg.seed)
     walkers, key = init_walkers(trial, cfg.n_walkers, key, noise=cfg.init_noise)
+    if _is_custom_trial(trial) and hasattr(trial, "bind_walkers"):
+        key, trial_key = jax.random.split(key)
+        trial.bind_walkers(walkers, key=trial_key, reinit=True)
     if not _is_custom_trial(trial):
         # Ensure stable dtypes for jit/scan
         w_up, w_dn = walkers
@@ -265,6 +285,13 @@ def afqmc_energy(
         key=key,
         e_estimate=e_estimate,
         pop_control_shift=e_estimate,
+        walker_fields=(
+            trial.walker_fields
+            if _is_custom_trial(trial)
+            and hasattr(trial, "walker_fields")
+            and getattr(trial, "walker_fields") is not None
+            else jnp.zeros((0, 0, 0), dtype=jnp.float64)
+        ),
     )
 
     logger.info(
@@ -306,16 +333,6 @@ def afqmc_energy(
     else:
         pure_err_logged = False
         for step in range(cfg.n_eq_steps):
-            if (
-                _is_custom_trial(trial)
-                and hasattr(trial, "refresh_samples")
-                and int(getattr(trial, "refresh_interval", 0)) > 0
-                and (step % int(getattr(trial, "refresh_interval", 0)) == 0)
-            ):
-                state.key, subkey = jax.random.split(state.key)
-                seed = int(onp.asarray(jax.random.randint(subkey, (), 0, 2**31 - 1)))
-                trial.refresh_samples(seed=seed)
-
             state = _propagate_step(hamil, trial, state, prop_data, cfg)
             state = maybe_orthonormalize(trial, state, step, cfg.ortho_interval)
             if cfg.log_interval > 0 and (
@@ -366,16 +383,6 @@ def afqmc_energy(
         )
 
     for blk in range(cfg.n_blocks):
-        if (
-            _is_custom_trial(trial)
-            and hasattr(trial, "refresh_samples")
-            and int(getattr(trial, "refresh_interval", 0)) > 0
-            and (blk % int(getattr(trial, "refresh_interval", 0)) == 0)
-        ):
-            state.key, subkey = jax.random.split(state.key)
-            seed = int(onp.asarray(jax.random.randint(subkey, (), 0, 2**31 - 1)))
-            trial.refresh_samples(seed=seed)
-
         if use_jit:
             state, _ = block_scan(state)
         else:
@@ -400,6 +407,7 @@ def afqmc_energy(
             key=state.key,
             e_estimate=0.9 * state.e_estimate + 0.1 * block_energy,
             pop_control_shift=state.pop_control_shift,
+            walker_fields=state.walker_fields,
         )
 
         if cfg.resample:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Tuple
 
 import jax
@@ -22,6 +22,9 @@ class AFQMCState:
     key: Array
     e_estimate: Array
     pop_control_shift: Array
+    walker_fields: Array = field(
+        default_factory=lambda: jnp.zeros((0, 0, 0), dtype=jnp.float64)
+    )
 
 
 # Register AFQMCState as a PyTree node for JAX jit/scan usage.
@@ -36,6 +39,7 @@ tree_util.register_pytree_node(
             s.key,
             s.e_estimate,
             s.pop_control_shift,
+            s.walker_fields,
         ),
         None,
     ),
@@ -76,6 +80,8 @@ def maybe_orthonormalize(trial: Any, state: AFQMCState, step: int, interval: int
 
     if _is_custom_trial(trial) and hasattr(trial, "orthonormalize_walkers"):
         walkers = trial.orthonormalize_walkers(state.walkers)
+        if hasattr(trial, "on_walkers_updated"):
+            trial.on_walkers_updated(walkers)
     else:
         _require_spin_det(state.walkers)
         walkers, _ = orthonormalize(state.walkers)
@@ -86,6 +92,7 @@ def maybe_orthonormalize(trial: Any, state: AFQMCState, step: int, interval: int
         weights=state.weights,
         sign=sign,
         logov=logov,
+        walker_fields=state.walker_fields,
         key=state.key,
         e_estimate=state.e_estimate,
         pop_control_shift=state.pop_control_shift,
@@ -96,11 +103,13 @@ def stochastic_reconfiguration(trial: Any, state: AFQMCState, key: Array) -> AFQ
     if _is_custom_trial(trial) and hasattr(trial, "stochastic_reconfiguration"):
         walkers, weights = trial.stochastic_reconfiguration(state.walkers, state.weights, key)
         sign, logov = calc_slov_batch(trial, walkers)
+        walker_fields = getattr(trial, "walker_fields", state.walker_fields)
         return AFQMCState(
             walkers=walkers,
             weights=weights,
             sign=sign,
             logov=logov,
+            walker_fields=walker_fields,
             key=state.key,
             e_estimate=state.e_estimate,
             pop_control_shift=state.pop_control_shift,
@@ -120,6 +129,9 @@ def stochastic_reconfiguration(trial: Any, state: AFQMCState, key: Array) -> AFQ
     w_up = w_up[idx]
     w_dn = w_dn[idx]
     walkers = (w_up, w_dn)
+    walker_fields = state.walker_fields
+    if walker_fields.ndim == 3 and walker_fields.shape[0] == n_walkers:
+        walker_fields = walker_fields[idx]
 
     new_weights = jnp.ones_like(weights) * (wsum / n_walkers)
     sign, logov = calc_slov_batch(trial, walkers)
@@ -128,6 +140,7 @@ def stochastic_reconfiguration(trial: Any, state: AFQMCState, key: Array) -> AFQ
         weights=new_weights,
         sign=sign,
         logov=logov,
+        walker_fields=walker_fields,
         key=state.key,
         e_estimate=state.e_estimate,
         pop_control_shift=state.pop_control_shift,

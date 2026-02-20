@@ -25,6 +25,8 @@ Wfn = Union[Array, SpinWfn]
 # - get_rdm1() or calc_rdm1() or rdm1 -> spin-summed RDM for mean-field shift
 # - init_walkers(n_walkers, key, noise=0.0) -> walkers (optional)
 # - orthonormalize_walkers(walkers) -> walkers (optional)
+# - bind_walkers(walkers, key=..., reinit=...) to initialize per-walker pools
+# - update_tethered_samples(walkers) -> (handoff, sign_new, logov_new) (optional)
 
 
 @dataclass
