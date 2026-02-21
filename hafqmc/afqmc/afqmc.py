@@ -25,6 +25,7 @@ from .afqmc_utils import (
     _is_custom_trial,
     _spin_sum_rdm,
 )
+from .vafqmc_trial import VAFQMCTrial
 from .walker import AFQMCState, init_walkers, maybe_orthonormalize, stochastic_reconfiguration
 
 
@@ -467,9 +468,70 @@ def afqmc_energy_from_pickle(
     )
 
 
+def afqmc_energy_from_checkpoint(
+    hamil_path: str,
+    checkpoint_path: str,
+    *,
+    hparams_path: str = "hparams.yml",
+    cfg: Optional[AFQMCConfig] = None,
+    logger: Optional[logging.Logger] = None,
+    n_walkers: Optional[int] = None,
+    n_samples: int = 20,
+    burn_in: int = 1000,
+    sampler_name: str = "hmc",
+    sampler_kwargs: Optional[dict] = None,
+    sampling_target: str = "walker_overlap",
+    logdens_floor: float = -60.0,
+    refresh_interval: int = 0,
+    replace_per_refresh: int = 1,
+    sample_update_steps: int = 1,
+    init_walkers_from_trial: bool = False,
+    init_walkers_burn_in: int = 0,
+    pure_eval_pairs: int = 1000,
+    max_prop: Optional[Any] = None,
+    seed: int = 0,
+    return_state: bool = False,
+    return_blocks: bool = False,
+):
+    """Run AFQMC by building VAFQMCTrial from checkpoint + hparams."""
+    cfg = cfg or AFQMCConfig()
+    if n_walkers is not None:
+        cfg = AFQMCConfig(**{**cfg.__dict__, "n_walkers": int(n_walkers)})
+
+    hamil = load_hamiltonian(hamil_path)
+    trial = VAFQMCTrial.from_hparams_checkpoint(
+        hamil,
+        checkpoint_path,
+        hparams_path=hparams_path,
+        n_samples=n_samples,
+        burn_in=burn_in,
+        sampler_name=sampler_name,
+        sampler_kwargs=sampler_kwargs,
+        sampling_target=sampling_target,
+        logdens_floor=logdens_floor,
+        refresh_interval=refresh_interval,
+        replace_per_refresh=replace_per_refresh,
+        sample_update_steps=sample_update_steps,
+        init_walkers_from_trial=init_walkers_from_trial,
+        init_walkers_burn_in=init_walkers_burn_in,
+        pure_eval_pairs=pure_eval_pairs,
+        max_prop=max_prop,
+        seed=seed,
+    )
+    return afqmc_energy(
+        hamil,
+        trial=trial,
+        cfg=cfg,
+        logger=logger,
+        return_state=return_state,
+        return_blocks=return_blocks,
+    )
+
+
 __all__ = [
     "AFQMCConfig",
     "afqmc_energy",
+    "afqmc_energy_from_checkpoint",
     "afqmc_energy_from_pickle",
     "build_hamiltonian_pickle",
 ]
