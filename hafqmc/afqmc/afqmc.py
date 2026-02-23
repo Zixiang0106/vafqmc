@@ -1,33 +1,21 @@
-"""AFQMC driver (single-determinant, phaseless)."""
+"""Public AFQMC API and trial dispatch."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import logging
 import time
+from collections.abc import Mapping
 from typing import Any, Optional
 
-import jax
-from jax import lax, numpy as jnp
+from ml_collections import ConfigDict
 
 from ..hamiltonian import Hamiltonian
-from ..propagator import orthonormalize
-from .afqmc_config import AFQMCConfig
-from .afqmc_utils import (
-    PropagationData,
-    apply_trotter,
-    build_hamiltonian_pickle,
-    build_propagation_data,
-    calc_force_bias,
-    calc_rdm_batch,
-    calc_local_energy_batch,
-    calc_slov_batch,
-    load_hamiltonian,
-    _is_custom_trial,
-    _spin_sum_rdm,
-)
-from .stochastic_trial import VAFQMCTrial
-from .walker import AFQMCState, init_walkers, maybe_orthonormalize, stochastic_reconfiguration
+from .afqmc_config import AFQMCConfig, default as afqmc_default, stochastic_trial_default
+from .afqmc_utils import build_hamiltonian_pickle, load_hamiltonian
+from .driver.custom import run_afqmc_custom
+from .driver.det import run_afqmc_det
+from .trial.single_det import as_spin_det, is_single_det_trial
+from .trial.stochastic import VAFQMCTrial
 
 
 def _get_logger(logger: Optional[logging.Logger] = None) -> logging.Logger:
@@ -43,712 +31,186 @@ def _get_logger(logger: Optional[logging.Logger] = None) -> logging.Logger:
     return logger
 
 
-def _propagate_step(
-    hamil: Hamiltonian,
-    trial: Any,
-    state: AFQMCState,
-    prop_data: PropagationData,
-    cfg: AFQMCConfig,
-) -> AFQMCState:
-    n_walkers = state.weights.shape[0]
-    nchol = prop_data.vhs.shape[0]
-    trial_state = state.trial_state
+def _to_cfg(cfg: Any | None) -> ConfigDict:
+    if cfg is None:
+        return AFQMCConfig.default()
+    if isinstance(cfg, ConfigDict):
+        return cfg.copy_and_resolve_references()
+    if isinstance(cfg, Mapping):
+        merged = afqmc_default()
+        for k, v in cfg.items():
+            merged[k] = v
+        return merged
+    return cfg
 
-    key, subkey = jax.random.split(state.key)
-    fields = jax.random.normal(
-        subkey, (n_walkers, nchol), dtype=jnp.real(prop_data.vhs).dtype
-    )
 
-    if (
-        _is_custom_trial(trial)
-        and trial_state is not None
-        and hasattr(trial, "calc_force_bias_state")
+def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
+    """Attach flat aliases expected by existing driver kernels."""
+    out = cfg.copy_and_resolve_references()
+
+    # legacy flat top-level support (if user passes AFQMCConfig(dt=...))
+    p = out.get("propagation", None)
+    if p is None:
+        p = out.propagation = afqmc_default().propagation
+    pop = out.get("pop_control", None)
+    if pop is None:
+        pop = out.pop_control = afqmc_default().pop_control
+
+    if "dt" in out:
+        p.dt = out.dt
+    if "n_walkers" in out:
+        p.n_walkers = out.n_walkers
+    if "n_prop_steps" in out:
+        p.n_prop_steps = out.n_prop_steps
+    if "n_blocks" in out:
+        p.n_blocks = out.n_blocks
+    if "n_eq_steps" in out:
+        p.n_eq_steps = out.n_eq_steps
+    if "ortho_interval" in out:
+        p.ortho_interval = out.ortho_interval
+    if "log_interval" in out:
+        p.log_interval = out.log_interval
+
+    if "init_noise" in out:
+        pop.init_noise = out.init_noise
+    if "resample" in out:
+        pop.resample = out.resample
+    if "min_weight" in out:
+        pop.min_weight = out.min_weight
+    if "max_weight" in out:
+        pop.max_weight = out.max_weight
+
+    st = out.get("stochastic_trial", None)
+    if st is None and str(out.get("trial_type", "single_det")).lower() in (
+        "stochastic",
+        "vafqmc",
+        "vtrial",
+        "custom",
     ):
-        force_bias = trial.calc_force_bias_state(state.walkers, prop_data, trial_state)
+        st = out.stochastic_trial = stochastic_trial_default()
+
+    out.dt = float(p.dt)
+    out.n_walkers = int(p.n_walkers)
+    out.n_prop_steps = int(p.n_prop_steps)
+    out.n_blocks = int(p.n_blocks)
+    out.n_eq_steps = int(p.n_eq_steps)
+    out.ortho_interval = int(p.ortho_interval)
+    out.log_interval = int(p.log_interval)
+
+    out.init_noise = float(pop.init_noise)
+    out.resample = bool(pop.resample)
+    out.min_weight = float(pop.min_weight)
+    out.max_weight = float(pop.max_weight)
+
+    if st is None:
+        out.n_measure_samples = 1
     else:
-        force_bias = calc_force_bias(hamil, trial, state.walkers, prop_data)
-    field_shifts = -prop_data.sqrt_dt * (1.0j * force_bias - prop_data.mf_shifts)
-    shifted_fields = fields - field_shifts
+        if "n_measure_samples" in out:
+            st.n_measure_samples = out.n_measure_samples
+        out.n_measure_samples = int(st.get("n_measure_samples", 1))
 
-    shift_term = jnp.einsum("wk,k->w", shifted_fields, prop_data.mf_shifts)
-    fb_term = jnp.einsum("wk,wk->w", fields, field_shifts) - 0.5 * jnp.einsum(
-        "wk,wk->w", field_shifts, field_shifts
-    )
+    if "trial_kind" in out:
+        out.trial_type = out.trial_kind
 
-    walkers_new = apply_trotter(state.walkers, shifted_fields, prop_data)
-    if (
-        _is_custom_trial(trial)
-        and trial_state is not None
-        and hasattr(trial, "calc_slov_state")
-    ):
-        sign_prop, logov_prop = trial.calc_slov_state(walkers_new, trial_state)
-    else:
-        sign_prop, logov_prop = calc_slov_batch(trial, walkers_new)
-
-    valid = jnp.isfinite(state.logov)
-    log_ratio = jnp.where(valid, logov_prop - state.logov, -jnp.inf)
-    sign_ratio = jnp.where(valid, sign_prop / state.sign, 0.0 + 0.0j)
-    ovlp_ratio = sign_ratio * jnp.exp(log_ratio)
-
-    imp = jnp.exp(
-        -prop_data.sqrt_dt * shift_term
-        + fb_term
-        + prop_data.dt * (state.pop_control_shift + prop_data.h0_prop)
-    ) * ovlp_ratio
-    theta = jnp.angle(jnp.exp(-prop_data.sqrt_dt * shift_term) * ovlp_ratio)
-    imp_ph = jnp.abs(imp) * jnp.cos(theta)
-    imp_ph = jnp.where(jnp.isnan(imp_ph), 0.0, imp_ph)
-    imp_ph = jnp.where(imp_ph < 0.0, 0.0, imp_ph)
-    imp_ph = jnp.where(imp_ph < cfg.min_weight, 0.0, imp_ph)
-    imp_ph = jnp.where(imp_ph > cfg.max_weight, 0.0, imp_ph)
-
-    # For tethered custom trials, update per-walker sample pools immediately
-    # after walker propagation, then apply an extra hand-off phaseless factor.
-    sign_new, logov_new = sign_prop, logov_prop
-    walker_fields = state.walker_fields
-    if (
-        _is_custom_trial(trial)
-        and trial_state is not None
-        and hasattr(trial, "update_tethered_samples_state")
-    ):
-        trial_state, handoff, sign_new, logov_new = trial.update_tethered_samples_state(
-            walkers_new,
-            trial_state,
-            old_sign=sign_prop,
-            old_logov=logov_prop,
-        )
-        if isinstance(trial_state, dict) and ("walker_fields" in trial_state):
-            walker_fields = trial_state["walker_fields"]
-        handoff = jnp.real(handoff)
-        handoff = jnp.where(jnp.isnan(handoff), 0.0, handoff)
-        handoff = jnp.where(handoff < 0.0, 0.0, handoff)
-        handoff = jnp.where(handoff < cfg.min_weight, 0.0, handoff)
-        handoff = jnp.where(handoff > cfg.max_weight, 0.0, handoff)
-        imp_ph = imp_ph * handoff
-
-    weights = state.weights * imp_ph
-    weights = jnp.where(weights > cfg.max_weight, 0.0, weights)
-    wsum = jnp.maximum(jnp.sum(weights), 1.0e-12)
-    pop_control_shift = state.e_estimate - 0.1 * jnp.log(wsum / n_walkers) / prop_data.dt
-
-    return AFQMCState(
-        walkers=walkers_new,
-        weights=weights,
-        sign=sign_new,
-        logov=logov_new,
-        key=key,
-        e_estimate=state.e_estimate,
-        pop_control_shift=pop_control_shift,
-        walker_fields=walker_fields,
-        trial_state=trial_state,
-    )
+    return out
 
 
-def _calc_mixed_energy(hamil: Hamiltonian, trial: Any, state: AFQMCState) -> Array:
-    if (
-        _is_custom_trial(trial)
-        and state.trial_state is not None
-        and hasattr(trial, "calc_local_energy_state")
-    ):
-        e_loc = jnp.real(trial.calc_local_energy_state(hamil, state.walkers, state.trial_state))
-    else:
-        e_loc = jnp.real(calc_local_energy_batch(hamil, trial, state.walkers))
-    wsum = jnp.maximum(jnp.sum(state.weights), 1.0e-12)
-    return jnp.sum(state.weights * e_loc) / wsum
+def _stochastic_sampler_kwargs(st_cfg: Any) -> dict[str, Any]:
+    sampler = st_cfg.sampler
+    kwargs = dict(getattr(sampler, "kwargs", {}) or {})
+    if str(sampler.name).lower() in ("hmc", "hamiltonian", "hybrid"):
+        kwargs.setdefault("dt", float(sampler.dt))
+        kwargs.setdefault("length", float(sampler.length))
+    return kwargs
 
 
-def _calc_block_energy_once(
-    hamil: Hamiltonian,
-    trial: Any,
-    state: AFQMCState,
-    cfg: AFQMCConfig,
-) -> Array:
-    if (
-        _is_custom_trial(trial)
-        and state.trial_state is not None
-        and hasattr(trial, "calc_local_energy_state")
-    ):
-        e_loc = jnp.real(trial.calc_local_energy_state(hamil, state.walkers, state.trial_state))
-    else:
-        e_loc = jnp.real(calc_local_energy_batch(hamil, trial, state.walkers))
-    clip = jnp.sqrt(2.0 / cfg.dt)
-    e_loc = jnp.where(
-        jnp.abs(e_loc - state.e_estimate) > clip, state.e_estimate, e_loc
-    )
-    wsum = jnp.maximum(jnp.sum(state.weights), 1.0e-12)
-    return jnp.sum(state.weights * e_loc) / wsum
+def _build_trial_from_config(hamil: Hamiltonian, cfg: ConfigDict) -> Any:
+    kind = str(cfg.trial_type).lower()
+    if kind in ("single_det", "single-det", "det", "sd", "reference", "hf"):
+        return hamil.wfn0
 
+    if kind in ("stochastic", "vafqmc", "vtrial", "custom"):
+        st = cfg.get("stochastic_trial", None)
+        if st is None:
+            st = stochastic_trial_default()
+            cfg.stochastic_trial = st
 
-def _calc_force_bias_det(trial: Any, walkers: Any, prop_data: PropagationData) -> Any:
-    rdm = calc_rdm_batch(trial, walkers)
-    rdm_sum = _spin_sum_rdm(rdm)
-    return jnp.einsum("kpq,wpq->wk", prop_data.vhs, rdm_sum)
-
-
-def _propagate_step_det(
-    trial: Any,
-    state: AFQMCState,
-    prop_data: PropagationData,
-    min_weight: float,
-    max_weight: float,
-) -> AFQMCState:
-    n_walkers = state.weights.shape[0]
-    nchol = prop_data.vhs.shape[0]
-
-    key, subkey = jax.random.split(state.key)
-    fields = jax.random.normal(
-        subkey, (n_walkers, nchol), dtype=jnp.real(prop_data.vhs).dtype
-    )
-
-    force_bias = _calc_force_bias_det(trial, state.walkers, prop_data)
-    field_shifts = -prop_data.sqrt_dt * (1.0j * force_bias - prop_data.mf_shifts)
-    shifted_fields = fields - field_shifts
-
-    shift_term = jnp.einsum("wk,k->w", shifted_fields, prop_data.mf_shifts)
-    fb_term = jnp.einsum("wk,wk->w", fields, field_shifts) - 0.5 * jnp.einsum(
-        "wk,wk->w", field_shifts, field_shifts
-    )
-
-    walkers_new = apply_trotter(state.walkers, shifted_fields, prop_data)
-    sign_new, logov_new = calc_slov_batch(trial, walkers_new)
-    # Keep dtypes stable inside lax.scan
-    sign_new = sign_new.astype(state.sign.dtype)
-    logov_new = logov_new.astype(state.logov.dtype)
-
-    valid = jnp.isfinite(state.logov)
-    log_ratio = jnp.where(valid, logov_new - state.logov, -jnp.inf)
-    sign_ratio = jnp.where(valid, sign_new / state.sign, 0.0 + 0.0j)
-    ovlp_ratio = sign_ratio * jnp.exp(log_ratio)
-
-    imp = jnp.exp(
-        -prop_data.sqrt_dt * shift_term
-        + fb_term
-        + prop_data.dt * (state.pop_control_shift + prop_data.h0_prop)
-    ) * ovlp_ratio
-    theta = jnp.angle(jnp.exp(-prop_data.sqrt_dt * shift_term) * ovlp_ratio)
-    imp_ph = jnp.abs(imp) * jnp.cos(theta)
-    imp_ph = jnp.where(jnp.isnan(imp_ph), 0.0, imp_ph)
-    imp_ph = jnp.where(imp_ph < 0.0, 0.0, imp_ph)
-    imp_ph = jnp.where(imp_ph < min_weight, 0.0, imp_ph)
-    imp_ph = jnp.where(imp_ph > max_weight, 0.0, imp_ph)
-
-    imp_ph = jnp.real(imp_ph).astype(state.weights.dtype)
-    weights = (state.weights * imp_ph).astype(state.weights.dtype)
-    weights = jnp.where(weights > max_weight, 0.0, weights)
-    wsum = jnp.maximum(jnp.sum(weights), 1.0e-12)
-    pop_control_shift = state.e_estimate - 0.1 * jnp.log(wsum / n_walkers) / prop_data.dt
-
-    return AFQMCState(
-        walkers=walkers_new,
-        weights=weights,
-        sign=sign_new,
-        logov=logov_new,
-        key=key,
-        e_estimate=state.e_estimate,
-        pop_control_shift=pop_control_shift,
-        walker_fields=state.walker_fields,
-        trial_state=state.trial_state,
-    )
-
-
-def _orthonormalize_det(
-    trial: Any,
-    state: AFQMCState,
-    do_ortho: jnp.ndarray,
-) -> AFQMCState:
-    def _apply(_):
-        walkers, _ = orthonormalize(state.walkers)
-        sign, logov = calc_slov_batch(trial, walkers)
-        return AFQMCState(
-            walkers=walkers,
-            weights=state.weights,
-            sign=sign,
-            logov=logov,
-            key=state.key,
-            e_estimate=state.e_estimate,
-            pop_control_shift=state.pop_control_shift,
-            walker_fields=state.walker_fields,
-            trial_state=state.trial_state,
-        )
-
-    return lax.cond(do_ortho, _apply, lambda _: state, operand=None)
-
-
-def _orthonormalize_custom(
-    trial: Any,
-    state: AFQMCState,
-    do_ortho: jnp.ndarray,
-) -> AFQMCState:
-    def _apply(_):
-        trial_state = state.trial_state
-        if _is_custom_trial(trial) and hasattr(trial, "orthonormalize_walkers"):
-            walkers = trial.orthonormalize_walkers(state.walkers)
-            if trial_state is not None and hasattr(trial, "on_walkers_updated_state"):
-                trial_state = trial.on_walkers_updated_state(walkers, trial_state)
-            elif hasattr(trial, "on_walkers_updated"):
-                trial.on_walkers_updated(walkers)
-                if hasattr(trial, "export_runtime_state"):
-                    trial_state = trial.export_runtime_state()
-        else:
-            walkers, _ = orthonormalize(state.walkers)
-
-        if trial_state is not None and hasattr(trial, "calc_slov_state"):
-            sign, logov = trial.calc_slov_state(walkers, trial_state)
-        else:
-            sign, logov = calc_slov_batch(trial, walkers)
-        walker_fields = (
-            trial_state.get("walker_fields", state.walker_fields)
-            if isinstance(trial_state, dict)
-            else state.walker_fields
-        )
-        return AFQMCState(
-            walkers=walkers,
-            weights=state.weights,
-            sign=sign,
-            logov=logov,
-            key=state.key,
-            e_estimate=state.e_estimate,
-            pop_control_shift=state.pop_control_shift,
-            walker_fields=walker_fields,
-            trial_state=trial_state,
-        )
-
-    return lax.cond(do_ortho, _apply, lambda _: state, operand=None)
-
-
-def _scan_steps_det(
-    state: AFQMCState,
-    trial: Any,
-    prop_data: PropagationData,
-    n_steps: int,
-    min_weight: float,
-    max_weight: float,
-    ortho_interval: int,
-    record_wsum: bool,
-):
-    ortho_interval_i = int(ortho_interval)
-
-    def body(carry, _):
-        st, idx = carry
-        st = _propagate_step_det(trial, st, prop_data, min_weight, max_weight)
-        if ortho_interval_i > 0:
-            do_ortho = ((idx + 1) % ortho_interval_i) == 0
-            st = _orthonormalize_det(trial, st, do_ortho)
-        wsum = jnp.sum(st.weights)
-        return (st, idx + 1), wsum
-
-    (state, _), wsum_hist = lax.scan(body, (state, 0), None, length=n_steps)
-    if record_wsum:
-        return state, wsum_hist
-    return state, jnp.zeros((0,), dtype=wsum_hist.dtype)
-
-
-def _scan_steps_custom(
-    state: AFQMCState,
-    hamil: Hamiltonian,
-    trial: Any,
-    prop_data: PropagationData,
-    cfg: AFQMCConfig,
-    n_steps: int,
-    record_wsum: bool,
-):
-    ortho_interval_i = int(cfg.ortho_interval)
-
-    def body(carry, _):
-        st, idx = carry
-        st = _propagate_step(hamil, trial, st, prop_data, cfg)
-        if ortho_interval_i > 0:
-            do_ortho = ((idx + 1) % ortho_interval_i) == 0
-            st = _orthonormalize_custom(trial, st, do_ortho)
-        wsum = jnp.sum(st.weights)
-        return (st, idx + 1), wsum
-
-    (state, _), wsum_hist = lax.scan(body, (state, 0), None, length=n_steps)
-    if record_wsum:
-        return state, wsum_hist
-    return state, jnp.zeros((0,), dtype=wsum_hist.dtype)
-
-
-@dataclass
-class _CustomScanRunner:
-    """Run custom-trial propagation with scan+jit and one-way Python fallback."""
-
-    hamil: Hamiltonian
-    trial: Any
-    prop_data: PropagationData
-    cfg: AFQMCConfig
-    logger: logging.Logger
-    enabled: bool = True
-    cache: dict[int, Any] = field(default_factory=dict)
-
-    def _get_scan(self, n_steps: int):
-        n_steps_i = int(n_steps)
-        fn = self.cache.get(n_steps_i)
-        if fn is None:
-            fn = jax.jit(
-                lambda st: _scan_steps_custom(
-                    st,
-                    self.hamil,
-                    self.trial,
-                    self.prop_data,
-                    self.cfg,
-                    n_steps_i,
-                    False,
-                )
+        if not st.checkpoint:
+            raise ValueError(
+                "cfg.stochastic_trial.checkpoint is required when trial_type is stochastic/vafqmc."
             )
-            self.cache[n_steps_i] = fn
-        return fn
 
-    def run_steps(self, state: AFQMCState, n_steps: int, label: str) -> AFQMCState:
-        n_steps_i = int(n_steps)
-        if n_steps_i <= 0:
-            return state
-
-        if self.enabled:
-            try:
-                state, _ = self._get_scan(n_steps_i)(state)
-                return state
-            except Exception as exc:
-                self.logger.warning(
-                    "Custom-trial %s scan-jit failed; fallback to python loop. error=%s",
-                    label,
-                    str(exc),
-                )
-                self.enabled = False
-
-        for step in range(n_steps_i):
-            state = _propagate_step(self.hamil, self.trial, state, self.prop_data, self.cfg)
-            state = maybe_orthonormalize(self.trial, state, step, self.cfg.ortho_interval)
-        return state
-
-
-def _ensure_complex_walkers(walkers: Any) -> Any:
-    if isinstance(walkers, tuple) and len(walkers) == 2:
-        w_up, w_dn = walkers
-        return (w_up.astype(jnp.complex128), w_dn.astype(jnp.complex128))
-    return walkers
-
-
-def _bind_trial_runtime_state(trial: Any, walkers: Any, key: Any) -> tuple[Any, Any]:
-    trial_state = None
-    if _is_custom_trial(trial) and hasattr(trial, "bind_walkers"):
-        if hasattr(trial, "init_runtime_state"):
-            key, trial_key = jax.random.split(key)
-            trial_state = trial.init_runtime_state(walkers, key=trial_key, reinit=True)
-        else:
-            key, trial_key = jax.random.split(key)
-            trial.bind_walkers(walkers, key=trial_key, reinit=True)
-            if hasattr(trial, "export_runtime_state"):
-                trial_state = trial.export_runtime_state()
-    return trial_state, key
-
-
-def _calc_trial_overlap(trial: Any, walkers: Any, trial_state: Any):
-    if (
-        _is_custom_trial(trial)
-        and trial_state is not None
-        and hasattr(trial, "calc_slov_state")
-    ):
-        return trial.calc_slov_state(walkers, trial_state)
-    return calc_slov_batch(trial, walkers)
-
-
-def _calc_trial_local_energy(hamil: Hamiltonian, trial: Any, walkers: Any, trial_state: Any):
-    if (
-        _is_custom_trial(trial)
-        and trial_state is not None
-        and hasattr(trial, "calc_local_energy_state")
-    ):
-        return jnp.real(trial.calc_local_energy_state(hamil, walkers, trial_state))
-    return jnp.real(calc_local_energy_batch(hamil, trial, walkers))
-
-
-def _initial_walker_fields(trial: Any, trial_state: Any):
-    if isinstance(trial_state, dict) and ("walker_fields" in trial_state):
-        return trial_state["walker_fields"]
-    if (
-        _is_custom_trial(trial)
-        and hasattr(trial, "walker_fields")
-        and getattr(trial, "walker_fields") is not None
-    ):
-        return trial.walker_fields
-    return jnp.zeros((0, 0, 0), dtype=jnp.float64)
-
-
-def _build_initial_state(
-    hamil: Hamiltonian,
-    trial: Any,
-    cfg: AFQMCConfig,
-) -> tuple[PropagationData, AFQMCState]:
-    prop_data = build_propagation_data(hamil, trial, cfg.dt)
-    key = jax.random.PRNGKey(cfg.seed)
-    walkers, key = init_walkers(trial, cfg.n_walkers, key, noise=cfg.init_noise)
-    walkers = _ensure_complex_walkers(walkers)
-
-    trial_state, key = _bind_trial_runtime_state(trial, walkers, key)
-    sign, logov = _calc_trial_overlap(trial, walkers, trial_state)
-    sign = sign.astype(jnp.complex128)
-    logov = logov.astype(jnp.float64)
-    weights = jnp.ones((cfg.n_walkers,), dtype=jnp.float64)
-
-    e_samples = _calc_trial_local_energy(hamil, trial, walkers, trial_state)
-    e_estimate = jnp.sum(e_samples) / cfg.n_walkers
-
-    state = AFQMCState(
-        walkers=walkers,
-        weights=weights,
-        sign=sign,
-        logov=logov,
-        key=key,
-        e_estimate=e_estimate,
-        pop_control_shift=e_estimate,
-        walker_fields=_initial_walker_fields(trial, trial_state),
-        trial_state=trial_state,
-    )
-    return prop_data, state
-
-
-def _log_init(logger: logging.Logger, cfg: AFQMCConfig, state: AFQMCState, start: float) -> None:
-    logger.info(
-        "AFQMC init: dt=%.4g walkers=%d blocks=%d prop_steps=%d meas_samples=%d",
-        cfg.dt,
-        cfg.n_walkers,
-        cfg.n_blocks,
-        cfg.n_prop_steps,
-        max(int(getattr(cfg, "n_measure_samples", 1)), 1),
-    )
-    logger.info("Init e_est=%.12f elapsed=%.2fs", float(state.e_estimate), time.time() - start)
-
-
-def _run_det_equilibration(
-    state: AFQMCState,
-    trial: Any,
-    prop_data: PropagationData,
-    cfg: AFQMCConfig,
-    logger: logging.Logger,
-    start: float,
-) -> AFQMCState:
-    record_eq = cfg.log_interval > 0
-    eq_scan = jax.jit(
-        lambda st: _scan_steps_det(
-            st,
-            trial,
-            prop_data,
-            cfg.n_eq_steps,
-            cfg.min_weight,
-            cfg.max_weight,
-            cfg.ortho_interval,
-            record_eq,
-        )
-    )
-    state, wsum_hist = eq_scan(state)
-    if cfg.log_interval > 0:
-        for step in range(cfg.log_interval - 1, cfg.n_eq_steps, cfg.log_interval):
-            logger.info(
-                "Eql %d/%d wsum=%.3e e_est=%.12f elapsed=%.2fs",
-                step + 1,
-                cfg.n_eq_steps,
-                float(wsum_hist[step]),
-                float(state.e_estimate),
-                time.time() - start,
-            )
-    return state
-
-
-def _run_custom_equilibration(
-    state: AFQMCState,
-    runner: _CustomScanRunner,
-    hamil: Hamiltonian,
-    trial: Any,
-    cfg: AFQMCConfig,
-    logger: logging.Logger,
-    start: float,
-) -> AFQMCState:
-    if cfg.log_interval <= 0:
-        return runner.run_steps(state, cfg.n_eq_steps, "eql")
-
-    eq_done = 0
-    eq_chunk = max(int(cfg.log_interval), 1)
-    while eq_done < cfg.n_eq_steps:
-        nrun = min(eq_chunk, cfg.n_eq_steps - eq_done)
-        state = runner.run_steps(state, nrun, "eql")
-        eq_done += nrun
-        logger.info(
-            "Eql %d/%d wsum=%.3e e_mix=%.12f e_est=%.12f elapsed=%.2fs",
-            eq_done,
-            cfg.n_eq_steps,
-            float(jnp.sum(state.weights)),
-            float(_calc_mixed_energy(hamil, trial, state)),
-            float(state.e_estimate),
-            time.time() - start,
-        )
-    return state
-
-
-def _measure_block_energy(
-    hamil: Hamiltonian,
-    trial: Any,
-    state: AFQMCState,
-    cfg: AFQMCConfig,
-) -> tuple[AFQMCState, Any]:
-    n_meas = max(int(getattr(cfg, "n_measure_samples", 1)), 1)
-    if (
-        _is_custom_trial(trial)
-        and state.trial_state is not None
-        and hasattr(trial, "measure_block_energy_state")
-    ):
-        trial_state, block_energy, sign_cur, logov_cur = trial.measure_block_energy_state(
+        trial_seed = int(cfg.seed if st.trial_seed is None else st.trial_seed)
+        return VAFQMCTrial.from_hparams_checkpoint(
             hamil,
-            state.walkers,
-            state.weights,
-            state.e_estimate,
-            cfg.dt,
-            n_meas,
-            state.trial_state,
+            st.checkpoint,
+            hparams_path=st.hparams_path,
+            n_samples=int(st.n_samples),
+            burn_in=int(st.burn_in),
+            sampler_name=str(st.sampler.name),
+            sampler_kwargs=_stochastic_sampler_kwargs(st),
+            sampling_target=str(st.sampling_target),
+            logdens_floor=float(st.logdens_floor),
+            sample_update_steps=int(st.sample_update_steps),
+            init_walkers_from_trial=bool(st.init_walkers_from_trial),
+            init_walkers_burn_in=int(st.init_walkers_burn_in),
+            max_prop=st.max_prop,
+            seed=trial_seed,
         )
-        walker_fields = (
-            trial_state.get("walker_fields", state.walker_fields)
-            if isinstance(trial_state, dict)
-            else state.walker_fields
-        )
-        state = AFQMCState(
-            walkers=state.walkers,
-            weights=state.weights,
-            sign=sign_cur,
-            logov=logov_cur,
-            key=state.key,
-            e_estimate=state.e_estimate,
-            pop_control_shift=state.pop_control_shift,
-            walker_fields=walker_fields,
-            trial_state=trial_state,
-        )
-        return state, block_energy
 
-    return state, _calc_block_energy_once(hamil, trial, state, cfg)
-
-
-def _update_e_estimate(state: AFQMCState, block_energy: Any) -> AFQMCState:
-    return AFQMCState(
-        walkers=state.walkers,
-        weights=state.weights,
-        sign=state.sign,
-        logov=state.logov,
-        key=state.key,
-        e_estimate=0.9 * state.e_estimate + 0.1 * block_energy,
-        pop_control_shift=state.pop_control_shift,
-        walker_fields=state.walker_fields,
-        trial_state=state.trial_state,
-    )
+    raise ValueError(f"Unknown trial_type: {cfg.trial_type}")
 
 
 def afqmc_energy(
     hamil: Hamiltonian,
     trial: Optional[Any] = None,
     *,
-    cfg: Optional[AFQMCConfig] = None,
+    cfg: Optional[Any] = None,
     logger: Optional[logging.Logger] = None,
     return_state: bool = False,
     return_blocks: bool = False,
 ):
-    cfg = cfg or AFQMCConfig()
+    """Run AFQMC energy estimation.
+
+    Trial dispatch:
+    - if ``trial`` is provided, use it directly
+    - else use ``cfg.trial_type`` + ``cfg.stochastic_trial``
+    """
+    cfg_user = _to_cfg(cfg)
+    cfg_runtime = _runtime_cfg(cfg_user)
     logger = _get_logger(logger)
     start = time.time()
 
     if trial is None:
-        trial = hamil.wfn0
+        trial = _build_trial_from_config(hamil, cfg_runtime)
 
-    prop_data, state = _build_initial_state(hamil, trial, cfg)
-    _log_init(logger, cfg, state, start)
-
-    use_jit = not _is_custom_trial(trial)
-    custom_runner = None
-    if not use_jit:
-        custom_runner = _CustomScanRunner(hamil, trial, prop_data, cfg, logger)
-
-    if use_jit:
-        state = _run_det_equilibration(state, trial, prop_data, cfg, logger, start)
-    else:
-        state = _run_custom_equilibration(state, custom_runner, hamil, trial, cfg, logger, start)
-
-    block_energies = []
-    block_scan = None
-    if use_jit:
-        block_scan = jax.jit(
-            lambda st: _scan_steps_det(
-                st,
-                trial,
-                prop_data,
-                cfg.n_prop_steps,
-                cfg.min_weight,
-                cfg.max_weight,
-                cfg.ortho_interval,
-                False,
-            )
+    if is_single_det_trial(trial):
+        trial = as_spin_det(trial)
+        return run_afqmc_det(
+            hamil,
+            trial,
+            cfg_runtime,
+            logger,
+            start,
+            return_state=return_state,
+            return_blocks=return_blocks,
         )
 
-    for blk in range(cfg.n_blocks):
-        if use_jit:
-            state, _ = block_scan(state)
-        else:
-            state = custom_runner.run_steps(state, cfg.n_prop_steps, "block")
-
-        state, block_energy = _measure_block_energy(hamil, trial, state, cfg)
-        block_energies.append(block_energy)
-
-        state = _update_e_estimate(state, block_energy)
-
-        if cfg.resample:
-            key_new, subkey = jax.random.split(state.key)
-            state = AFQMCState(
-                walkers=state.walkers,
-                weights=state.weights,
-                sign=state.sign,
-                logov=state.logov,
-                key=key_new,
-                e_estimate=state.e_estimate,
-                pop_control_shift=state.pop_control_shift,
-                walker_fields=state.walker_fields,
-                trial_state=state.trial_state,
-            )
-            state = stochastic_reconfiguration(trial, state, subkey)
-
-        if cfg.log_interval > 0 and (
-            (blk + 1) % cfg.log_interval == 0 or blk + 1 == cfg.n_blocks
-        ):
-            logger.info(
-                "Block %d/%d e_blk=%.12f e_est=%.12f wsum=%.3e elapsed=%.2fs",
-                blk + 1,
-                cfg.n_blocks,
-                float(block_energy),
-                float(state.e_estimate),
-                float(jnp.sum(state.weights)),
-                time.time() - start,
-            )
-
-    blocks = jnp.array(block_energies)
-    e_mean = jnp.mean(blocks)
-    e_err = jnp.std(blocks, ddof=1) / jnp.sqrt(blocks.size) if blocks.size > 1 else 0.0
-
-    logger.info(
-        "AFQMC done: E=%.12f +/- %.3e elapsed=%.2fs",
-        float(e_mean),
-        float(e_err),
-        time.time() - start,
+    return run_afqmc_custom(
+        hamil,
+        trial,
+        cfg_runtime,
+        logger,
+        start,
+        return_state=return_state,
+        return_blocks=return_blocks,
     )
-
-    if return_state and return_blocks:
-        return e_mean, e_err, blocks, state
-    if return_state:
-        return e_mean, e_err, state
-    if return_blocks:
-        return e_mean, e_err, blocks
-    return e_mean, e_err
 
 
 def afqmc_energy_from_pickle(
     hamil_path: str,
     *,
-    cfg: Optional[AFQMCConfig] = None,
+    cfg: Optional[Any] = None,
     logger: Optional[logging.Logger] = None,
     trial: Optional[Any] = None,
     return_state: bool = False,
@@ -770,48 +232,64 @@ def afqmc_energy_from_checkpoint(
     checkpoint_path: str,
     *,
     hparams_path: str = "hparams.yml",
-    cfg: Optional[AFQMCConfig] = None,
+    cfg: Optional[Any] = None,
     logger: Optional[logging.Logger] = None,
     n_walkers: Optional[int] = None,
-    n_samples: int = 20,
-    burn_in: int = 1000,
-    sampler_name: str = "hmc",
+    n_samples: Optional[int] = None,
+    burn_in: Optional[int] = None,
+    sampler_name: Optional[str] = None,
     sampler_kwargs: Optional[dict] = None,
-    sampling_target: str = "walker_overlap",
-    logdens_floor: float = -60.0,
-    sample_update_steps: int = 1,
-    init_walkers_from_trial: bool = False,
-    init_walkers_burn_in: int = 0,
+    sampling_target: Optional[str] = None,
+    logdens_floor: Optional[float] = None,
+    sample_update_steps: Optional[int] = None,
+    init_walkers_from_trial: Optional[bool] = None,
+    init_walkers_burn_in: Optional[int] = None,
     max_prop: Optional[Any] = None,
-    seed: int = 0,
+    seed: Optional[int] = None,
     return_state: bool = False,
     return_blocks: bool = False,
 ):
-    """Run AFQMC by building VAFQMCTrial from checkpoint + hparams."""
-    cfg = cfg or AFQMCConfig()
-    if n_walkers is not None:
-        cfg = AFQMCConfig(**{**cfg.__dict__, "n_walkers": int(n_walkers)})
+    """Compatibility wrapper: map args into ConfigDict-style AFQMC config."""
+    cfg = _to_cfg(cfg)
+    cfg.trial_type = "stochastic"
+    if cfg.get("stochastic_trial", None) is None:
+        cfg.stochastic_trial = stochastic_trial_default()
 
-    hamil = load_hamiltonian(hamil_path)
-    trial = VAFQMCTrial.from_hparams_checkpoint(
-        hamil,
-        checkpoint_path,
-        hparams_path=hparams_path,
-        n_samples=n_samples,
-        burn_in=burn_in,
-        sampler_name=sampler_name,
-        sampler_kwargs=sampler_kwargs,
-        sampling_target=sampling_target,
-        logdens_floor=logdens_floor,
-        sample_update_steps=sample_update_steps,
-        init_walkers_from_trial=init_walkers_from_trial,
-        init_walkers_burn_in=init_walkers_burn_in,
-        max_prop=max_prop,
-        seed=seed,
-    )
-    return afqmc_energy(
-        hamil,
-        trial=trial,
+    cfg.stochastic_trial.checkpoint = checkpoint_path
+    cfg.stochastic_trial.hparams_path = hparams_path
+
+    if n_walkers is not None:
+        cfg.propagation.n_walkers = int(n_walkers)
+    if n_samples is not None:
+        cfg.stochastic_trial.n_samples = int(n_samples)
+    if burn_in is not None:
+        cfg.stochastic_trial.burn_in = int(burn_in)
+    if sampler_name is not None:
+        cfg.stochastic_trial.sampler.name = str(sampler_name)
+    if sampler_kwargs is not None:
+        cfg.stochastic_trial.sampler.kwargs = dict(sampler_kwargs)
+        if "dt" in sampler_kwargs:
+            cfg.stochastic_trial.sampler.dt = float(sampler_kwargs["dt"])
+        if "length" in sampler_kwargs:
+            cfg.stochastic_trial.sampler.length = float(sampler_kwargs["length"])
+    if sampling_target is not None:
+        cfg.stochastic_trial.sampling_target = str(sampling_target)
+    if logdens_floor is not None:
+        cfg.stochastic_trial.logdens_floor = float(logdens_floor)
+    if sample_update_steps is not None:
+        cfg.stochastic_trial.sample_update_steps = int(sample_update_steps)
+    if init_walkers_from_trial is not None:
+        cfg.stochastic_trial.init_walkers_from_trial = bool(init_walkers_from_trial)
+    if init_walkers_burn_in is not None:
+        cfg.stochastic_trial.init_walkers_burn_in = int(init_walkers_burn_in)
+    if max_prop is not None:
+        cfg.stochastic_trial.max_prop = max_prop
+    if seed is not None:
+        cfg.seed = int(seed)
+        cfg.stochastic_trial.trial_seed = int(seed)
+
+    return afqmc_energy_from_pickle(
+        hamil_path,
         cfg=cfg,
         logger=logger,
         return_state=return_state,
