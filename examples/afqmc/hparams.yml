@@ -1,0 +1,72 @@
+ansatz:
+  propagators:
+  - aux_network: null
+    dyn_mfshift: false
+    expm_option: [scan, 2, 1]
+    hermite_ops: false
+    init_random: 0.1
+    init_tsteps: [0.01]
+    max_nhs: 100
+    mf_subtract: false
+    ortho_intvl: 0
+    parametrize: all
+    priori_mask: null
+    spin_mixing: true
+    sqrt_tsvpar: true
+    timevarying: hmf
+    use_complex: false
+  wfn_complex: false
+  wfn_param: true
+  wfn_random: 0.0
+  wfn_spinmix: false
+hamiltonian:
+  chol_cut: 1.0e-06
+  full_eri: false
+  orth_ao: null
+  with_cc: false
+log:
+  ckpt_choice: last
+  ckpt_freq: 1000
+  ckpt_path: checkpoints
+  hamil_path: hamiltonian.pkl
+  hpar_path: hparams.yml
+  level: info
+  stat_freq: 1
+  stat_path: tbdata/
+loss:
+  sign_factor: 1.0
+  sign_power: 2.0
+  sign_target: 0.7
+  std_factor: 0.0
+  std_power: 2.0
+  std_target: 100.0
+molecule: {}
+optim:
+  baseline:
+    decay: 0.99
+  batch: null
+  grad_clip: 1.0
+  iteration: 40000
+  lr:
+    decay: 1.0
+    delay: 5000.0
+    start: 0.0003
+  optimizer: adabelief
+restart:
+  hamiltonian: hamiltonian.pkl
+  lower_state_params: []
+  params: null
+  states: null
+  weights: []
+sample:
+  batch: 800
+  burn_in: 100
+  prop_steps: null
+  sampler:
+    dt: 0.1
+    length: 1.0
+    name: hmc
+  size: 8000
+seed: 1
+trial: null
+

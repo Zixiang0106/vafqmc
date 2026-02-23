@@ -21,8 +21,6 @@ def log_once(logger, process_index, message, level='info'):
     """Only log a message once per process."""
     if process_index == 0:
         getattr(logger, level)(message)
-
-
 def lower_penalty(s, factor=1., target=1., power=2.):
     return factor * jnp.maximum(target - s, 0) ** power
 
@@ -150,31 +148,10 @@ def train(cfg: ConfigDict):
     logger = logging.getLogger("train")
     log_level = getattr(logging, cfg.log.level.upper())
     logger.setLevel(log_level)
-
-    n_local_devices = jax.local_device_count()
-    is_multi_gpu = n_local_devices > 1
-    if not is_multi_gpu:
-        logger.info("Detected %s local device, skip jax.distributed.initialize", n_local_devices)
-    else:
-        coord_addr = os.environ.get("JAX_COORDINATOR_ADDRESS")
-        num_processes = os.environ.get("JAX_NUM_PROCESSES")
-        process_id = os.environ.get("JAX_PROCESS_ID")
-        if coord_addr and num_processes and process_id:
-            is_initialized = getattr(jax.distributed, "is_initialized", None)
-            if not (callable(is_initialized) and is_initialized()):
-                jax.distributed.initialize()
-            logger.info(
-                "Initialized JAX distributed: coordinator=%s process_id=%s num_processes=%s",
-                coord_addr,
-                process_id,
-                num_processes,
-            )
-        else:
-            logger.info(
-                "Detected %s local devices without distributed env vars, skip jax.distributed.initialize",
-                n_local_devices,
-            )
-
+    #jax.distributed.initialize(local_device_ids=[0, 1, 2, 3])
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    n_visible_gpus = len(cuda_visible.split(","))
+    jax.distributed.initialize(local_device_ids=list(range(n_visible_gpus)))
     n_devices = jax.device_count()
     n_local_devices = jax.local_device_count()
     process_index = jax.process_index()
@@ -270,7 +247,7 @@ def train(cfg: ConfigDict):
     else:
         log_once(logger, process_index,"Loading Hamiltonian from saved file")
         hamil_data = load_pickle(cfg.restart.hamiltonian)
-        HamCls = Hamiltonian
+        HamCls = Hamiltonian_sym
         hamiltonian = HamCls(*hamil_data)
         if process_index == 0:
             print(f"# HF energy from loaded: {hamiltonian.local_energy()}")
