@@ -10,7 +10,7 @@ Core behavior:
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import jax
 import numpy as onp
@@ -26,6 +26,7 @@ from ..utils import load_pickle
 from .afqmc_utils import _spin_sum_rdm
 
 Array = jnp.ndarray
+RuntimeState = Dict[str, Any]
 
 
 def _gaussian_logdens(_params: Any, fields: Any) -> Array:
@@ -124,7 +125,16 @@ def load_ansatz_cfg_from_hparams(hparams_path: str) -> Mapping[str, Any]:
 
 
 class VAFQMCTrial:
-    """Custom trial object consumed by ``hafqmc.afqmc.afqmc_energy``."""
+    """Custom trial object consumed by ``hafqmc.afqmc.afqmc_energy``.
+
+    Design layers:
+    1. Construction/config: checkpoint loading and sampler setup.
+    2. Runtime-state API: explicit import/export of walker-bound trial state.
+    3. AFQMC hooks: overlap/local-energy/force-bias/update/reconfiguration/measurement.
+
+    The AFQMC driver only relies on the runtime-state API + AFQMC hooks,
+    so numerical kernels stay decoupled from object mutation details.
+    """
 
     def __init__(
         self,
@@ -138,12 +148,9 @@ class VAFQMCTrial:
         sampler_kwargs: Optional[Mapping[str, Any]] = None,
         sampling_target: str = "walker_overlap",
         logdens_floor: float = -60.0,
-        refresh_interval: int = 0,
-        replace_per_refresh: int = 1,
         sample_update_steps: int = 1,
         init_walkers_from_trial: bool = False,
         init_walkers_burn_in: int = 0,
-        pure_eval_pairs: int = 1000,
         max_prop: Optional[Any] = None,
         seed: int = 0,
     ) -> None:
@@ -159,11 +166,8 @@ class VAFQMCTrial:
         self.sample_update_steps = int(sample_update_steps)
         self.init_walkers_from_trial = bool(init_walkers_from_trial)
         self.init_walkers_burn_in = int(init_walkers_burn_in)
-        self.pure_eval_pairs = int(pure_eval_pairs)
         self.sampling_target = str(sampling_target).lower()
         self.logdens_floor = float(logdens_floor)
-        self.refresh_interval = int(refresh_interval)  # compatibility knob
-        self.replace_per_refresh = int(replace_per_refresh)  # compatibility knob
         self.max_prop = max_prop
         self.seed = int(seed)
 
@@ -195,10 +199,6 @@ class VAFQMCTrial:
 
         # RNG streams.
         self._rng = jax.random.PRNGKey(self.seed)
-        self._pair_rng = jax.random.PRNGKey(self.seed + 7919)
-
-        # Delayed burn-in budget that is consumed when walkers are first bound.
-        self._pending_bind_burn_in = 0
 
         # Walker-bound tethered sampling state.
         self._n_walkers = 0
@@ -213,13 +213,10 @@ class VAFQMCTrial:
         # Public flattened pool view used by AFQMC state.
         self.walker_fields = None  # (n_walkers, n_samples, n_fields_flat)
 
-        # Pair sampler for pure-energy diagnostics.
-        self._pair_fields_shape = tree_map(
-            lambda s: onp.array((2, *tuple(onp.asarray(s).tolist()))),
-            self.fields_shape,
-        )
-        self._pair_sampler = None
-        self._pair_state = None
+        # Lazily-compiled kernels keyed by (object-id/config) to reduce Python overhead.
+        self._local_energy_fns: Dict[int, Any] = {}
+        self._force_bias_fns: Dict[int, Any] = {}
+        self._block_measure_fns: Dict[Tuple[int, int, int], Any] = {}
 
         # Mean-field shift setup keeps a deterministic reference RDM.
         self.rdm1 = jnp.real(self._collapse_rdm(calc_rdm(self.reference_wfn, self.reference_wfn)))
@@ -237,12 +234,9 @@ class VAFQMCTrial:
         sampler_kwargs: Optional[Mapping[str, Any]] = None,
         sampling_target: str = "walker_overlap",
         logdens_floor: float = -60.0,
-        refresh_interval: int = 0,
-        replace_per_refresh: int = 1,
         sample_update_steps: int = 1,
         init_walkers_from_trial: bool = False,
         init_walkers_burn_in: int = 0,
-        pure_eval_pairs: int = 1000,
         max_prop: Optional[Any] = None,
         seed: int = 0,
     ) -> "VAFQMCTrial":
@@ -259,12 +253,9 @@ class VAFQMCTrial:
             sampler_kwargs=sampler_kwargs,
             sampling_target=sampling_target,
             logdens_floor=logdens_floor,
-            refresh_interval=refresh_interval,
-            replace_per_refresh=replace_per_refresh,
             sample_update_steps=sample_update_steps,
             init_walkers_from_trial=init_walkers_from_trial,
             init_walkers_burn_in=init_walkers_burn_in,
-            pure_eval_pairs=pure_eval_pairs,
             max_prop=max_prop,
             seed=seed,
         )
@@ -282,12 +273,9 @@ class VAFQMCTrial:
         sampler_kwargs: Optional[Mapping[str, Any]] = None,
         sampling_target: str = "walker_overlap",
         logdens_floor: float = -60.0,
-        refresh_interval: int = 0,
-        replace_per_refresh: int = 1,
         sample_update_steps: int = 1,
         init_walkers_from_trial: bool = False,
         init_walkers_burn_in: int = 0,
-        pure_eval_pairs: int = 1000,
         max_prop: Optional[Any] = None,
         seed: int = 0,
     ) -> "VAFQMCTrial":
@@ -303,52 +291,127 @@ class VAFQMCTrial:
             sampler_kwargs=sampler_kwargs,
             sampling_target=sampling_target,
             logdens_floor=logdens_floor,
-            refresh_interval=refresh_interval,
-            replace_per_refresh=replace_per_refresh,
             sample_update_steps=sample_update_steps,
             init_walkers_from_trial=init_walkers_from_trial,
             init_walkers_burn_in=init_walkers_burn_in,
-            pure_eval_pairs=pure_eval_pairs,
             max_prop=max_prop,
             seed=seed,
         )
 
     # ---------------------------------------------------------------------
-    # Lightweight flattened views for diagnostics compatibility.
+    # Runtime-state utilities.
     # ---------------------------------------------------------------------
-    @property
-    def sample_fields(self) -> Any:
-        if self._pool_fields_tree is None:
-            return None
-        nw = int(self._pool_logsw.shape[0])
-        ns = int(self._pool_logsw.shape[1])
-        return tree_map(lambda x: x.reshape((nw * ns,) + x.shape[2:]), self._pool_fields_tree)
+    def _pack_runtime_state(
+        self,
+        *,
+        rng: Any,
+        pool_state: Any,
+        pool_fields_tree: Any,
+        pool_logsw: Array,
+        pool_bra: Any,
+        pool_log_abs: Array,
+        pool_phase: Array,
+        walker_fields: Optional[Array] = None,
+    ) -> RuntimeState:
+        if walker_fields is None:
+            walker_fields = self._fields_tree_to_flat(pool_fields_tree)
+        return {
+            "rng": rng,
+            "pool_state": pool_state,
+            "pool_fields_tree": pool_fields_tree,
+            "pool_logsw": pool_logsw,
+            "pool_bra": pool_bra,
+            "pool_log_abs": pool_log_abs,
+            "pool_phase": pool_phase,
+            "walker_fields": walker_fields,
+        }
 
-    @property
-    def sample_logsw(self) -> Optional[Array]:
-        if self._pool_logsw is None:
-            return None
-        return self._pool_logsw.reshape((-1,))
+    def _require_runtime_state(self, walkers: Any) -> RuntimeState:
+        self._ensure_bound_pool(walkers)
+        runtime_state = self.export_runtime_state()
+        if runtime_state is None:
+            raise ValueError("trial runtime_state is not initialized.")
+        return runtime_state
 
-    @property
-    def sample_log_abs(self) -> Optional[Array]:
-        if self._pool_log_abs is None:
-            return None
-        return self._pool_log_abs.reshape((-1,))
+    def _overlap_bundle_from_state(
+        self,
+        walkers: Any,
+        runtime_state: RuntimeState,
+    ) -> tuple[Array, Array, Array]:
+        return self._calc_overlap_bundle_from_cache(
+            walkers,
+            runtime_state["pool_bra"],
+            runtime_state["pool_log_abs"],
+            runtime_state["pool_phase"],
+        )
 
-    @property
-    def sample_phase(self) -> Optional[Array]:
-        if self._pool_phase is None:
-            return None
-        return self._pool_phase.reshape((-1,))
+    def _cache_from_samples(self, fields: Any, logsw: Array) -> tuple[Any, Array, Array]:
+        bra, logcoef = self._evaluate_pool_bra(fields, logsw)
+        return bra, jnp.real(logcoef), jnp.exp(1.0j * jnp.imag(logcoef))
 
-    @property
-    def bra_samples(self) -> Any:
-        if self._pool_bra is None:
+    # ---------------------------------------------------------------------
+    # Runtime state I/O for AFQMC driver.
+    # ---------------------------------------------------------------------
+    def export_runtime_state(self) -> Optional[RuntimeState]:
+        if self._pool_state is None or self._pool_logsw is None:
             return None
-        nw = int(self._pool_logsw.shape[0])
-        ns = int(self._pool_logsw.shape[1])
-        return tree_map(lambda x: x.reshape((nw * ns,) + x.shape[2:]), self._pool_bra)
+        return self._pack_runtime_state(
+            rng=self._rng,
+            pool_state=self._pool_state,
+            pool_fields_tree=self._pool_fields_tree,
+            pool_logsw=self._pool_logsw,
+            pool_bra=self._pool_bra,
+            pool_log_abs=self._pool_log_abs,
+            pool_phase=self._pool_phase,
+            walker_fields=self.walker_fields,
+        )
+
+    def import_runtime_state(self, runtime_state: Optional[RuntimeState]) -> None:
+        if runtime_state is None:
+            return
+        self._rng = runtime_state["rng"]
+        self._pool_state = runtime_state["pool_state"]
+        self._pool_fields_tree = runtime_state["pool_fields_tree"]
+        self._pool_logsw = runtime_state["pool_logsw"]
+        self._pool_bra = runtime_state["pool_bra"]
+        self._pool_log_abs = runtime_state["pool_log_abs"]
+        self._pool_phase = runtime_state["pool_phase"]
+        self.walker_fields = runtime_state["walker_fields"]
+        self._n_walkers = int(self._pool_logsw.shape[0])
+
+    def init_runtime_state(
+        self,
+        walkers: Any,
+        *,
+        key: Optional[Array] = None,
+        seed: Optional[int] = None,
+        burn_in: Optional[int] = None,
+        reinit: bool = True,
+    ) -> RuntimeState:
+        self.bind_walkers(
+            walkers,
+            key=key,
+            seed=seed,
+            burn_in=burn_in,
+            reinit=reinit,
+        )
+        state = self.export_runtime_state()
+        if state is None:
+            raise ValueError("Failed to initialize runtime_state.")
+        return state
+
+    def on_walkers_updated_state(
+        self,
+        walkers: Any,
+        runtime_state: Optional[RuntimeState],
+    ) -> RuntimeState:
+        walkers = tree_map(jnp.asarray, walkers)
+        nw = int(tree_leaves(walkers)[0].shape[0])
+        if runtime_state is None:
+            return self.init_runtime_state(walkers, reinit=True)
+        if int(runtime_state["pool_logsw"].shape[0]) != nw:
+            return self.init_runtime_state(walkers, reinit=True)
+        return runtime_state
 
     # ---------------------------------------------------------------------
     # Trial interface used by AFQMC.
@@ -420,9 +483,7 @@ class VAFQMCTrial:
             or int(self._pool_logsw.shape[1]) != self.n_samples
         )
         if need_init:
-            total_burn = requested_burn + int(self._pending_bind_burn_in)
-            self._pending_bind_burn_in = 0
-            self._pool_state = self._init_pool_state(walkers, total_burn)
+            self._pool_state = self._init_pool_state(walkers, requested_burn)
 
         self._n_walkers = n_walkers
         self._bound_walkers = walkers
@@ -430,69 +491,149 @@ class VAFQMCTrial:
         self._update_pool_cache(fields, logsw)
 
     def calc_slov(self, walkers: Any) -> tuple[Array, Array]:
-        self._ensure_bound_pool(walkers)
-        sign, logov, _ = self._calc_overlap_bundle(walkers)
+        return self.calc_slov_state(walkers, self._require_runtime_state(walkers))
+
+    def calc_slov_state(
+        self,
+        walkers: Any,
+        runtime_state: RuntimeState,
+    ) -> tuple[Array, Array]:
+        walkers = tree_map(jnp.asarray, walkers)
+        sign, logov, _ = self._overlap_bundle_from_state(walkers, runtime_state)
         return sign, logov
 
     def calc_local_energy(self, hamil: Any, walkers: Any) -> Array:
-        self._ensure_bound_pool(walkers)
-        _, _, mix_weights = self._calc_overlap_bundle(walkers)
+        return self.calc_local_energy_state(hamil, walkers, self._require_runtime_state(walkers))
 
-        def one_walker(walker, bra_samples, weights):
-            es = jax.vmap(lambda bra: hamil.local_energy(bra, walker))(bra_samples)
-            return jnp.einsum("s,s->", weights, es)
-
-        return jax.vmap(one_walker)(walkers, self._pool_bra, mix_weights)
+    def calc_local_energy_state(
+        self,
+        hamil: Any,
+        walkers: Any,
+        runtime_state: RuntimeState,
+    ) -> Array:
+        walkers = tree_map(jnp.asarray, walkers)
+        _, _, mix_weights = self._overlap_bundle_from_state(walkers, runtime_state)
+        fn = self._get_local_energy_fn(hamil)
+        return fn(walkers, runtime_state["pool_bra"], mix_weights)
 
     def calc_force_bias(self, _hamil: Any, walkers: Any, prop_data: Any) -> Array:
-        self._ensure_bound_pool(walkers)
-        _, _, mix_weights = self._calc_overlap_bundle(walkers)
+        return self.calc_force_bias_state(walkers, prop_data, self._require_runtime_state(walkers))
 
-        def one_walker(walker, bra_samples, weights):
-            rdms = jax.vmap(lambda bra: self._collapse_rdm(calc_rdm(bra, walker)))(bra_samples)
-            rdm_mix = jnp.einsum("s,spq->pq", weights, rdms)
-            return jnp.einsum("kpq,pq->k", prop_data.vhs, rdm_mix)
-
-        return jax.vmap(one_walker)(walkers, self._pool_bra, mix_weights)
+    def calc_force_bias_state(
+        self,
+        walkers: Any,
+        prop_data: Any,
+        runtime_state: RuntimeState,
+    ) -> Array:
+        walkers = tree_map(jnp.asarray, walkers)
+        _, _, mix_weights = self._overlap_bundle_from_state(walkers, runtime_state)
+        fn = self._get_force_bias_fn(prop_data)
+        return fn(walkers, runtime_state["pool_bra"], mix_weights)
 
     def update_tethered_samples(
         self,
         walkers: Any,
         *,
         n_steps: Optional[int] = None,
+        old_sign: Optional[Array] = None,
+        old_logov: Optional[Array] = None,
     ) -> tuple[Array, Array, Array]:
         """Advance each walker's pool and return hand-off correction."""
-        self._ensure_bound_pool(walkers)
+        runtime_state = self._require_runtime_state(walkers)
+        runtime_state, handoff, new_sign, new_logov = self.update_tethered_samples_state(
+            walkers,
+            runtime_state,
+            n_steps=n_steps,
+            old_sign=old_sign,
+            old_logov=old_logov,
+        )
+        self.import_runtime_state(runtime_state)
+        self._bound_walkers = tree_map(jnp.asarray, walkers)
+        return handoff, new_sign, new_logov
+
+    def update_tethered_samples_state(
+        self,
+        walkers: Any,
+        runtime_state: RuntimeState,
+        *,
+        n_steps: Optional[int] = None,
+        old_sign: Optional[Array] = None,
+        old_logov: Optional[Array] = None,
+    ) -> tuple[RuntimeState, Array, Array, Array]:
         walkers = tree_map(jnp.asarray, walkers)
-        old_sign, old_logov, _ = self._calc_overlap_bundle(walkers)
+        if (old_sign is None) or (old_logov is None):
+            old_sign, old_logov, _ = self._overlap_bundle_from_state(walkers, runtime_state)
+        else:
+            old_sign = jnp.asarray(old_sign)
+            old_logov = jnp.asarray(old_logov)
 
         steps = self.sample_update_steps if n_steps is None else int(n_steps)
         if steps < 0:
             raise ValueError("n_steps must be non-negative.")
         if steps == 0:
-            ones = jnp.ones((self._n_walkers,), dtype=jnp.float64)
-            return ones, old_sign, old_logov
+            ones = jnp.ones((int(tree_leaves(walkers)[0].shape[0]),), dtype=jnp.float64)
+            return runtime_state, ones, old_sign, old_logov
 
-        state = self._pool_state
-        fields = self._pool_fields_tree
-        logsw = self._pool_logsw
-        for _ in range(steps):
-            state, (fields, logsw) = self._sample_pool_step(walkers, state)
-        self._pool_state = state
-        self._update_pool_cache(fields, logsw)
-        self._bound_walkers = walkers
+        n_walkers = int(tree_leaves(walkers)[0].shape[0])
+        sample_one = lambda key, walker, st: self._pool_sampler.sample(key, (self.params, walker), st)
 
-        new_sign, new_logov, _ = self._calc_overlap_bundle(walkers)
+        def step_body(_i, carry):
+            rng, st, f, lsw = carry
+            rng, sample_key = jax.random.split(rng)
+            keys = jax.random.split(sample_key, n_walkers)
+            st, (f, lsw) = jax.vmap(sample_one)(keys, walkers, st)
+            return (rng, st, f, lsw)
+
+        rng, state_new, fields_new, logsw_new = lax.fori_loop(
+            0,
+            steps,
+            step_body,
+            (
+                runtime_state["rng"],
+                runtime_state["pool_state"],
+                runtime_state["pool_fields_tree"],
+                runtime_state["pool_logsw"],
+            ),
+        )
+        bra_new, log_abs_new, phase_new = self._cache_from_samples(fields_new, logsw_new)
+        new_sign, new_logov, _ = self._calc_overlap_bundle_from_cache(walkers, bra_new, log_abs_new, phase_new)
         valid = jnp.isfinite(old_logov) & jnp.isfinite(new_logov) & (jnp.abs(old_sign) > 0)
         log_ratio = jnp.where(valid, new_logov - old_logov, -jnp.inf)
         sign_ratio = jnp.where(valid, new_sign / old_sign, 0.0 + 0.0j)
         handoff = _phaseless_from_ratio(sign_ratio * jnp.exp(log_ratio))
-        return handoff, new_sign, new_logov
+
+        runtime_state_new = self._pack_runtime_state(
+            rng=rng,
+            pool_state=state_new,
+            pool_fields_tree=fields_new,
+            pool_logsw=logsw_new,
+            pool_bra=bra_new,
+            pool_log_abs=log_abs_new,
+            pool_phase=phase_new,
+        )
+        return runtime_state_new, handoff, new_sign, new_logov
 
     def stochastic_reconfiguration(self, walkers: Any, weights: Array, key: Array):
         """Resample walkers and clone their tethered pools consistently."""
-        self._ensure_bound_pool(walkers)
-        n_walkers = weights.shape[0]
+        runtime_state = self._require_runtime_state(walkers)
+        walkers_new, new_weights, runtime_state = self.stochastic_reconfiguration_state(
+            walkers,
+            weights,
+            key,
+            runtime_state,
+        )
+        self.import_runtime_state(runtime_state)
+        self._bound_walkers = walkers_new
+        return walkers_new, new_weights
+
+    def stochastic_reconfiguration_state(
+        self,
+        walkers: Any,
+        weights: Array,
+        key: Array,
+        runtime_state: RuntimeState,
+    ) -> tuple[Any, Array, RuntimeState]:
+        n_walkers = int(weights.shape[0])
 
         pos_weights = jnp.maximum(weights, 0.0)
         wsum = jnp.maximum(jnp.sum(pos_weights), 1.0e-12)
@@ -504,157 +645,156 @@ class VAFQMCTrial:
         idx = jnp.clip(idx, 0, n_walkers - 1)
 
         walkers_new = tree_map(lambda x: x[idx], walkers)
-        self._bound_walkers = walkers_new
-        self._pool_state = tree_map(lambda x: x[idx], self._pool_state)
-        self._pool_fields_tree = tree_map(lambda x: x[idx], self._pool_fields_tree)
-        self._pool_logsw = self._pool_logsw[idx]
-        self._pool_log_abs = self._pool_log_abs[idx]
-        self._pool_phase = self._pool_phase[idx]
-        self._pool_bra = tree_map(lambda x: x[idx], self._pool_bra)
-        self.walker_fields = self.walker_fields[idx]
+        runtime_state_new = self._pack_runtime_state(
+            rng=runtime_state["rng"],
+            pool_state=tree_map(lambda x: x[idx], runtime_state["pool_state"]),
+            pool_fields_tree=tree_map(lambda x: x[idx], runtime_state["pool_fields_tree"]),
+            pool_logsw=runtime_state["pool_logsw"][idx],
+            pool_bra=tree_map(lambda x: x[idx], runtime_state["pool_bra"]),
+            pool_log_abs=runtime_state["pool_log_abs"][idx],
+            pool_phase=runtime_state["pool_phase"][idx],
+            walker_fields=runtime_state["walker_fields"][idx],
+        )
 
         new_weights = jnp.ones_like(weights) * (wsum / n_walkers)
-        return walkers_new, new_weights
+        return walkers_new, new_weights, runtime_state_new
 
-    # ---------------------------------------------------------------------
-    # Optional diagnostics / compatibility helpers.
-    # ---------------------------------------------------------------------
-    def refresh_samples(
+    def measure_block_energy(
         self,
-        *,
-        seed: Optional[int] = None,
-        n_samples: Optional[int] = None,
-        burn_in: Optional[int] = None,
-        replace_per_refresh: Optional[int] = None,
-        reinit: bool = False,
-    ) -> None:
-        """Compatibility wrapper for older callers."""
-        if seed is not None:
-            self._rng = jax.random.PRNGKey(int(seed))
-        if n_samples is not None and int(n_samples) != self.n_samples:
-            self.n_samples = int(n_samples)
-            if self.n_samples <= 0:
-                raise ValueError("n_samples must be positive.")
-            self._pool_sampler = make_batched(self._sampler, self.n_samples, concat=False)
-            reinit = True
-        if burn_in is not None:
-            self.burn_in = int(burn_in)
-            if self.burn_in < 0:
-                raise ValueError("burn_in must be non-negative.")
-        if replace_per_refresh is not None:
-            self.replace_per_refresh = int(replace_per_refresh)
+        hamil: Any,
+        walkers: Any,
+        weights: Array,
+        e_estimate: Array,
+        dt: float,
+        n_meas: int,
+    ) -> tuple[Array, Array, Array]:
+        """Average n_meas trial-resampled mixed measurements with fixed walkers."""
+        runtime_state = self._require_runtime_state(walkers)
+        runtime_state, e_blk, sign_last, logov_last = self.measure_block_energy_state(
+            hamil,
+            walkers,
+            weights,
+            e_estimate,
+            dt,
+            n_meas,
+            runtime_state,
+        )
+        self.import_runtime_state(runtime_state)
+        self._bound_walkers = tree_map(jnp.asarray, walkers)
+        return e_blk, sign_last, logov_last
 
-        if self._bound_walkers is None:
-            return
-        if reinit:
-            self.bind_walkers(self._bound_walkers, reinit=True, burn_in=self.burn_in)
-            return
+    def measure_block_energy_state(
+        self,
+        hamil: Any,
+        walkers: Any,
+        weights: Array,
+        e_estimate: Array,
+        dt: float,
+        n_meas: int,
+        runtime_state: RuntimeState,
+    ) -> tuple[RuntimeState, Array, Array, Array]:
+        walkers = tree_map(jnp.asarray, walkers)
+        n_meas_i = max(int(n_meas), 1)
+        steps = max(int(self.sample_update_steps), 0)
+        key = (id(hamil), steps, n_meas_i)
+        fn = self._block_measure_fns.get(key)
 
-        steps = int(self.replace_per_refresh)
-        if steps <= 0:
-            steps = max(self.sample_update_steps, 1)
-        self.update_tethered_samples(self._bound_walkers, n_steps=steps)
+        if fn is None:
+            n_walkers = int(tree_leaves(walkers)[0].shape[0])
+            one_walker_eloc = lambda walker, bra_samples, mweights: jnp.einsum(
+                "s,s->",
+                mweights,
+                jax.vmap(lambda bra: hamil.local_energy(bra, walker))(bra_samples),
+            )
 
-    def advance_sampler(self, steps: int, *, seed: Optional[int] = None) -> None:
-        """Advance tethered sampler state.
+            def measure_fn(rng, st, fields, logsw, bra0, log_abs0, phase0, walkers_in, weights_in, e_est, dt_in):
+                def advance_steps(rng_in, st_in, fields_in, logsw_in):
+                    if steps == 0:
+                        return rng_in, st_in, fields_in, logsw_in
 
-        If walkers are not bound yet, this is stored as pending burn-in and
-        consumed in the next ``bind_walkers`` call.
-        """
-        nsteps = int(steps)
-        if nsteps <= 0:
-            return
-        if seed is not None:
-            self._rng = jax.random.PRNGKey(int(seed))
+                    sample_one = lambda k, walker, st_: self._pool_sampler.sample(k, (self.params, walker), st_)
 
-        if self._bound_walkers is None:
-            self._pending_bind_burn_in += nsteps
-            return
-        self.update_tethered_samples(self._bound_walkers, n_steps=nsteps)
+                    def step_body(_i, carry):
+                        rng_c, st_c, f_c, lsw_c = carry
+                        rng_c, sample_key = jax.random.split(rng_c)
+                        keys = jax.random.split(sample_key, n_walkers)
+                        st_c, (f_c, lsw_c) = jax.vmap(sample_one)(keys, walkers_in, st_c)
+                        return (rng_c, st_c, f_c, lsw_c)
 
-    def calc_pure_energy(self, hamil: Any, *, diag_only: bool = True) -> Array:
-        """Estimate trial-only energy from current pooled samples."""
-        log_abs = self.sample_log_abs
-        phase = self.sample_phase
-        bra_samples = self.bra_samples
-        if log_abs is None or phase is None or bra_samples is None:
-            return jnp.nan
+                    return lax.fori_loop(
+                        0,
+                        steps,
+                        step_body,
+                        (rng_in, st_in, fields_in, logsw_in),
+                    )
 
-        shift = jnp.max(log_abs)
-        w = jnp.exp(log_abs - shift)
-        wsum = jnp.maximum(jnp.sum(w), 1.0e-16)
+                sign0, logov0, _ = self._calc_overlap_bundle_from_cache(
+                    walkers_in, bra0, log_abs0, phase0
+                )
+                clip = jnp.sqrt(2.0 / dt_in)
 
-        if diag_only:
-            es = jax.vmap(lambda bra: hamil.local_energy(bra, bra))(bra_samples)
-            return jnp.sum(w * jnp.real(es)) / wsum
+                def meas_body(_i, carry):
+                    rng_c, st_c, f_c, lsw_c, e_acc, sign_last, logov_last = carry
+                    rng_c, st_c, f_c, lsw_c = advance_steps(rng_c, st_c, f_c, lsw_c)
 
-        alpha = jnp.exp(log_abs + 1.0j * jnp.angle(phase))
-        n_total = int(log_abs.shape[0])
+                    bra_c, logcoef_c = self._evaluate_pool_bra(f_c, lsw_c)
+                    log_abs_c = jnp.real(logcoef_c)
+                    phase_c = jnp.exp(1.0j * jnp.imag(logcoef_c))
+                    sign_c, logov_c, mix_weights_c = self._calc_overlap_bundle_from_cache(
+                        walkers_in, bra_c, log_abs_c, phase_c
+                    )
 
-        def one_pair(bra_s, bra_t):
-            sign, logov = calc_slov(bra_s, bra_t)
-            return sign * jnp.exp(logov), hamil.local_energy(bra_s, bra_t)
+                    e_loc = jax.vmap(one_walker_eloc)(walkers_in, bra_c, mix_weights_c)
+                    e_loc = jnp.real(e_loc)
+                    e_loc = jnp.where(
+                        jnp.abs(e_loc - e_est) > clip, e_est, e_loc
+                    )
+                    wsum = jnp.maximum(jnp.sum(weights_in), 1.0e-12)
+                    e_blk = jnp.sum(weights_in * e_loc) / wsum
+                    return (rng_c, st_c, f_c, lsw_c, e_acc + e_blk, sign_c, logov_c)
 
-        def one_s(idx_s):
-            bra_s = tree_map(lambda x: x[idx_s], bra_samples)
-            return jax.vmap(
-                lambda idx_t: one_pair(bra_s, tree_map(lambda x: x[idx_t], bra_samples))
-            )(jnp.arange(n_total))
+                return lax.fori_loop(
+                    0,
+                    n_meas_i,
+                    meas_body,
+                    (
+                        rng,
+                        st,
+                        fields,
+                        logsw,
+                        jnp.array(0.0, dtype=jnp.float64),
+                        sign0,
+                        logov0,
+                    ),
+                )
 
-        ov_mat, e_mat = jax.vmap(one_s)(jnp.arange(n_total))
-        coef = jnp.conj(alpha)[:, None] * alpha[None, :]
-        den = jnp.sum(coef * ov_mat)
-        num = jnp.sum(coef * ov_mat * e_mat)
-        return jnp.real(num / den)
+            fn = jax.jit(measure_fn)
+            self._block_measure_fns[key] = fn
 
-    def calc_mixed_energy_reference(self, hamil: Any) -> Array:
-        """Mixed estimator using fixed ket=reference_wfn."""
-        log_abs = self.sample_log_abs
-        phase = self.sample_phase
-        bra_samples = self.bra_samples
-        if log_abs is None or phase is None or bra_samples is None:
-            return jnp.nan
-
-        sample_sign, sample_logov = jax.vmap(
-            lambda bra: calc_slov(bra, self.reference_wfn)
-        )(bra_samples)
-        sample_eloc = jax.vmap(
-            lambda bra: hamil.local_energy(bra, self.reference_wfn)
-        )(bra_samples)
-
-        log_terms = log_abs + sample_logov
-        phases = phase * sample_sign
-        shift = jnp.max(jnp.real(log_terms))
-        coeff = phases * jnp.exp(log_terms - shift)
-        den = jnp.sum(coeff)
-        num = jnp.sum(coeff * sample_eloc)
-        return jnp.where(jnp.abs(den) > 1.0e-16, jnp.real(num / den), jnp.nan)
-
-    def calc_pure_energy_inference(self, hamil: Any, *, n_pairs: Optional[int] = None) -> Array:
-        """Inference-like pure estimator with independent bra/ket pairs."""
-        npairs = self.pure_eval_pairs if n_pairs is None else int(n_pairs)
-        if npairs <= 0:
-            return jnp.nan
-
-        fields_pair, logsw_pair = self._sample_pairs_for_pure(npairs)
-        fields_a = tree_map(lambda x: x[:, 0, ...], fields_pair)
-        fields_b = tree_map(lambda x: x[:, 1, ...], fields_pair)
-
-        eval_ansatz = jax.vmap(lambda f: self.ansatz.apply(self.params, f))
-        bra, bra_lw = eval_ansatz(fields_a)
-        ket, ket_lw = eval_ansatz(fields_b)
-        sign, logov = jax.vmap(lambda b, k: calc_slov(b, k))(bra, ket)
-        eloc = jax.vmap(lambda b, k: hamil.local_energy(b, k))(bra, ket)
-
-        log_ratio = (logov + bra_lw + ket_lw) - logsw_pair
-        shift = jnp.max(log_ratio)
-        rel = jnp.exp(log_ratio - shift)
-        rel = rel / jnp.maximum(jnp.mean(rel), 1.0e-16)
-
-        num = jnp.mean((eloc * sign) * rel)
-        den = jnp.mean(sign * rel)
-        den_r = jnp.real(den)
-        return jnp.where(jnp.abs(den_r) > 1.0e-16, jnp.real(num) / den_r, jnp.nan)
+        rng_new, st_new, fields_new, logsw_new, e_acc, sign_last, logov_last = fn(
+            runtime_state["rng"],
+            runtime_state["pool_state"],
+            runtime_state["pool_fields_tree"],
+            runtime_state["pool_logsw"],
+            runtime_state["pool_bra"],
+            runtime_state["pool_log_abs"],
+            runtime_state["pool_phase"],
+            walkers,
+            weights,
+            e_estimate,
+            jnp.asarray(dt),
+        )
+        bra_new, log_abs_new, phase_new = self._cache_from_samples(fields_new, logsw_new)
+        runtime_state_new = self._pack_runtime_state(
+            rng=rng_new,
+            pool_state=st_new,
+            pool_fields_tree=fields_new,
+            pool_logsw=logsw_new,
+            pool_bra=bra_new,
+            pool_log_abs=log_abs_new,
+            pool_phase=phase_new,
+        )
+        return runtime_state_new, e_acc / float(n_meas_i), sign_last, logov_last
 
     # ---------------------------------------------------------------------
     # Internal helpers.
@@ -766,53 +906,51 @@ class VAFQMCTrial:
         else:
             self._bound_walkers = walkers
 
-    def _calc_overlap_bundle(self, walkers: Any) -> tuple[Array, Array, Array]:
+    def _calc_overlap_bundle_from_cache(
+        self,
+        walkers: Any,
+        pool_bra: Any,
+        pool_log_abs: Array,
+        pool_phase: Array,
+    ) -> tuple[Array, Array, Array]:
         def one_walker(walker, bra_samples, log_abs, phase):
             sample_sign, sample_logov = jax.vmap(lambda bra: calc_slov(bra, walker))(bra_samples)
             return _mix_overlap_terms(sample_sign, sample_logov, log_abs, phase)
 
         return jax.vmap(one_walker)(
             walkers,
-            self._pool_bra,
-            self._pool_log_abs,
-            self._pool_phase,
+            pool_bra,
+            pool_log_abs,
+            pool_phase,
         )
 
-    def _build_pair_logdens(self):
-        def _logdens(params: Any, fields_pair: Any) -> Array:
-            fields_a = tree_map(lambda x: x[0], fields_pair)
-            fields_b = tree_map(lambda x: x[1], fields_pair)
-            bra, bra_lw = self.ansatz.apply(params, fields_a)
-            ket, ket_lw = self.ansatz.apply(params, fields_b)
-            _, logov = calc_slov(bra, ket)
-            logd = jnp.real(logov + bra_lw + ket_lw)
-            return jnp.where(jnp.isfinite(logd), logd, self.logdens_floor)
+    def _get_local_energy_fn(self, hamil: Any):
+        key = id(hamil)
+        fn = self._local_energy_fns.get(key)
+        if fn is None:
+            def local_energy_fn(walkers, pool_bra, mix_weights):
+                def one_walker(walker, bra_samples, weights):
+                    es = jax.vmap(lambda bra: hamil.local_energy(bra, walker))(bra_samples)
+                    return jnp.einsum("s,s->", weights, es)
 
-        return _logdens
+                return jax.vmap(one_walker)(walkers, pool_bra, mix_weights)
 
-    def _sample_pairs_for_pure(self, npairs: int):
-        if self._pair_sampler is None:
-            self._pair_sampler = choose_sampler_maker(self._sampler_name)(
-                self._build_pair_logdens(),
-                self._pair_fields_shape,
-                **self._sampler_kwargs,
-            )
+            fn = jax.jit(local_energy_fn)
+            self._local_energy_fns[key] = fn
+        return fn
 
-        if self._pair_state is None:
-            self._pair_rng, init_key = jax.random.split(self._pair_rng)
-            state = self._pair_sampler.init(init_key, self.params)
-            if self.burn_in > 0:
-                self._pair_rng, burn_key = jax.random.split(self._pair_rng)
-                state = self._pair_sampler.burn_in(burn_key, self.params, state, self.burn_in)
-            self._pair_state = state
+    def _get_force_bias_fn(self, prop_data: Any):
+        key = id(prop_data)
+        fn = self._force_bias_fns.get(key)
+        if fn is None:
+            def force_bias_fn(walkers, pool_bra, mix_weights):
+                def one_walker(walker, bra_samples, weights):
+                    rdms = jax.vmap(lambda bra: self._collapse_rdm(calc_rdm(bra, walker)))(bra_samples)
+                    rdm_mix = jnp.einsum("s,spq->pq", weights, rdms)
+                    return jnp.einsum("kpq,pq->k", prop_data.vhs, rdm_mix)
 
-        self._pair_rng, sample_key = jax.random.split(self._pair_rng)
-        keys = jax.random.split(sample_key, npairs)
+                return jax.vmap(one_walker)(walkers, pool_bra, mix_weights)
 
-        def _scan_step(state, key):
-            new_state, data = self._pair_sampler.sample(key, self.params, state)
-            return new_state, data
-
-        state, data = lax.scan(_scan_step, self._pair_state, keys)
-        self._pair_state = state
-        return data
+            fn = jax.jit(force_bias_fn)
+            self._force_bias_fns[key] = fn
+        return fn

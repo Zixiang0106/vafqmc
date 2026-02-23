@@ -10,6 +10,7 @@ class AFQMCConfig:
     dt: float = 0.01
     n_walkers: int = 50
     n_prop_steps: int = 50
+    n_measure_samples: int = 20
     n_blocks: int = 20
     n_eq_steps: int = 50
     ortho_interval: int = 10

@@ -24,6 +24,40 @@ def log_once(logger, process_index, message, level='info'):
         getattr(logger, level)(message)
 
 
+def _maybe_initialize_distributed(logger):
+    """Initialize JAX distributed only when multi-process env vars are provided."""
+    if hasattr(jax.distributed, "is_initialized"):
+        try:
+            if jax.distributed.is_initialized():
+                return
+        except Exception:
+            pass
+
+    coord_addr = os.environ.get("JAX_COORDINATOR_ADDRESS")
+    num_processes = os.environ.get("JAX_NUM_PROCESSES")
+    process_id = os.environ.get("JAX_PROCESS_ID")
+
+    if coord_addr and num_processes and process_id:
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        local_ids = None
+        if cuda_visible and cuda_visible != "-1":
+            visible_list = [x.strip() for x in cuda_visible.split(",") if x.strip()]
+            if visible_list:
+                local_ids = list(range(len(visible_list)))
+        if local_ids is None:
+            jax.distributed.initialize()
+        else:
+            jax.distributed.initialize(local_device_ids=local_ids)
+        logger.info(
+            "Initialized JAX distributed: coordinator=%s process_id=%s num_processes=%s",
+            coord_addr,
+            process_id,
+            num_processes,
+        )
+    else:
+        logger.info("Running in single-process mode (skip jax.distributed.initialize)")
+
+
 def lower_penalty(s, factor=1., target=1., power=2.):
     return factor * jnp.maximum(target - s, 0) ** power
 
@@ -232,10 +266,7 @@ def train(cfg: ConfigDict):
     logger = logging.getLogger("train")
     log_level = getattr(logging, cfg.log.level.upper())
     logger.setLevel(log_level)
-    #jax.distributed.initialize(local_device_ids=[0, 1, 2, 3])
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
-    n_visible_gpus = len(cuda_visible.split(","))
-    jax.distributed.initialize(local_device_ids=list(range(n_visible_gpus)))
+    _maybe_initialize_distributed(logger)
     n_devices = jax.device_count()
     n_local_devices = jax.local_device_count()
     process_index = jax.process_index()

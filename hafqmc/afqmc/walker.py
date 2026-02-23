@@ -25,6 +25,7 @@ class AFQMCState:
     walker_fields: Array = field(
         default_factory=lambda: jnp.zeros((0, 0, 0), dtype=jnp.float64)
     )
+    trial_state: Any = None
 
 
 # Register AFQMCState as a PyTree node for JAX jit/scan usage.
@@ -40,6 +41,7 @@ tree_util.register_pytree_node(
             s.e_estimate,
             s.pop_control_shift,
             s.walker_fields,
+            s.trial_state,
         ),
         None,
     ),
@@ -78,15 +80,23 @@ def maybe_orthonormalize(trial: Any, state: AFQMCState, step: int, interval: int
     if interval <= 0 or (step + 1) % interval != 0:
         return state
 
+    trial_state = state.trial_state
     if _is_custom_trial(trial) and hasattr(trial, "orthonormalize_walkers"):
         walkers = trial.orthonormalize_walkers(state.walkers)
-        if hasattr(trial, "on_walkers_updated"):
+        if trial_state is not None and hasattr(trial, "on_walkers_updated_state"):
+            trial_state = trial.on_walkers_updated_state(walkers, trial_state)
+        elif hasattr(trial, "on_walkers_updated"):
             trial.on_walkers_updated(walkers)
+            if hasattr(trial, "export_runtime_state"):
+                trial_state = trial.export_runtime_state()
     else:
         _require_spin_det(state.walkers)
         walkers, _ = orthonormalize(state.walkers)
 
-    sign, logov = calc_slov_batch(trial, walkers)
+    if trial_state is not None and hasattr(trial, "calc_slov_state"):
+        sign, logov = trial.calc_slov_state(walkers, trial_state)
+    else:
+        sign, logov = calc_slov_batch(trial, walkers)
     return AFQMCState(
         walkers=walkers,
         weights=state.weights,
@@ -96,24 +106,55 @@ def maybe_orthonormalize(trial: Any, state: AFQMCState, step: int, interval: int
         key=state.key,
         e_estimate=state.e_estimate,
         pop_control_shift=state.pop_control_shift,
+        trial_state=trial_state,
     )
 
 
 def stochastic_reconfiguration(trial: Any, state: AFQMCState, key: Array) -> AFQMCState:
-    if _is_custom_trial(trial) and hasattr(trial, "stochastic_reconfiguration"):
-        walkers, weights = trial.stochastic_reconfiguration(state.walkers, state.weights, key)
-        sign, logov = calc_slov_batch(trial, walkers)
-        walker_fields = getattr(trial, "walker_fields", state.walker_fields)
-        return AFQMCState(
-            walkers=walkers,
-            weights=weights,
-            sign=sign,
-            logov=logov,
-            walker_fields=walker_fields,
-            key=state.key,
-            e_estimate=state.e_estimate,
-            pop_control_shift=state.pop_control_shift,
-        )
+    if _is_custom_trial(trial):
+        if state.trial_state is not None and hasattr(trial, "stochastic_reconfiguration_state"):
+            walkers, weights, trial_state = trial.stochastic_reconfiguration_state(
+                state.walkers, state.weights, key, state.trial_state
+            )
+            if hasattr(trial, "calc_slov_state"):
+                sign, logov = trial.calc_slov_state(walkers, trial_state)
+            else:
+                sign, logov = calc_slov_batch(trial, walkers)
+            walker_fields = (
+                trial_state.get("walker_fields", state.walker_fields)
+                if isinstance(trial_state, dict)
+                else state.walker_fields
+            )
+            return AFQMCState(
+                walkers=walkers,
+                weights=weights,
+                sign=sign,
+                logov=logov,
+                walker_fields=walker_fields,
+                key=state.key,
+                e_estimate=state.e_estimate,
+                pop_control_shift=state.pop_control_shift,
+                trial_state=trial_state,
+            )
+
+        if hasattr(trial, "stochastic_reconfiguration"):
+            walkers, weights = trial.stochastic_reconfiguration(state.walkers, state.weights, key)
+            sign, logov = calc_slov_batch(trial, walkers)
+            walker_fields = getattr(trial, "walker_fields", state.walker_fields)
+            trial_state = state.trial_state
+            if hasattr(trial, "export_runtime_state"):
+                trial_state = trial.export_runtime_state()
+            return AFQMCState(
+                walkers=walkers,
+                weights=weights,
+                sign=sign,
+                logov=logov,
+                walker_fields=walker_fields,
+                key=state.key,
+                e_estimate=state.e_estimate,
+                pop_control_shift=state.pop_control_shift,
+                trial_state=trial_state,
+            )
 
     n_walkers = state.weights.shape[0]
     weights = jnp.maximum(state.weights, 0.0)
@@ -144,4 +185,5 @@ def stochastic_reconfiguration(trial: Any, state: AFQMCState, key: Array) -> AFQ
         key=state.key,
         e_estimate=state.e_estimate,
         pop_control_shift=state.pop_control_shift,
+        trial_state=state.trial_state,
     )

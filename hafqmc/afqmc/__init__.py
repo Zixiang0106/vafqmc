@@ -8,7 +8,7 @@ from .afqmc import (
 )
 from .afqmc_config import AFQMCConfig
 from .afqmc_utils import PropagationData, load_hamiltonian, save_hamiltonian
-from .vafqmc_trial import VAFQMCTrial, load_ansatz_cfg_from_hparams
+from .stochastic_trial import VAFQMCTrial, load_ansatz_cfg_from_hparams
 from .walker import AFQMCState, init_walkers
 
 __all__ = [
