@@ -24,6 +24,8 @@ def propagation_default() -> ConfigDict:
             "dt": 0.01,
             "n_walkers": 50,
             "n_prop_steps": 50,
+            "n_ene_blocks": 1,
+            "n_sr_blocks": 1,
             "n_blocks": 20,
             "n_eq_steps": 50,
             "ortho_interval": 10,

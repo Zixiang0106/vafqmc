@@ -62,6 +62,10 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
         p.n_walkers = out.n_walkers
     if "n_prop_steps" in out:
         p.n_prop_steps = out.n_prop_steps
+    if "n_ene_blocks" in out:
+        p.n_ene_blocks = out.n_ene_blocks
+    if "n_sr_blocks" in out:
+        p.n_sr_blocks = out.n_sr_blocks
     if "n_blocks" in out:
         p.n_blocks = out.n_blocks
     if "n_eq_steps" in out:
@@ -92,6 +96,8 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
     out.dt = float(p.dt)
     out.n_walkers = int(p.n_walkers)
     out.n_prop_steps = int(p.n_prop_steps)
+    out.n_ene_blocks = int(p.get("n_ene_blocks", 1))
+    out.n_sr_blocks = int(p.get("n_sr_blocks", 1))
     out.n_blocks = int(p.n_blocks)
     out.n_eq_steps = int(p.n_eq_steps)
     out.ortho_interval = int(p.ortho_interval)

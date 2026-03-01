@@ -14,6 +14,7 @@ from ...propagator import orthonormalize
 from ..afqmc_config import AFQMCConfig
 from ..afqmc_utils import (
     PropagationData,
+    analyze_energy_blocks,
     apply_trotter,
     build_propagation_data,
     calc_local_energy_batch,
@@ -33,10 +34,12 @@ def _ensure_complex_walkers(walkers: Any) -> Any:
 
 def _log_init(logger: logging.Logger, cfg: AFQMCConfig, state: AFQMCState, start: float) -> None:
     logger.info(
-        "AFQMC init: dt=%.4g walkers=%d blocks=%d prop_steps=%d meas_samples=%d",
+        "AFQMC init: dt=%.4g walkers=%d blocks=%d sr_blocks=%d ene_blocks=%d prop_steps=%d meas_samples=%d",
         cfg.dt,
         cfg.n_walkers,
         cfg.n_blocks,
+        max(int(getattr(cfg, "n_sr_blocks", 1)), 1),
+        max(int(getattr(cfg, "n_ene_blocks", 1)), 1),
         cfg.n_prop_steps,
         max(int(getattr(cfg, "n_measure_samples", 1)), 1),
     )
@@ -57,23 +60,39 @@ def _update_e_estimate(state: AFQMCState, block_energy: Any) -> AFQMCState:
     )
 
 
+def _relax_pop_control_shift(state: AFQMCState, block_energy: Any) -> AFQMCState:
+    return AFQMCState(
+        walkers=state.walkers,
+        weights=state.weights,
+        sign=state.sign,
+        logov=state.logov,
+        key=state.key,
+        e_estimate=state.e_estimate,
+        pop_control_shift=0.9 * state.pop_control_shift + 0.1 * block_energy,
+        walker_fields=state.walker_fields,
+        trial_state=state.trial_state,
+    )
+
+
 def _finalize_outputs(
     logger: logging.Logger,
     start: float,
     block_energies: list[Any],
+    block_weights: list[Any],
     *,
     state: AFQMCState,
     return_state: bool,
     return_blocks: bool,
 ):
     blocks = jnp.array(block_energies)
-    e_mean = jnp.mean(blocks)
-    e_err = jnp.std(blocks, ddof=1) / jnp.sqrt(blocks.size) if blocks.size > 1 else 0.0
+    weights = jnp.array(block_weights)
+    e_mean, e_err, n_outliers = analyze_energy_blocks(blocks, weights)
 
     logger.info(
-        "AFQMC done: E=%.12f +/- %.3e elapsed=%.2fs",
+        "AFQMC done: E=%.12f +/- %.3e outliers=%d elapsed=%.2fs",
         float(e_mean),
         float(e_err),
+        int(n_outliers),
         time.time() - start,
     )
 
@@ -129,7 +148,7 @@ def _propagate_step_det(
     imp = jnp.exp(
         -prop_data.sqrt_dt * shift_term
         + fb_term
-        + prop_data.dt * (state.pop_control_shift + prop_data.h0_prop)
+        + prop_data.dt * (state.pop_control_shift - prop_data.h0_prop)
     ) * ovlp_ratio
     theta = jnp.angle(jnp.exp(-prop_data.sqrt_dt * shift_term) * ovlp_ratio)
     imp_ph = jnp.abs(imp) * jnp.cos(theta)
@@ -241,33 +260,71 @@ def _build_initial_state_det(
 
 def _run_det_equilibration(
     state: AFQMCState,
+    hamil: Hamiltonian,
     trial: Any,
     prop_data: PropagationData,
     cfg: AFQMCConfig,
     logger: logging.Logger,
     start: float,
 ) -> AFQMCState:
-    record_eq = cfg.log_interval > 0
-    eq_scan = jax.jit(
-        lambda st: _scan_steps_det(
-            st,
-            trial,
-            prop_data,
-            cfg.n_eq_steps,
-            cfg.min_weight,
-            cfg.max_weight,
-            cfg.ortho_interval,
-            record_eq,
-        )
-    )
-    state, wsum_hist = eq_scan(state)
-    if cfg.log_interval > 0:
-        for step in range(cfg.log_interval - 1, cfg.n_eq_steps, cfg.log_interval):
+    if cfg.n_eq_steps <= 0:
+        return state
+
+    cache: dict[tuple[int, bool], Any] = {}
+
+    def run_chunk(st: AFQMCState, n_steps: int, record_wsum: bool):
+        key = (int(n_steps), bool(record_wsum))
+        fn = cache.get(key)
+        if fn is None:
+            fn = jax.jit(
+                lambda s: _scan_steps_det(
+                    s,
+                    trial,
+                    prop_data,
+                    key[0],
+                    cfg.min_weight,
+                    cfg.max_weight,
+                    cfg.ortho_interval,
+                    key[1],
+                )
+            )
+            cache[key] = fn
+        return fn(st)
+
+    eq_done = 0
+    eq_chunk = max(int(cfg.log_interval), 1) if cfg.log_interval > 0 else int(cfg.n_eq_steps)
+    while eq_done < cfg.n_eq_steps:
+        nrun = min(eq_chunk, cfg.n_eq_steps - eq_done)
+        record_wsum = cfg.log_interval > 0
+        state, wsum_hist = run_chunk(state, nrun, record_wsum)
+        eq_done += nrun
+
+        e_mix = _measure_block_energy_det(hamil, trial, state, cfg)
+        state = _update_e_estimate(state, e_mix)
+        state = _relax_pop_control_shift(state, e_mix)
+
+        if cfg.resample:
+            key_new, subkey = jax.random.split(state.key)
+            state = AFQMCState(
+                walkers=state.walkers,
+                weights=state.weights,
+                sign=state.sign,
+                logov=state.logov,
+                key=key_new,
+                e_estimate=state.e_estimate,
+                pop_control_shift=state.pop_control_shift,
+                walker_fields=state.walker_fields,
+                trial_state=state.trial_state,
+            )
+            state = stochastic_reconfiguration(trial, state, subkey)
+
+        if cfg.log_interval > 0:
             logger.info(
-                "Eql %d/%d wsum=%.3e e_est=%.12f elapsed=%.2fs",
-                step + 1,
+                "Eql %d/%d wsum=%.3e e_mix=%.12f e_est=%.12f elapsed=%.2fs",
+                eq_done,
                 cfg.n_eq_steps,
-                float(wsum_hist[step]),
+                float(wsum_hist[-1]),
+                float(e_mix),
                 float(state.e_estimate),
                 time.time() - start,
             )
@@ -300,7 +357,7 @@ def run_afqmc_det(
     prop_data, state = _build_initial_state_det(hamil, trial, cfg)
     _log_init(logger, cfg, state, start)
 
-    state = _run_det_equilibration(state, trial, prop_data, cfg, logger, start)
+    state = _run_det_equilibration(state, hamil, trial, prop_data, cfg, logger, start)
 
     block_scan = jax.jit(
         lambda st: _scan_steps_det(
@@ -316,26 +373,42 @@ def run_afqmc_det(
     )
 
     block_energies: list[Any] = []
-    for blk in range(cfg.n_blocks):
-        state, _ = block_scan(state)
-        block_energy = _measure_block_energy_det(hamil, trial, state, cfg)
-        block_energies.append(block_energy)
-        state = _update_e_estimate(state, block_energy)
+    block_weights: list[Any] = []
+    n_sr_blocks = max(int(getattr(cfg, "n_sr_blocks", 1)), 1)
+    n_ene_blocks = max(int(getattr(cfg, "n_ene_blocks", 1)), 1)
 
-        if cfg.resample:
-            key_new, subkey = jax.random.split(state.key)
-            state = AFQMCState(
-                walkers=state.walkers,
-                weights=state.weights,
-                sign=state.sign,
-                logov=state.logov,
-                key=key_new,
-                e_estimate=state.e_estimate,
-                pop_control_shift=state.pop_control_shift,
-                walker_fields=state.walker_fields,
-                trial_state=state.trial_state,
-            )
-            state = stochastic_reconfiguration(trial, state, subkey)
+    for blk in range(cfg.n_blocks):
+        e_num = jnp.asarray(0.0, dtype=jnp.float64)
+        e_den = jnp.asarray(0.0, dtype=jnp.float64)
+
+        for _ in range(n_sr_blocks):
+            for _ in range(n_ene_blocks):
+                state, _ = block_scan(state)
+                e_i = _measure_block_energy_det(hamil, trial, state, cfg)
+                w_i = jnp.maximum(jnp.sum(state.weights), 1.0e-12)
+                e_num = e_num + w_i * e_i
+                e_den = e_den + w_i
+                state = _relax_pop_control_shift(state, e_i)
+
+            if cfg.resample:
+                key_new, subkey = jax.random.split(state.key)
+                state = AFQMCState(
+                    walkers=state.walkers,
+                    weights=state.weights,
+                    sign=state.sign,
+                    logov=state.logov,
+                    key=key_new,
+                    e_estimate=state.e_estimate,
+                    pop_control_shift=state.pop_control_shift,
+                    walker_fields=state.walker_fields,
+                    trial_state=state.trial_state,
+                )
+                state = stochastic_reconfiguration(trial, state, subkey)
+
+        block_energy = e_num / jnp.maximum(e_den, 1.0e-12)
+        block_energies.append(block_energy)
+        block_weights.append(e_den)
+        state = _update_e_estimate(state, block_energy)
 
         if cfg.log_interval > 0 and (
             (blk + 1) % cfg.log_interval == 0 or blk + 1 == cfg.n_blocks
@@ -354,6 +427,7 @@ def run_afqmc_det(
         logger,
         start,
         block_energies,
+        block_weights,
         state=state,
         return_state=return_state,
         return_blocks=return_blocks,
