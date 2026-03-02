@@ -22,6 +22,7 @@ from ..afqmc_utils import (
     calc_local_energy_batch,
     calc_slov_batch,
 )
+from ..utils.visualization import build_energy_visualizer
 from ..walker import AFQMCState, init_walkers, stochastic_reconfiguration
 
 
@@ -82,6 +83,7 @@ def _finalize_outputs(
     block_weights: list[Any],
     *,
     state: AFQMCState,
+    visualizer: Any,
     return_state: bool,
     return_blocks: bool,
 ):
@@ -96,6 +98,7 @@ def _finalize_outputs(
         int(n_outliers),
         time.time() - start,
     )
+    visualizer.finalize(float(e_mean), float(e_err))
 
     if return_state and return_blocks:
         return e_mean, e_err, blocks, state
@@ -104,6 +107,22 @@ def _finalize_outputs(
     if return_blocks:
         return e_mean, e_err, blocks
     return e_mean, e_err
+
+
+def _log_pop_control_stats(logger: logging.Logger, state: AFQMCState, label: str) -> None:
+    w = jnp.real(state.weights)
+    w_min = float(jnp.min(w))
+    w_max = float(jnp.max(w))
+    w_mean = float(jnp.mean(w))
+    w_sum = float(jnp.sum(w))
+    logger.info(
+        "PopCtrl %s: w_min=%.6e w_max=%.6e w_mean=%.6e w_sum=%.6e",
+        label,
+        w_min,
+        w_max,
+        w_mean,
+        w_sum,
+    )
 
 
 def _propagate_step_custom(
@@ -434,6 +453,7 @@ def _resample_state_custom(trial: Any, state: AFQMCState) -> AFQMCState:
 def _run_steps_with_pop_control_custom(
     state: AFQMCState,
     runner: _CustomScanRunner,
+    logger: logging.Logger,
     *,
     n_steps: int,
     step_counter: int,
@@ -455,7 +475,9 @@ def _run_steps_with_pop_control_custom(
         steps_done += nrun
         local_step += nrun
         if do_resample and pop_freq > 0 and step_counter % pop_freq == 0:
+            _log_pop_control_stats(logger, state, f"pre-resample(step={step_counter}, label={label})")
             state = _resample_state_custom(trial, state)
+            _log_pop_control_stats(logger, state, f"post-resample(step={step_counter}, label={label})")
     return state, step_counter
 
 
@@ -481,6 +503,7 @@ def _run_custom_equilibration(
             state, step_counter = _run_steps_with_pop_control_custom(
                 state,
                 runner,
+                logger,
                 n_steps=nrun,
                 step_counter=step_counter,
                 pop_freq=pop_freq,
@@ -496,7 +519,9 @@ def _run_custom_equilibration(
         state = _relax_pop_control_shift(state, e_mix)
 
         if cfg.resample and pop_freq <= 0:
+            _log_pop_control_stats(logger, state, f"pre-resample(eql={eq_done})")
             state = _resample_state_custom(trial, state)
+            _log_pop_control_stats(logger, state, f"post-resample(eql={eq_done})")
 
         logger.info(
             "Eql %d/%d wsum=%.3e e_mix=%.12f e_est=%.12f elapsed=%.2fs",
@@ -563,6 +588,14 @@ def run_afqmc_custom(
 
     custom_runner = _CustomScanRunner(hamil, trial, prop_data, cfg, logger)
     state = _run_custom_equilibration(state, custom_runner, hamil, trial, cfg, logger, start)
+    visualizer = build_energy_visualizer(
+        enabled=bool(getattr(cfg, "visualization", False)),
+        logger=logger,
+        title="AFQMC Live Energy (custom)",
+        refresh_every=int(getattr(cfg, "visualization_refresh_every", 1)),
+        show=bool(getattr(cfg, "visualization_show", True)),
+        save_path=getattr(cfg, "visualization_save_path", None),
+    )
 
     block_energies: list[Any] = []
     block_weights: list[Any] = []
@@ -581,6 +614,7 @@ def run_afqmc_custom(
                     state, step_counter = _run_steps_with_pop_control_custom(
                         state,
                         custom_runner,
+                        logger,
                         n_steps=int(cfg.n_prop_steps),
                         step_counter=step_counter,
                         pop_freq=pop_freq,
@@ -598,12 +632,15 @@ def run_afqmc_custom(
                 state = _relax_pop_control_shift(state, e_i)
 
             if cfg.resample and pop_freq <= 0:
+                _log_pop_control_stats(logger, state, f"pre-resample(block={blk + 1})")
                 state = _resample_state_custom(trial, state)
+                _log_pop_control_stats(logger, state, f"post-resample(block={blk + 1})")
 
         block_energy = e_num / jnp.maximum(e_den, 1.0e-12)
         block_energies.append(block_energy)
         block_weights.append(e_den)
         state = _update_e_estimate(state, block_energy)
+        visualizer.update(blk + 1, float(block_energy))
 
         if cfg.log_interval > 0 and (
             (blk + 1) % cfg.log_interval == 0 or blk + 1 == cfg.n_blocks
@@ -624,6 +661,7 @@ def run_afqmc_custom(
         block_energies,
         block_weights,
         state=state,
+        visualizer=visualizer,
         return_state=return_state,
         return_blocks=return_blocks,
     )

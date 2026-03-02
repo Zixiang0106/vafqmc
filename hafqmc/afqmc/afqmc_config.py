@@ -76,6 +76,7 @@ def default() -> ConfigDict:
         {
             "propagation": propagation_default(),
             "pop_control": pop_control_default(),
+            "visualization": False,
             "trial_type": "single_det",
             "stochastic_trial": None,
             "seed": 0,

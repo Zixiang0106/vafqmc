@@ -111,6 +111,22 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
     out.min_weight = float(pop.min_weight)
     out.max_weight = float(pop.max_weight)
 
+    vis_cfg = out.get("visualization", False)
+    is_vis_dict_like = (
+        hasattr(vis_cfg, "get")
+        and not isinstance(vis_cfg, (bool, int, float, str))
+    )
+    if is_vis_dict_like:
+        out.visualization = bool(vis_cfg.get("enabled", False))
+        out.visualization_refresh_every = int(vis_cfg.get("refresh_every", 1))
+        out.visualization_show = bool(vis_cfg.get("show", True))
+        out.visualization_save_path = vis_cfg.get("save_path", None)
+    else:
+        out.visualization = bool(vis_cfg)
+        out.visualization_refresh_every = 1
+        out.visualization_show = True
+        out.visualization_save_path = None
+
     if st is None:
         out.n_measure_samples = 1
     else:

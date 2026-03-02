@@ -22,6 +22,7 @@ from ..afqmc_utils import (
     calc_slov_batch,
     _spin_sum_rdm,
 )
+from ..utils.visualization import build_energy_visualizer
 from ..walker import AFQMCState, init_walkers, stochastic_reconfiguration
 
 
@@ -82,6 +83,7 @@ def _finalize_outputs(
     block_weights: list[Any],
     *,
     state: AFQMCState,
+    visualizer: Any,
     return_state: bool,
     return_blocks: bool,
 ):
@@ -96,6 +98,7 @@ def _finalize_outputs(
         int(n_outliers),
         time.time() - start,
     )
+    visualizer.finalize(float(e_mean), float(e_err))
 
     if return_state and return_blocks:
         return e_mean, e_err, blocks, state
@@ -416,6 +419,14 @@ def run_afqmc_det(
     _log_init(logger, cfg, state, start)
 
     state = _run_det_equilibration(state, hamil, trial, prop_data, cfg, logger, start)
+    visualizer = build_energy_visualizer(
+        enabled=bool(getattr(cfg, "visualization", False)),
+        logger=logger,
+        title="AFQMC Live Energy (single_det)",
+        refresh_every=int(getattr(cfg, "visualization_refresh_every", 1)),
+        show=bool(getattr(cfg, "visualization_show", True)),
+        save_path=getattr(cfg, "visualization_save_path", None),
+    )
 
     block_scan = jax.jit(
         lambda st: _scan_steps_det(
@@ -495,6 +506,7 @@ def run_afqmc_det(
         block_energies.append(block_energy)
         block_weights.append(e_den)
         state = _update_e_estimate(state, block_energy)
+        visualizer.update(blk + 1, float(block_energy))
 
         if cfg.log_interval > 0 and (
             (blk + 1) % cfg.log_interval == 0 or blk + 1 == cfg.n_blocks
@@ -515,6 +527,7 @@ def run_afqmc_det(
         block_energies,
         block_weights,
         state=state,
+        visualizer=visualizer,
         return_state=return_state,
         return_blocks=return_blocks,
     )

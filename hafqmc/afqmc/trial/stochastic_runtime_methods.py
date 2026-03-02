@@ -339,6 +339,25 @@ def update_tethered_samples_state(
     valid = jnp.isfinite(old_logov) & jnp.isfinite(new_logov) & (jnp.abs(old_sign) > 0)
     log_ratio = jnp.where(valid, new_logov - old_logov, -jnp.inf)
     sign_ratio = jnp.where(valid, new_sign / old_sign, 0.0 + 0.0j)
+    if bool(getattr(self, "debug_print_sign_ratio", False)):
+        sign_ratio_flat = sign_ratio.reshape(-1)
+        log_ratio_flat = log_ratio.reshape(-1)
+        valid_flat = valid.reshape(-1)
+        n_ratio = int(sign_ratio_flat.shape[0])
+
+        def _print_sign_ratio(i, _):
+            value = sign_ratio_flat[i]
+            jax.debug.print(
+                "sign_ratio[{i}] = {re} + {im}j, log_ratio={lr} (valid={valid})",
+                i=i,
+                re=jnp.real(value),
+                im=jnp.imag(value),
+                lr=log_ratio_flat[i],
+                valid=valid_flat[i],
+            )
+            return _
+
+        _ = lax.fori_loop(0, n_ratio, _print_sign_ratio, None)
     handoff = _phaseless_from_ratio(sign_ratio * jnp.exp(log_ratio))
 
     runtime_state_new = self._pack_runtime_state(
