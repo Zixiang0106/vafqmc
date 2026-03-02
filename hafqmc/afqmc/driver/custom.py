@@ -115,13 +115,36 @@ def _log_pop_control_stats(logger: logging.Logger, state: AFQMCState, label: str
     w_max = float(jnp.max(w))
     w_mean = float(jnp.mean(w))
     w_sum = float(jnp.sum(w))
+    n_zero_w = int(jnp.sum(w <= 0.0))
+
+    logov = jnp.real(state.logov)
+    finite = jnp.isfinite(logov)
+    n_total = int(logov.shape[0])
+    n_finite = int(jnp.sum(finite))
+    n_nonfinite = n_total - n_finite
+    if n_finite > 0:
+        lo_min = float(jnp.min(jnp.where(finite, logov, jnp.inf)))
+        lo_max = float(jnp.max(jnp.where(finite, logov, -jnp.inf)))
+        lo_mean = float(jnp.sum(jnp.where(finite, logov, 0.0)) / n_finite)
+    else:
+        lo_min = float("nan")
+        lo_max = float("nan")
+        lo_mean = float("nan")
+
     logger.info(
-        "PopCtrl %s: w_min=%.6e w_max=%.6e w_mean=%.6e w_sum=%.6e",
+        "PopCtrl %s: "
+        "w_min=%.6e w_max=%.6e w_mean=%.6e w_sum=%.6e n_zero_w=%d | "
+        "logov_min=%.6e logov_max=%.6e logov_mean=%.6e n_logov_nonfinite=%d",
         label,
         w_min,
         w_max,
         w_mean,
         w_sum,
+        n_zero_w,
+        lo_min,
+        lo_max,
+        lo_mean,
+        n_nonfinite,
     )
 
 
