@@ -27,7 +27,7 @@ def propagation_default() -> ConfigDict:
             "n_ene_blocks": 1,
             "n_sr_blocks": 1,
             "n_blocks": 20,
-            "n_eq_steps": 50,
+            "n_eq_steps": 150,
             "ortho_interval": 10,
             "log_interval": 1,
         }
@@ -39,6 +39,7 @@ def pop_control_default() -> ConfigDict:
         {
             "init_noise": 0.0,
             "resample": True,
+            "freq": 0,
             "min_weight": 1.0e-3,
             "max_weight": 100.0,
         }

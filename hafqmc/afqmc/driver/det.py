@@ -34,7 +34,7 @@ def _ensure_complex_walkers(walkers: Any) -> Any:
 
 def _log_init(logger: logging.Logger, cfg: AFQMCConfig, state: AFQMCState, start: float) -> None:
     logger.info(
-        "AFQMC init: dt=%.4g walkers=%d blocks=%d sr_blocks=%d ene_blocks=%d prop_steps=%d meas_samples=%d",
+        "AFQMC init: dt=%.4g walkers=%d blocks=%d sr_blocks=%d ene_blocks=%d prop_steps=%d meas_samples=%d pop_freq=%d",
         cfg.dt,
         cfg.n_walkers,
         cfg.n_blocks,
@@ -42,6 +42,7 @@ def _log_init(logger: logging.Logger, cfg: AFQMCConfig, state: AFQMCState, start
         max(int(getattr(cfg, "n_ene_blocks", 1)), 1),
         cfg.n_prop_steps,
         max(int(getattr(cfg, "n_measure_samples", 1)), 1),
+        int(getattr(cfg, "pop_control_freq", 0)),
     )
     logger.info("Init e_est=%.12f elapsed=%.2fs", float(state.e_estimate), time.time() - start)
 
@@ -207,15 +208,17 @@ def _scan_steps_det(
     min_weight: float,
     max_weight: float,
     ortho_interval: int,
+    step_start: int,
     record_wsum: bool,
 ):
     ortho_interval_i = int(ortho_interval)
+    step_start_i = jnp.asarray(step_start, dtype=jnp.int32)
 
     def body(carry, _):
         st, idx = carry
         st = _propagate_step_det(trial, st, prop_data, min_weight, max_weight)
         if ortho_interval_i > 0:
-            do_ortho = ((idx + 1) % ortho_interval_i) == 0
+            do_ortho = ((step_start_i + idx + 1) % ortho_interval_i) == 0
             st = _orthonormalize_det(trial, st, do_ortho)
         wsum = jnp.sum(st.weights)
         return (st, idx + 1), wsum
@@ -258,6 +261,57 @@ def _build_initial_state_det(
     return prop_data, state
 
 
+def _resample_state_det(trial: Any, state: AFQMCState) -> AFQMCState:
+    key_new, subkey = jax.random.split(state.key)
+    state = AFQMCState(
+        walkers=state.walkers,
+        weights=state.weights,
+        sign=state.sign,
+        logov=state.logov,
+        key=key_new,
+        e_estimate=state.e_estimate,
+        pop_control_shift=state.pop_control_shift,
+        walker_fields=state.walker_fields,
+        trial_state=state.trial_state,
+    )
+    return stochastic_reconfiguration(trial, state, subkey)
+
+
+def _run_steps_with_pop_control_det(
+    state: AFQMCState,
+    run_chunk: Any,
+    *,
+    n_steps: int,
+    step_counter: int,
+    pop_freq: int,
+    record_wsum: bool,
+    do_resample: bool,
+    trial: Any,
+) -> tuple[AFQMCState, Any, int]:
+    steps_done = 0
+    local_step = 0
+    last_wsum = jnp.sum(state.weights)
+    while steps_done < n_steps:
+        if pop_freq > 0:
+            to_pop = pop_freq - (step_counter % pop_freq)
+            nrun = min(n_steps - steps_done, to_pop)
+        else:
+            nrun = n_steps - steps_done
+        state, wsum_hist = run_chunk(state, nrun, local_step, record_wsum)
+        step_counter += nrun
+        steps_done += nrun
+        local_step += nrun
+        if record_wsum and wsum_hist.size > 0:
+            last_wsum = wsum_hist[-1]
+        elif not record_wsum:
+            last_wsum = jnp.sum(state.weights)
+
+        if do_resample and pop_freq > 0 and step_counter % pop_freq == 0:
+            state = _resample_state_det(trial, state)
+
+    return state, last_wsum, step_counter
+
+
 def _run_det_equilibration(
     state: AFQMCState,
     hamil: Hamiltonian,
@@ -272,12 +326,12 @@ def _run_det_equilibration(
 
     cache: dict[tuple[int, bool], Any] = {}
 
-    def run_chunk(st: AFQMCState, n_steps: int, record_wsum: bool):
+    def run_chunk(st: AFQMCState, n_steps: int, step_start: int, record_wsum: bool):
         key = (int(n_steps), bool(record_wsum))
         fn = cache.get(key)
         if fn is None:
             fn = jax.jit(
-                lambda s: _scan_steps_det(
+                lambda s, step0: _scan_steps_det(
                     s,
                     trial,
                     prop_data,
@@ -285,45 +339,49 @@ def _run_det_equilibration(
                     cfg.min_weight,
                     cfg.max_weight,
                     cfg.ortho_interval,
+                    step0,
                     key[1],
                 )
             )
             cache[key] = fn
-        return fn(st)
+        return fn(st, int(step_start))
 
+    pop_freq = int(getattr(cfg, "pop_control_freq", 0))
+    step_counter = 0
     eq_done = 0
     eq_chunk = max(int(cfg.log_interval), 1) if cfg.log_interval > 0 else int(cfg.n_eq_steps)
     while eq_done < cfg.n_eq_steps:
         nrun = min(eq_chunk, cfg.n_eq_steps - eq_done)
         record_wsum = cfg.log_interval > 0
-        state, wsum_hist = run_chunk(state, nrun, record_wsum)
+        if pop_freq > 0:
+            state, wsum_last, step_counter = _run_steps_with_pop_control_det(
+                state,
+                run_chunk,
+                n_steps=nrun,
+                step_counter=step_counter,
+                pop_freq=pop_freq,
+                record_wsum=record_wsum,
+                do_resample=bool(cfg.resample),
+                trial=trial,
+            )
+        else:
+            state, wsum_hist = run_chunk(state, nrun, 0, record_wsum)
+            wsum_last = wsum_hist[-1] if record_wsum and wsum_hist.size > 0 else jnp.sum(state.weights)
         eq_done += nrun
 
         e_mix = _measure_block_energy_det(hamil, trial, state, cfg)
         state = _update_e_estimate(state, e_mix)
         state = _relax_pop_control_shift(state, e_mix)
 
-        if cfg.resample:
-            key_new, subkey = jax.random.split(state.key)
-            state = AFQMCState(
-                walkers=state.walkers,
-                weights=state.weights,
-                sign=state.sign,
-                logov=state.logov,
-                key=key_new,
-                e_estimate=state.e_estimate,
-                pop_control_shift=state.pop_control_shift,
-                walker_fields=state.walker_fields,
-                trial_state=state.trial_state,
-            )
-            state = stochastic_reconfiguration(trial, state, subkey)
+        if cfg.resample and pop_freq <= 0:
+            state = _resample_state_det(trial, state)
 
         if cfg.log_interval > 0:
             logger.info(
                 "Eql %d/%d wsum=%.3e e_mix=%.12f e_est=%.12f elapsed=%.2fs",
                 eq_done,
                 cfg.n_eq_steps,
-                float(wsum_hist[-1]),
+                float(wsum_last),
                 float(e_mix),
                 float(state.e_estimate),
                 time.time() - start,
@@ -368,14 +426,40 @@ def run_afqmc_det(
             cfg.min_weight,
             cfg.max_weight,
             cfg.ortho_interval,
+            0,
             False,
         )
     )
+    block_scan_cache: dict[int, Any] = {}
+
+    def run_block_steps(st: AFQMCState, n_steps: int, step_start: int):
+        n_steps_i = int(n_steps)
+        if n_steps_i == int(cfg.n_prop_steps) and int(step_start) == 0:
+            return block_scan(st)
+        fn = block_scan_cache.get(n_steps_i)
+        if fn is None:
+            fn = jax.jit(
+                lambda s, step0: _scan_steps_det(
+                    s,
+                    trial,
+                    prop_data,
+                    n_steps_i,
+                    cfg.min_weight,
+                    cfg.max_weight,
+                    cfg.ortho_interval,
+                    step0,
+                    False,
+                )
+            )
+            block_scan_cache[n_steps_i] = fn
+        return fn(st, int(step_start))
 
     block_energies: list[Any] = []
     block_weights: list[Any] = []
     n_sr_blocks = max(int(getattr(cfg, "n_sr_blocks", 1)), 1)
     n_ene_blocks = max(int(getattr(cfg, "n_ene_blocks", 1)), 1)
+    pop_freq = int(getattr(cfg, "pop_control_freq", 0))
+    step_counter = 0
 
     for blk in range(cfg.n_blocks):
         e_num = jnp.asarray(0.0, dtype=jnp.float64)
@@ -383,27 +467,29 @@ def run_afqmc_det(
 
         for _ in range(n_sr_blocks):
             for _ in range(n_ene_blocks):
-                state, _ = block_scan(state)
+                if cfg.resample and pop_freq > 0:
+                    steps_left = int(cfg.n_prop_steps)
+                    local_step = 0
+                    while steps_left > 0:
+                        to_pop = pop_freq - (step_counter % pop_freq)
+                        nrun = min(steps_left, to_pop)
+                        state, _ = run_block_steps(state, nrun, local_step)
+                        step_counter += nrun
+                        steps_left -= nrun
+                        local_step += nrun
+                        if step_counter % pop_freq == 0:
+                            state = _resample_state_det(trial, state)
+                else:
+                    state, _ = run_block_steps(state, cfg.n_prop_steps, 0)
+                    step_counter += int(cfg.n_prop_steps)
                 e_i = _measure_block_energy_det(hamil, trial, state, cfg)
                 w_i = jnp.maximum(jnp.sum(state.weights), 1.0e-12)
                 e_num = e_num + w_i * e_i
                 e_den = e_den + w_i
                 state = _relax_pop_control_shift(state, e_i)
 
-            if cfg.resample:
-                key_new, subkey = jax.random.split(state.key)
-                state = AFQMCState(
-                    walkers=state.walkers,
-                    weights=state.weights,
-                    sign=state.sign,
-                    logov=state.logov,
-                    key=key_new,
-                    e_estimate=state.e_estimate,
-                    pop_control_shift=state.pop_control_shift,
-                    walker_fields=state.walker_fields,
-                    trial_state=state.trial_state,
-                )
-                state = stochastic_reconfiguration(trial, state, subkey)
+            if cfg.resample and pop_freq <= 0:
+                state = _resample_state_det(trial, state)
 
         block_energy = e_num / jnp.maximum(e_den, 1.0e-12)
         block_energies.append(block_energy)
