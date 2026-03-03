@@ -18,7 +18,7 @@ def default_aux_network(kind: str = "mlp") -> ConfigDict:
             "n_heads": 4,
             "n_layers": 2,
             "mlp_ratio": 4,
-            "eps": 0.02,
+            "eps": 0.2,
             "clip_value": 3.0,
             "dropout": 0.0,
             "tanh_bound": False,

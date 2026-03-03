@@ -148,19 +148,49 @@ def train(cfg: ConfigDict):
     logger = logging.getLogger("train")
     log_level = getattr(logging, cfg.log.level.upper())
     logger.setLevel(log_level)
-    # initialize distributed mode only when there are multiple devices
-    n_devices = jax.device_count()
-    if n_devices > 1:
-        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
-        visible = [x for x in cuda_visible.split(",") if x.strip() != ""]
-        n_visible_gpus = len(visible) if visible else n_devices
+
+    def _env_int(name, default=1):
         try:
-            jax.distributed.initialize(local_device_ids=list(range(n_visible_gpus)))
+            return int(os.environ.get(name, default))
+        except (TypeError, ValueError):
+            return default
+
+    # Initialize distributed only when environment explicitly requests multi-process.
+    has_coord = any(os.environ.get(k) for k in ("JAX_COORDINATOR_ADDRESS", "COORDINATOR_ADDRESS"))
+    env_nproc = max(_env_int("JAX_PROCESS_COUNT", 1),
+                    _env_int("WORLD_SIZE", 1),
+                    _env_int("SLURM_NTASKS", 1),
+                    _env_int("PMI_SIZE", 1),
+                    _env_int("OMPI_COMM_WORLD_SIZE", 1))
+    requested_distributed = has_coord or env_nproc > 1
+    if requested_distributed:
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        visible = [x for x in cuda_visible.split(",") if x.strip() != ""]
+        dist_kwargs = {}
+        if visible:
+            dist_kwargs["local_device_ids"] = list(range(len(visible)))
+        try:
+            jax.distributed.initialize(**dist_kwargs)
+            logger.info("Initialized jax.distributed")
         except ValueError as err:
-            logger.warning(
-                "Skip jax.distributed.initialize and use local devices: %s", err)
-    else:
-        logger.info("Detected 1 device, skip jax.distributed.initialize")
+            emsg = str(err)
+            if "coordinator_address should be defined" in emsg:
+                raise ValueError(
+                    "Distributed mode requested by environment, but coordinator "
+                    "address is missing. Set JAX_COORDINATOR_ADDRESS "
+                    "(and JAX_PROCESS_COUNT/JAX_PROCESS_INDEX when needed).") from err
+            raise
+        except RuntimeError as err:
+            emsg = str(err)
+            if "must be called before any JAX computations are executed" in emsg:
+                raise RuntimeError(
+                    "jax.distributed.initialize() was called too late. "
+                    "Ensure no JAX call runs before hafqmc.train.train().") from err
+            if "already initialized" in emsg.lower():
+                logger.info("jax.distributed already initialized")
+            else:
+                raise
+
     n_devices = jax.device_count()
     n_local_devices = jax.local_device_count()
     process_index = jax.process_index()
