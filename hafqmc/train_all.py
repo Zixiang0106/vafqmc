@@ -232,10 +232,19 @@ def train(cfg: ConfigDict):
     logger = logging.getLogger("train")
     log_level = getattr(logging, cfg.log.level.upper())
     logger.setLevel(log_level)
-    #jax.distributed.initialize(local_device_ids=[0, 1, 2, 3])
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
-    n_visible_gpus = len(cuda_visible.split(","))
-    jax.distributed.initialize(local_device_ids=list(range(n_visible_gpus)))
+    # initialize distributed mode only when there are multiple devices
+    n_devices = jax.device_count()
+    if n_devices > 1:
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+        visible = [x for x in cuda_visible.split(",") if x.strip() != ""]
+        n_visible_gpus = len(visible) if visible else n_devices
+        try:
+            jax.distributed.initialize(local_device_ids=list(range(n_visible_gpus)))
+        except ValueError as err:
+            logger.warning(
+                "Skip jax.distributed.initialize and use local devices: %s", err)
+    else:
+        logger.info("Detected 1 device, skip jax.distributed.initialize")
     n_devices = jax.device_count()
     n_local_devices = jax.local_device_count()
     process_index = jax.process_index()

@@ -146,6 +146,151 @@ class AuxFieldNet(AuxField):
         return vhs_sum, log_weight
 
 
+class TransformerEncoderBlock(nn.Module):
+    d_model: int
+    n_heads: int
+    mlp_ratio: int = 4
+    dropout: float = 0.
+    dtype: Optional[jnp.dtype] = _t_real
+
+    @nn.compact
+    def __call__(self, hidden):
+        deterministic = not self.has_rng("dropout")
+        h1 = nn.LayerNorm(param_dtype=self.dtype, dtype=self.dtype)(hidden)
+        h1 = nn.SelfAttention(
+            num_heads=self.n_heads,
+            qkv_features=self.d_model,
+            out_features=self.d_model,
+            dropout_rate=self.dropout,
+            deterministic=deterministic,
+            param_dtype=self.dtype,
+            dtype=self.dtype)(h1)
+        hidden = hidden + h1
+        h2 = nn.LayerNorm(param_dtype=self.dtype, dtype=self.dtype)(hidden)
+        mlp_width = max(1, int(self.d_model * self.mlp_ratio))
+        h2 = nn.Dense(mlp_width, param_dtype=self.dtype, dtype=self.dtype)(h2)
+        h2 = nn.gelu(h2)
+        if self.dropout > 0:
+            h2 = nn.Dropout(rate=self.dropout)(h2, deterministic=deterministic)
+        h2 = nn.Dense(self.d_model, param_dtype=self.dtype, dtype=self.dtype)(h2)
+        if self.dropout > 0:
+            h2 = nn.Dropout(rate=self.dropout)(h2, deterministic=deterministic)
+        return hidden + h2
+
+
+class AuxFieldTransformer(AuxField):
+    d_model: int = 64
+    n_heads: int = 4
+    n_layers: int = 2
+    mlp_ratio: int = 4
+    eps: float = 0.02
+    clip_value: float = 3.0
+    dropout: float = 0.0
+    tanh_bound: bool = False
+    zero_init: bool = True
+    mod_density: bool = False
+    net_dtype: Union[str, jnp.dtype] = "float64"
+    log_stats: bool = False
+
+    def _resolve_net_dtype(self):
+        if isinstance(self.net_dtype, str):
+            name = self.net_dtype.lower()
+            if name in ("float32", "f32", "fp32"):
+                return jnp.float32
+            if name in ("float64", "f64", "fp64", "double"):
+                return jnp.float64
+            raise ValueError(f"unsupported net_dtype: {self.net_dtype}")
+        return jnp.dtype(self.net_dtype)
+
+    def setup(self):
+        super().setup()
+        if self.d_model <= 0:
+            raise ValueError(f"d_model must be positive, got {self.d_model}")
+        if self.n_heads <= 0 or self.d_model % self.n_heads != 0:
+            raise ValueError(
+                f"n_heads must divide d_model, got d_model={self.d_model}, "
+                f"n_heads={self.n_heads}")
+        if self.n_layers < 0:
+            raise ValueError(f"n_layers must be non-negative, got {self.n_layers}")
+        if self.mlp_ratio <= 0:
+            raise ValueError(f"mlp_ratio must be positive, got {self.mlp_ratio}")
+        self._ndtype = self._resolve_net_dtype()
+        self.token_embed = nn.Dense(
+            self.d_model,
+            param_dtype=self._ndtype,
+            dtype=self._ndtype,
+            kernel_init=nn.initializers.lecun_normal(),
+            bias_init=nn.zeros)
+        self.channel_embedding = self.param(
+            "channel_embedding",
+            nn.initializers.normal(stddev=0.01),
+            (self.nhs, self.d_model),
+            self._ndtype)
+        self.blocks = [
+            TransformerEncoderBlock(
+                d_model=self.d_model,
+                n_heads=self.n_heads,
+                mlp_ratio=self.mlp_ratio,
+                dropout=self.dropout,
+                dtype=self._ndtype)
+            for _ in range(self.n_layers)]
+        last_init = nn.zeros if self.zero_init else nn.initializers.lecun_normal()
+        self.delta_head = nn.Dense(
+            1,
+            param_dtype=self._ndtype,
+            dtype=self._ndtype,
+            kernel_init=last_init,
+            bias_init=nn.zeros)
+        if self.mod_density:
+            self.density_head = nn.Dense(
+                1,
+                param_dtype=self._ndtype,
+                dtype=self._ndtype,
+                kernel_init=last_init,
+                bias_init=nn.zeros)
+
+    def _bound_delta(self, delta):
+        clipv = jnp.asarray(jnp.abs(self.clip_value), dtype=delta.dtype)
+        if self.tanh_bound:
+            return clipv * jnp.tanh(delta / jnp.maximum(clipv, 1e-12))
+        return jnp.clip(delta, -clipv, clipv)
+
+    def __call__(self, step, fields, curr_wfn=None):
+        vhs = symmetrize(self.vhs) if self.hermite_out else self.vhs
+        log_weight = -0.5 * (fields ** 2).sum()
+        x = fields[:self.nhs]
+        x_net = x.astype(self._ndtype)
+        hidden = self.token_embed(x_net[:, None]) + self.channel_embedding
+        for block in self.blocks:
+            hidden = block(hidden)
+        delta_raw = self.delta_head(hidden).reshape(-1)
+        delta = self._bound_delta(delta_raw)
+        delta = delta.astype(x.dtype)
+        nfields = x + jnp.asarray(self.eps, dtype=x.dtype) * delta
+        if self.mod_density:
+            log_weight -= self.density_head(hidden.mean(0)).reshape(()).astype(log_weight.dtype)
+        if self.trial_rdm is not None:
+            vhs, vbar0 = meanfield_subtract(vhs, self.trial_rdm)
+            nfields += step * vbar0
+        # this dynamic shift is buggy
+        if curr_wfn is not None and self.trial_wfn is not None:
+            trdm = calc_rdm(self.trial_wfn, curr_wfn)
+            _, vbar = meanfield_subtract(vhs, lax.stop_gradient(trdm), 0.1)
+            fshift = step * vbar
+            log_weight += - nfields @ fshift - 0.5 * (fshift ** 2).sum()
+            nfields += fshift
+        vhs_sum = jnp.tensordot(nfields, vhs, axes=1)
+        vhs_sum = cmult(step, vhs_sum)
+        if self.log_stats:
+            clipv = jnp.asarray(jnp.abs(self.clip_value), dtype=delta_raw.dtype)
+            clip_rate = jnp.mean((jnp.abs(delta_raw) >= clipv).astype(self._ndtype))
+            self.sow("intermediates", "delta_mean", jnp.mean(delta_raw))
+            self.sow("intermediates", "delta_std", jnp.std(delta_raw))
+            self.sow("intermediates", "delta_maxabs", jnp.max(jnp.abs(delta_raw)))
+            self.sow("intermediates", "clip_rate", clip_rate)
+        return vhs_sum, log_weight
+
+
 def meanfield_subtract(vhs, rdm, cutoff=None):
     if rdm.ndim == 3:
         rdm = rdm.sum(0)

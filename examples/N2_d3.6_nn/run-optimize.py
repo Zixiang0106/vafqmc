@@ -9,12 +9,14 @@ cfg.restart.hamiltonian = "hamiltonian.pkl"
 
 cfg.ansatz.wfn_spinmix = True
 cfg.ansatz.propagators[0].max_nhs = 100
-cfg.ansatz.propagators[0].aux_network = {
-    "hidden_sizes": [-1, -1, -1],
-    "actv_fun": "gelu",
-    "zero_init": True,
-    "mod_density": False,
-}
+# cfg.ansatz.propagators[0].aux_network = {
+#     "type": "mlp",
+#     "hidden_sizes": [-1, -1, -1],
+#     "actv_fun": "gelu",
+#     "zero_init": True,
+#     "mod_density": False,
+# }
+cfg.ansatz.propagators[0].aux_network = hafqmc.config.default_aux_network("transformer")
 cfg.ansatz.propagators[0].init_tsteps = [0.01] * 3
 cfg.ansatz.propagators[0].sqrt_tsvpar = True
 cfg.ansatz.propagators[0].init_random = 0.1

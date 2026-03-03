@@ -1,13 +1,41 @@
 from ml_collections import ConfigDict, config_dict
 
 
-def default_prop(with_net=False) -> ConfigDict:
-    net_dict = {
-        "hidden_sizes": [-1, -1, -1],
-        "actv_fun": "gelu",
-        "zero_init": True,
-        "mod_density": False,
+def default_aux_network(kind: str = "mlp") -> ConfigDict:
+    kind = kind.lower()
+    if kind in ("mlp", "dense", "net"):
+        net_dict = {
+            "type": "mlp",
+            "hidden_sizes": [-1, -1, -1],
+            "actv_fun": "gelu",
+            "zero_init": True,
+            "mod_density": False,
         }
+    elif kind in ("transformer", "channel_transformer"):
+        net_dict = {
+            "type": "transformer",
+            "d_model": 64,
+            "n_heads": 4,
+            "n_layers": 2,
+            "mlp_ratio": 4,
+            "eps": 0.02,
+            "clip_value": 3.0,
+            "dropout": 0.0,
+            "tanh_bound": False,
+            "zero_init": True,
+            "mod_density": False,
+            "net_dtype": "float64",
+            "log_stats": False,
+        }
+    else:
+        raise ValueError(
+            f"unknown aux network kind: {kind}, choose from "
+            f"'mlp' or 'transformer'")
+    return ConfigDict(net_dict, type_safe=False, convert_dict=True)
+
+
+def default_prop(with_net=False) -> ConfigDict:
+    net_dict = default_aux_network("mlp")
     return ConfigDict({
         "max_nhs": None,
         "init_tsteps": [0.01]*3,

@@ -11,7 +11,7 @@ from .utils import parse_bool, ensure_mapping
 from .utils import fix_init
 from .utils import pack_spin, unpack_spin, block_spin
 from .utils import chol_qr
-from .ham_operator import OneBody, AuxField, AuxFieldNet
+from .ham_operator import OneBody, AuxField, AuxFieldNet, AuxFieldTransformer
 from .ham_operator import OneBodyPW, AuxFieldPW
 from .hamiltonian import _make_ghf, _has_spin, Hamiltonian, HamiltonianPW
 
@@ -90,8 +90,19 @@ class Propagator(nn.Module):
             AuxFieldCls = AuxField
             network_args = {}
         else:
-            AuxFieldCls = AuxFieldNet
-            network_args = ensure_mapping(aux_network, "hidden_sizes")
+            if isinstance(aux_network, str):
+                network_args = {"type": aux_network}
+            else:
+                network_args = ensure_mapping(aux_network, "hidden_sizes")
+            network_type = str(network_args.pop("type", "mlp")).lower()
+            if network_type in ("mlp", "dense", "net"):
+                AuxFieldCls = AuxFieldNet
+            elif network_type in ("transformer", "channel_transformer"):
+                AuxFieldCls = AuxFieldTransformer
+            else:
+                raise ValueError(
+                    f"unknown aux_network type: {network_type}, choose from "
+                    f"'mlp' or 'transformer'")
         vhs_op = AuxFieldCls(
             init_vhs,
             trial_wfn=mfwfn,
