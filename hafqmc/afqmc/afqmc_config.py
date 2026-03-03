@@ -40,6 +40,7 @@ def pop_control_default() -> ConfigDict:
             "init_noise": 0.0,
             "resample": True,
             "freq": 0,
+            "log_stats": False,
             "min_weight": 1.0e-3,
             "max_weight": 100.0,
         }

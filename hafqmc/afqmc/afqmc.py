@@ -81,6 +81,8 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
         pop.resample = out.resample
     if "pop_control_freq" in out:
         pop.freq = out.pop_control_freq
+    if "pop_control_log_stats" in out:
+        pop.log_stats = out.pop_control_log_stats
     if "min_weight" in out:
         pop.min_weight = out.min_weight
     if "max_weight" in out:
@@ -108,6 +110,7 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
     out.init_noise = float(pop.init_noise)
     out.resample = bool(pop.resample)
     out.pop_control_freq = int(pop.get("freq", 0))
+    out.pop_control_log_stats = bool(pop.get("log_stats", False))
     out.min_weight = float(pop.min_weight)
     out.max_weight = float(pop.max_weight)
 

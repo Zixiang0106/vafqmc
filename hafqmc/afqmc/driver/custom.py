@@ -477,6 +477,7 @@ def _run_steps_with_pop_control_custom(
     state: AFQMCState,
     runner: _CustomScanRunner,
     logger: logging.Logger,
+    log_pop_stats: bool,
     *,
     n_steps: int,
     step_counter: int,
@@ -498,9 +499,11 @@ def _run_steps_with_pop_control_custom(
         steps_done += nrun
         local_step += nrun
         if do_resample and pop_freq > 0 and step_counter % pop_freq == 0:
-            _log_pop_control_stats(logger, state, f"pre-resample(step={step_counter}, label={label})")
+            if log_pop_stats:
+                _log_pop_control_stats(logger, state, f"pre-resample(step={step_counter}, label={label})")
             state = _resample_state_custom(trial, state)
-            _log_pop_control_stats(logger, state, f"post-resample(step={step_counter}, label={label})")
+            if log_pop_stats:
+                _log_pop_control_stats(logger, state, f"post-resample(step={step_counter}, label={label})")
     return state, step_counter
 
 
@@ -517,6 +520,7 @@ def _run_custom_equilibration(
         return runner.run_steps(state, cfg.n_eq_steps, "eql")
 
     pop_freq = int(getattr(cfg, "pop_control_freq", 0))
+    log_pop_stats = bool(getattr(cfg, "pop_control_log_stats", False))
     step_counter = 0
     eq_done = 0
     eq_chunk = max(int(cfg.log_interval), 1)
@@ -527,6 +531,7 @@ def _run_custom_equilibration(
                 state,
                 runner,
                 logger,
+                log_pop_stats,
                 n_steps=nrun,
                 step_counter=step_counter,
                 pop_freq=pop_freq,
@@ -542,9 +547,11 @@ def _run_custom_equilibration(
         state = _relax_pop_control_shift(state, e_mix)
 
         if cfg.resample and pop_freq <= 0:
-            _log_pop_control_stats(logger, state, f"pre-resample(eql={eq_done})")
+            if log_pop_stats:
+                _log_pop_control_stats(logger, state, f"pre-resample(eql={eq_done})")
             state = _resample_state_custom(trial, state)
-            _log_pop_control_stats(logger, state, f"post-resample(eql={eq_done})")
+            if log_pop_stats:
+                _log_pop_control_stats(logger, state, f"post-resample(eql={eq_done})")
 
         logger.info(
             "Eql %d/%d wsum=%.3e e_mix=%.12f e_est=%.12f elapsed=%.2fs",
@@ -625,6 +632,7 @@ def run_afqmc_custom(
     n_sr_blocks = max(int(getattr(cfg, "n_sr_blocks", 1)), 1)
     n_ene_blocks = max(int(getattr(cfg, "n_ene_blocks", 1)), 1)
     pop_freq = int(getattr(cfg, "pop_control_freq", 0))
+    log_pop_stats = bool(getattr(cfg, "pop_control_log_stats", False))
     step_counter = 0
 
     for blk in range(cfg.n_blocks):
@@ -638,6 +646,7 @@ def run_afqmc_custom(
                         state,
                         custom_runner,
                         logger,
+                        log_pop_stats,
                         n_steps=int(cfg.n_prop_steps),
                         step_counter=step_counter,
                         pop_freq=pop_freq,
@@ -655,9 +664,11 @@ def run_afqmc_custom(
                 state = _relax_pop_control_shift(state, e_i)
 
             if cfg.resample and pop_freq <= 0:
-                _log_pop_control_stats(logger, state, f"pre-resample(block={blk + 1})")
+                if log_pop_stats:
+                    _log_pop_control_stats(logger, state, f"pre-resample(block={blk + 1})")
                 state = _resample_state_custom(trial, state)
-                _log_pop_control_stats(logger, state, f"post-resample(block={blk + 1})")
+                if log_pop_stats:
+                    _log_pop_control_stats(logger, state, f"post-resample(block={blk + 1})")
 
         block_energy = e_num / jnp.maximum(e_den, 1.0e-12)
         block_energies.append(block_energy)
