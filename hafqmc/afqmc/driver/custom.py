@@ -516,14 +516,27 @@ def _run_custom_equilibration(
     logger: logging.Logger,
     start: float,
 ) -> AFQMCState:
-    if cfg.log_interval <= 0:
+    log_enabled = bool(getattr(cfg, "log_enabled", True))
+    eq_interval = int(getattr(cfg, "log_equil_interval", 0))
+    eq_n_print = max(int(getattr(cfg, "log_equil_n_print", 5)), 0)
+    if not log_enabled:
+        return runner.run_steps(state, cfg.n_eq_steps, "eql")
+    if eq_interval > 0:
+        eq_chunk = max(eq_interval, 1)
+    elif eq_n_print > 0:
+        eq_chunk = max(int(cfg.n_eq_steps) // eq_n_print, 1)
+    else:
         return runner.run_steps(state, cfg.n_eq_steps, "eql")
 
     pop_freq = int(getattr(cfg, "pop_control_freq", 0))
     log_pop_stats = bool(getattr(cfg, "pop_control_log_stats", False))
     step_counter = 0
     eq_done = 0
-    eq_chunk = max(int(cfg.log_interval), 1)
+    logger.info(
+        "Equilibration sweeps: steps=%d, print_every=%d",
+        int(cfg.n_eq_steps),
+        int(eq_chunk),
+    )
     while eq_done < cfg.n_eq_steps:
         nrun = min(eq_chunk, cfg.n_eq_steps - eq_done)
         if pop_freq > 0:
@@ -633,6 +646,8 @@ def run_afqmc_custom(
     n_ene_blocks = max(int(getattr(cfg, "n_ene_blocks", 1)), 1)
     pop_freq = int(getattr(cfg, "pop_control_freq", 0))
     log_pop_stats = bool(getattr(cfg, "pop_control_log_stats", False))
+    log_enabled = bool(getattr(cfg, "log_enabled", True))
+    block_log_interval = int(getattr(cfg, "log_block_interval", 1))
     step_counter = 0
 
     for blk in range(cfg.n_blocks):
@@ -676,8 +691,8 @@ def run_afqmc_custom(
         state = _update_e_estimate(state, block_energy)
         visualizer.update(blk + 1, float(block_energy))
 
-        if cfg.log_interval > 0 and (
-            (blk + 1) % cfg.log_interval == 0 or blk + 1 == cfg.n_blocks
+        if log_enabled and block_log_interval > 0 and (
+            (blk + 1) % block_log_interval == 0 or blk + 1 == cfg.n_blocks
         ):
             logger.info(
                 "Block %d/%d e_blk=%.12f e_est=%.12f wsum=%.3e elapsed=%.2fs",

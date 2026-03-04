@@ -58,6 +58,9 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
     p = out.get("propagation", None)
     if p is None:
         p = out.propagation = afqmc_default().propagation
+    lg = out.get("log", None)
+    if lg is None:
+        lg = out.log = afqmc_default().log
     pop = out.get("pop_control", None)
     if pop is None:
         pop = out.pop_control = afqmc_default().pop_control
@@ -80,6 +83,7 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
         p.ortho_interval = out.ortho_interval
     if "log_interval" in out:
         p.log_interval = out.log_interval
+        lg.block_interval = out.log_interval
 
     if "init_noise" in out:
         pop.init_noise = out.init_noise
@@ -89,10 +93,21 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
         pop.freq = out.pop_control_freq
     if "pop_control_log_stats" in out:
         pop.log_stats = out.pop_control_log_stats
+        lg.pop_control_stats = out.pop_control_log_stats
     if "min_weight" in out:
         pop.min_weight = out.min_weight
     if "max_weight" in out:
         pop.max_weight = out.max_weight
+
+    # logging aliases
+    if "log_enabled" in out:
+        lg.enabled = out.log_enabled
+    if "log_block_interval" in out:
+        lg.block_interval = out.log_block_interval
+    if "log_equil_interval" in out:
+        lg.equil_interval = out.log_equil_interval
+    if "log_equil_n_print" in out:
+        lg.equil_n_print = out.log_equil_n_print
 
     st = out.get("stochastic_trial", None)
     if st is None and str(out.get("trial_type", "single_det")).lower() in (
@@ -120,12 +135,18 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
     out.n_blocks = int(p.n_blocks)
     out.n_eq_steps = int(p.n_eq_steps)
     out.ortho_interval = int(p.ortho_interval)
-    out.log_interval = int(p.log_interval)
+
+    out.log_enabled = bool(lg.get("enabled", True))
+    out.log_block_interval = int(lg.get("block_interval", p.get("log_interval", 1)))
+    out.log_equil_interval = int(lg.get("equil_interval", 0))
+    out.log_equil_n_print = int(lg.get("equil_n_print", 5))
+    # keep legacy flat key for backward compatibility in external scripts
+    out.log_interval = int(out.log_block_interval)
 
     out.init_noise = float(pop.init_noise)
     out.resample = bool(pop.resample)
     out.pop_control_freq = int(pop.get("freq", 0))
-    out.pop_control_log_stats = bool(pop.get("log_stats", False))
+    out.pop_control_log_stats = bool(lg.get("pop_control_stats", pop.get("log_stats", False)))
     out.min_weight = float(pop.min_weight)
     out.max_weight = float(pop.max_weight)
 

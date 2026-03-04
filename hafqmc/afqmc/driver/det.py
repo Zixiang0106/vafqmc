@@ -352,10 +352,27 @@ def _run_det_equilibration(
     pop_freq = int(getattr(cfg, "pop_control_freq", 0))
     step_counter = 0
     eq_done = 0
-    eq_chunk = max(int(cfg.log_interval), 1) if cfg.log_interval > 0 else int(cfg.n_eq_steps)
+    log_enabled = bool(getattr(cfg, "log_enabled", True))
+    eq_interval = int(getattr(cfg, "log_equil_interval", 0))
+    eq_n_print = max(int(getattr(cfg, "log_equil_n_print", 5)), 0)
+    if log_enabled and eq_interval > 0:
+        log_eq = True
+        eq_chunk = max(eq_interval, 1)
+    elif log_enabled and eq_n_print > 0:
+        log_eq = True
+        eq_chunk = max(int(cfg.n_eq_steps) // eq_n_print, 1)
+    else:
+        log_eq = False
+        eq_chunk = int(cfg.n_eq_steps)
+    if log_eq:
+        logger.info(
+            "Equilibration sweeps: steps=%d, print_every=%d",
+            int(cfg.n_eq_steps),
+            int(eq_chunk),
+        )
     while eq_done < cfg.n_eq_steps:
         nrun = min(eq_chunk, cfg.n_eq_steps - eq_done)
-        record_wsum = cfg.log_interval > 0
+        record_wsum = log_eq
         if pop_freq > 0:
             state, wsum_last, step_counter = _run_steps_with_pop_control_det(
                 state,
@@ -379,7 +396,7 @@ def _run_det_equilibration(
         if cfg.resample and pop_freq <= 0:
             state = _resample_state_det(trial, state)
 
-        if cfg.log_interval > 0:
+        if log_eq:
             logger.info(
                 "Eql %d/%d wsum=%.3e e_mix=%.12f e_est=%.12f elapsed=%.2fs",
                 eq_done,
@@ -470,6 +487,8 @@ def run_afqmc_det(
     n_sr_blocks = max(int(getattr(cfg, "n_sr_blocks", 1)), 1)
     n_ene_blocks = max(int(getattr(cfg, "n_ene_blocks", 1)), 1)
     pop_freq = int(getattr(cfg, "pop_control_freq", 0))
+    log_enabled = bool(getattr(cfg, "log_enabled", True))
+    block_log_interval = int(getattr(cfg, "log_block_interval", 1))
     step_counter = 0
 
     for blk in range(cfg.n_blocks):
@@ -508,8 +527,8 @@ def run_afqmc_det(
         state = _update_e_estimate(state, block_energy)
         visualizer.update(blk + 1, float(block_energy))
 
-        if cfg.log_interval > 0 and (
-            (blk + 1) % cfg.log_interval == 0 or blk + 1 == cfg.n_blocks
+        if log_enabled and block_log_interval > 0 and (
+            (blk + 1) % block_log_interval == 0 or blk + 1 == cfg.n_blocks
         ):
             logger.info(
                 "Block %d/%d e_blk=%.12f e_est=%.12f wsum=%.3e elapsed=%.2fs",

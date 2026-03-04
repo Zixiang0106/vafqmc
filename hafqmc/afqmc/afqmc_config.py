@@ -29,7 +29,25 @@ def propagation_default() -> ConfigDict:
             "n_blocks": 20,
             "n_eq_steps": 150,
             "ortho_interval": 10,
+            # legacy key; runtime maps logging to cfg.log.*
             "log_interval": 1,
+        }
+    )
+
+
+def log_default() -> ConfigDict:
+    return _cfg(
+        {
+            "enabled": True,
+            # block (production) logging cadence
+            "block_interval": 1,
+            # equilibration logging cadence:
+            # - if >0: print every equil_interval steps
+            # - if 0 and equil_n_print>0: auto-chunk to ~equil_n_print prints
+            "equil_interval": 0,
+            "equil_n_print": 5,
+            # alias to pop_control.log_stats (mapped in runtime)
+            "pop_control_stats": False,
         }
     )
 
@@ -88,6 +106,7 @@ def default() -> ConfigDict:
     return _cfg(
         {
             "propagation": propagation_default(),
+            "log": log_default(),
             "pop_control": pop_control_default(),
             "visualization": False,
             "trial_type": "single_det",
@@ -168,6 +187,7 @@ __all__ = [
     "cassci_example",
     "cassci_trial_default",
     "default",
+    "log_default",
     "pop_control_default",
     "propagation_default",
     "single_det_example",

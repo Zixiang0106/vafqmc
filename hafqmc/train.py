@@ -169,7 +169,8 @@ def train(cfg: ConfigDict):
     #jax.distributed.initialize(local_device_ids=[0, 1, 2, 3])
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
     n_visible_gpus = len(cuda_visible.split(","))
-    jax.distributed.initialize(local_device_ids=list(range(n_visible_gpus)))
+    if n_visible_gpus > 1:
+      jax.distributed.initialize(local_device_ids=list(range(n_visible_gpus)))
     n_devices = jax.device_count()
     n_local_devices = jax.local_device_count()
     process_index = jax.process_index()

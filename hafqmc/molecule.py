@@ -101,7 +101,7 @@ def initwfn_from_ghf(gmf, mf=None, orth_ao=None):
 def build_mf(verbose=0, **mol_args):
     from pyscf import gto
     scf_args = mol_args.pop("scf", {})
-    method = mol_args.pop("method", "HF")
+    method = mol_args.pop("method", "UHF")
     mol = gto.M(dump_input=False, parse_arg=False, verbose=verbose, **mol_args)
     mf = getattr(mol, method.upper())()
     mf = mf.set(**scf_args).run()
