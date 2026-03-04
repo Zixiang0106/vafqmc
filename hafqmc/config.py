@@ -75,6 +75,9 @@ def default() -> ConfigDict:
             "full_eri": False,
             "with_cc": False,
         },
+        "hf_stability": {
+            "loops": 0,
+        },
         "ansatz":{
             "propagators":[default_prop()],
             "wfn_param": True,

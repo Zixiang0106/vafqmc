@@ -358,8 +358,8 @@ def update_tethered_samples_state(
             return _
 
         _ = lax.fori_loop(0, n_ratio, _print_sign_ratio, None)
-    handoff = _phaseless_from_ratio(sign_ratio)
     #handoff = _phaseless_from_ratio(sign_ratio * jnp.exp(log_ratio))
+    handoff = _phaseless_from_ratio(sign_ratio)
 
     runtime_state_new = self._pack_runtime_state(
         rng=rng,

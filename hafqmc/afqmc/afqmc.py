@@ -10,10 +10,16 @@ from typing import Any, Optional
 from ml_collections import ConfigDict
 
 from ..hamiltonian import Hamiltonian
-from .afqmc_config import AFQMCConfig, default as afqmc_default, stochastic_trial_default
+from .afqmc_config import (
+    AFQMCConfig,
+    cassci_trial_default,
+    default as afqmc_default,
+    stochastic_trial_default,
+)
 from .afqmc_utils import build_hamiltonian_pickle, load_hamiltonian
 from .driver.custom import run_afqmc_custom
 from .driver.det import run_afqmc_det
+from .trial.cassci import CASSCITrial
 from .trial.single_det import as_spin_det, is_single_det_trial
 from .trial.stochastic import VAFQMCTrial
 
@@ -96,6 +102,15 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
         "custom",
     ):
         st = out.stochastic_trial = stochastic_trial_default()
+    ct = out.get("cassci_trial", None)
+    if ct is None and str(out.get("trial_type", "single_det")).lower() in (
+        "cassci",
+        "casci",
+        "cas",
+        "multi_det",
+        "multidet",
+    ):
+        ct = out.cassci_trial = cassci_trial_default()
 
     out.dt = float(p.dt)
     out.n_walkers = int(p.n_walkers)
@@ -184,6 +199,23 @@ def _build_trial_from_config(hamil: Hamiltonian, cfg: ConfigDict) -> Any:
             init_walkers_burn_in=int(st.init_walkers_burn_in),
             max_prop=st.max_prop,
             seed=trial_seed,
+        )
+
+    if kind in ("cassci", "casci", "cas", "multi_det", "multidet"):
+        ct = cfg.get("cassci_trial", None)
+        if ct is None:
+            ct = cassci_trial_default()
+            cfg.cassci_trial = ct
+        if not ct.path:
+            raise ValueError(
+                "cfg.cassci_trial.path is required when trial_type is cassci."
+            )
+        return CASSCITrial.from_file(
+            str(ct.path),
+            n_det=int(ct.n_det) if ct.get("n_det", None) is not None else None,
+            coeff_cutoff=float(ct.get("coeff_cutoff", 0.0)),
+            normalize_coeffs=bool(ct.get("normalize_coeffs", True)),
+            init_mode=str(ct.get("init_mode", "sample_coeff")),
         )
 
     raise ValueError(f"Unknown trial_type: {cfg.trial_type}")

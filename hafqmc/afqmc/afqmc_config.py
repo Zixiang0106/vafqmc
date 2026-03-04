@@ -72,6 +72,18 @@ def stochastic_trial_default() -> ConfigDict:
     )
 
 
+def cassci_trial_default() -> ConfigDict:
+    return _cfg(
+        {
+            "path": None,
+            "n_det": 20,
+            "coeff_cutoff": 0.0,
+            "normalize_coeffs": True,
+            "init_mode": "sample_coeff",
+        }
+    )
+
+
 def default() -> ConfigDict:
     return _cfg(
         {
@@ -80,6 +92,7 @@ def default() -> ConfigDict:
             "visualization": False,
             "trial_type": "single_det",
             "stochastic_trial": None,
+            "cassci_trial": None,
             "seed": 0,
         }
     )
@@ -96,6 +109,14 @@ def stochastic_example() -> ConfigDict:
     cfg = default()
     cfg.trial_type = "stochastic"
     cfg.stochastic_trial = stochastic_trial_default()
+    return cfg
+
+
+def cassci_example() -> ConfigDict:
+    cfg = default()
+    cfg.trial_type = "cassci"
+    cfg.cassci_trial = cassci_trial_default()
+    cfg.stochastic_trial = None
     return cfg
 
 
@@ -137,9 +158,15 @@ class AFQMCConfig:
     def stochastic_example() -> ConfigDict:
         return stochastic_example()
 
+    @staticmethod
+    def cassci_example() -> ConfigDict:
+        return cassci_example()
+
 
 __all__ = [
     "AFQMCConfig",
+    "cassci_example",
+    "cassci_trial_default",
     "default",
     "pop_control_default",
     "propagation_default",

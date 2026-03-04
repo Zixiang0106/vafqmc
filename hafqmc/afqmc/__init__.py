@@ -8,6 +8,8 @@ from .afqmc import (
 )
 from .afqmc_config import (
     AFQMCConfig,
+    cassci_example,
+    cassci_trial_default,
     default,
     pop_control_default,
     propagation_default,
@@ -16,18 +18,22 @@ from .afqmc_config import (
     stochastic_trial_default,
 )
 from .afqmc_utils import PropagationData, load_hamiltonian, save_hamiltonian
+from .trial.cassci import CASSCITrial
 from .trial.stochastic import VAFQMCTrial, load_ansatz_cfg_from_hparams
 from .walker import AFQMCState, init_walkers
 
 __all__ = [
     "AFQMCConfig",
     "AFQMCState",
+    "CASSCITrial",
     "PropagationData",
     "VAFQMCTrial",
     "afqmc_energy",
     "afqmc_energy_from_checkpoint",
     "afqmc_energy_from_pickle",
     "build_hamiltonian_pickle",
+    "cassci_example",
+    "cassci_trial_default",
     "default",
     "init_walkers",
     "load_hamiltonian",

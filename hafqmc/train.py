@@ -42,6 +42,24 @@ def make_lr_schedule(start=1e-4, decay=1., delay=1e4):
     return lambda t: start * jnp.power((1.0 / (1.0 + (t/delay))), decay)
 
 
+def stabilize_hf(mf, n_loop: int, logger: logging.Logger, process_index: int = 0):
+    """Run PySCF stability-improvement cycles on converged mean-field."""
+    n_loop_i = max(int(n_loop), 0)
+    if n_loop_i <= 0:
+        return mf
+    for ii in range(n_loop_i):
+        mo1 = mf.stability()[0]
+        dm1 = mf.make_rdm1(mo1, mf.mo_occ)
+        mf = mf.run(dm1)
+        _ = mf.stability()
+        log_once(
+            logger,
+            process_index,
+            f"HF stability loop {ii + 1}/{n_loop_i}: E = {mf.energy_tot():.12f}",
+        )
+    return mf
+
+
 def make_loss(expect_fn, 
               sign_factor=0., sign_target=1., sign_power=2.,
               std_factor=0., std_target=1., std_power=2):
@@ -233,6 +251,14 @@ def train(cfg: ConfigDict):
         if "ueg" not in cfg:
             log_once(logger, process_index,"Building molecule and doing HF calculation to get Hamiltonian")
             mf = build_mf(**cfg.molecule)
+            n_stab = int(cfg.get("hf_stability", {}).get("loops", 0))
+            if n_stab > 0:
+                log_once(
+                    logger,
+                    process_index,
+                    f"Running HF stability cycles before building Hamiltonian (loops={n_stab})",
+                )
+                mf = stabilize_hf(mf, n_stab, logger, process_index)
             if process_index == 0:
                 print(f"# HF energy from pyscf calculation: {mf.e_tot}")
             if not mf.converged:
