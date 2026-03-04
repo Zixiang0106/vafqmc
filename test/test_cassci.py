@@ -72,16 +72,16 @@ cfg.propagation.dt = 0.005
 cfg.propagation.n_walkers = 200
 cfg.propagation.n_eq_steps = 20
 cfg.propagation.n_blocks = 200
-cfg.propagation.n_prop_steps = 50
-cfg.propagation.ortho_interval = 10
+cfg.propagation.n_block_steps = 50
+cfg.propagation.ortho_freq = 10
 
 cfg.pop_control.resample = True
 cfg.pop_control.freq = 10  # population control every 10 propagation steps
 
 cfg.log.enabled = True
-cfg.log.equil_interval = 0
+cfg.log.equil_freq = 0
 cfg.log.equil_n_print = 5
-cfg.log.block_interval = 1
+cfg.log.block_freq = 1
 cfg.log.pop_control_stats = False
 
 e, err = afqmc_energy(hamil, trial=trial, cfg=cfg)

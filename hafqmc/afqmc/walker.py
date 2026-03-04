@@ -76,8 +76,8 @@ def init_walkers(
     return (w_up, w_dn), key
 
 
-def maybe_orthonormalize(trial: Any, state: AFQMCState, step: int, interval: int) -> AFQMCState:
-    if interval <= 0 or (step + 1) % interval != 0:
+def maybe_orthonormalize(trial: Any, state: AFQMCState, step: int, freq: int) -> AFQMCState:
+    if freq <= 0 or (step + 1) % freq != 0:
         return state
 
     trial_state = state.trial_state

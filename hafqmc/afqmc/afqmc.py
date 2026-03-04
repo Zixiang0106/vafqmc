@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 from collections.abc import Mapping
 from typing import Any, Optional
 
 from ml_collections import ConfigDict
 
 from ..hamiltonian import Hamiltonian
+from ..utils import cfg_to_yaml
 from .afqmc_config import (
     AFQMCConfig,
     cassci_trial_default,
@@ -64,26 +66,33 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
     pop = out.get("pop_control", None)
     if pop is None:
         pop = out.pop_control = afqmc_default().pop_control
+    otp = out.get("output", None)
+    if otp is None:
+        otp = out.output = afqmc_default().output
+    vis = otp.get("visualization", None)
+    if vis is None:
+        vis = otp.visualization = afqmc_default().output.visualization
 
     if "dt" in out:
         p.dt = out.dt
     if "n_walkers" in out:
         p.n_walkers = out.n_walkers
+    if "n_block_steps" in out:
+        p.n_block_steps = out.n_block_steps
+    # Backward-compatible aliases (old names).
     if "n_prop_steps" in out:
-        p.n_prop_steps = out.n_prop_steps
+        p.n_block_steps = out.n_prop_steps
+    if "n_ene_measurements" in out:
+        p.n_ene_measurements = out.n_ene_measurements
+    # Backward-compatible aliases (old names).
     if "n_ene_blocks" in out:
-        p.n_ene_blocks = out.n_ene_blocks
-    if "n_sr_blocks" in out:
-        p.n_sr_blocks = out.n_sr_blocks
+        p.n_ene_measurements = out.n_ene_blocks
     if "n_blocks" in out:
         p.n_blocks = out.n_blocks
     if "n_eq_steps" in out:
         p.n_eq_steps = out.n_eq_steps
-    if "ortho_interval" in out:
-        p.ortho_interval = out.ortho_interval
-    if "log_interval" in out:
-        p.log_interval = out.log_interval
-        lg.block_interval = out.log_interval
+    if "ortho_freq" in out:
+        p.ortho_freq = out.ortho_freq
 
     if "init_noise" in out:
         pop.init_noise = out.init_noise
@@ -92,22 +101,47 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
     if "pop_control_freq" in out:
         pop.freq = out.pop_control_freq
     if "pop_control_log_stats" in out:
-        pop.log_stats = out.pop_control_log_stats
         lg.pop_control_stats = out.pop_control_log_stats
     if "min_weight" in out:
         pop.min_weight = out.min_weight
     if "max_weight" in out:
         pop.max_weight = out.max_weight
+    if "write_raw" in out:
+        otp.write_raw = out.write_raw
+    if "raw_path" in out:
+        otp.raw_path = out.raw_path
+    if "write_hparams" in out:
+        otp.write_hparams = out.write_hparams
+    if "hparams_path" in out:
+        otp.hparams_path = out.hparams_path
+    # Output visualization aliases
+    if "output_visualization_enabled" in out:
+        vis.enabled = out.output_visualization_enabled
+    if "output_visualization_refresh_every" in out:
+        vis.refresh_every = out.output_visualization_refresh_every
+    if "output_visualization_show" in out:
+        vis.show = out.output_visualization_show
+    if "output_visualization_save_path" in out:
+        vis.save_path = out.output_visualization_save_path
 
     # logging aliases
     if "log_enabled" in out:
         lg.enabled = out.log_enabled
-    if "log_block_interval" in out:
-        lg.block_interval = out.log_block_interval
-    if "log_equil_interval" in out:
-        lg.equil_interval = out.log_equil_interval
+    if "log_block_freq" in out:
+        lg.block_freq = out.log_block_freq
+    if "log_equil_freq" in out:
+        lg.equil_freq = out.log_equil_freq
     if "log_equil_n_print" in out:
         lg.equil_n_print = out.log_equil_n_print
+    # Backward-compatible top-level visualization aliases.
+    if "visualization" in out:
+        vis.enabled = out.visualization
+    if "visualization_refresh_every" in out:
+        vis.refresh_every = out.visualization_refresh_every
+    if "visualization_show" in out:
+        vis.show = out.visualization_show
+    if "visualization_save_path" in out:
+        vis.save_path = out.visualization_save_path
 
     st = out.get("stochastic_trial", None)
     if st is None and str(out.get("trial_type", "single_det")).lower() in (
@@ -129,42 +163,38 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
 
     out.dt = float(p.dt)
     out.n_walkers = int(p.n_walkers)
-    out.n_prop_steps = int(p.n_prop_steps)
-    out.n_ene_blocks = int(p.get("n_ene_blocks", 1))
-    out.n_sr_blocks = int(p.get("n_sr_blocks", 1))
+    out.n_block_steps = int(p.get("n_block_steps", p.get("n_prop_steps", 50)))
+    out.n_ene_measurements = int(
+        p.get("n_ene_measurements", p.get("n_ene_blocks", 1))
+    )
+    # Backward-compatible flat aliases for internals/external scripts.
+    out.n_prop_steps = int(out.n_block_steps)
+    out.n_ene_blocks = int(out.n_ene_measurements)
     out.n_blocks = int(p.n_blocks)
     out.n_eq_steps = int(p.n_eq_steps)
-    out.ortho_interval = int(p.ortho_interval)
+    out.ortho_freq = int(p.ortho_freq)
 
     out.log_enabled = bool(lg.get("enabled", True))
-    out.log_block_interval = int(lg.get("block_interval", p.get("log_interval", 1)))
-    out.log_equil_interval = int(lg.get("equil_interval", 0))
+    out.log_block_freq = int(lg.get("block_freq", 1))
+    out.log_equil_freq = int(lg.get("equil_freq", 0))
     out.log_equil_n_print = int(lg.get("equil_n_print", 5))
-    # keep legacy flat key for backward compatibility in external scripts
-    out.log_interval = int(out.log_block_interval)
 
     out.init_noise = float(pop.init_noise)
     out.resample = bool(pop.resample)
     out.pop_control_freq = int(pop.get("freq", 0))
-    out.pop_control_log_stats = bool(lg.get("pop_control_stats", pop.get("log_stats", False)))
+    out.pop_control_log_stats = bool(lg.get("pop_control_stats", False))
     out.min_weight = float(pop.min_weight)
     out.max_weight = float(pop.max_weight)
-
-    vis_cfg = out.get("visualization", False)
-    is_vis_dict_like = (
-        hasattr(vis_cfg, "get")
-        and not isinstance(vis_cfg, (bool, int, float, str))
+    out.output_write_raw = bool(otp.get("write_raw", False))
+    out.output_raw_path = str(otp.get("raw_path", "raw.dat"))
+    out.output_write_hparams = bool(otp.get("write_hparams", False))
+    out.output_hparams_path = str(otp.get("hparams_path", "afqmc_hparams.yml"))
+    out.output_visualization_enabled = bool(vis.get("enabled", False))
+    out.output_visualization_refresh_every = int(vis.get("refresh_every", 1))
+    out.output_visualization_show = bool(vis.get("show", False))
+    out.output_visualization_save_path = str(
+        vis.get("save_path", "eblock_afqmc.png")
     )
-    if is_vis_dict_like:
-        out.visualization = bool(vis_cfg.get("enabled", False))
-        out.visualization_refresh_every = int(vis_cfg.get("refresh_every", 1))
-        out.visualization_show = bool(vis_cfg.get("show", True))
-        out.visualization_save_path = vis_cfg.get("save_path", None)
-    else:
-        out.visualization = bool(vis_cfg)
-        out.visualization_refresh_every = 1
-        out.visualization_show = True
-        out.visualization_save_path = None
 
     if st is None:
         out.n_measure_samples = 1
@@ -186,6 +216,14 @@ def _stochastic_sampler_kwargs(st_cfg: Any) -> dict[str, Any]:
         kwargs.setdefault("dt", float(sampler.dt))
         kwargs.setdefault("length", float(sampler.length))
     return kwargs
+
+
+def _save_afqmc_hparams(cfg: ConfigDict, path: str) -> None:
+    p = Path(path)
+    if p.parent and str(p.parent) != "":
+        p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w", encoding="utf-8") as f:
+        f.write(cfg_to_yaml(cfg))
 
 
 def _build_trial_from_config(hamil: Hamiltonian, cfg: ConfigDict) -> Any:
@@ -261,6 +299,10 @@ def afqmc_energy(
     cfg_runtime = _runtime_cfg(cfg_user)
     logger = _get_logger(logger)
     start = time.time()
+
+    if bool(getattr(cfg_runtime, "output_write_hparams", False)):
+        _save_afqmc_hparams(cfg_user, str(cfg_runtime.output_hparams_path))
+        logger.info("Saved AFQMC config: %s", str(cfg_runtime.output_hparams_path))
 
     if trial is None:
         trial = _build_trial_from_config(hamil, cfg_runtime)

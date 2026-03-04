@@ -7,7 +7,7 @@ cfg.propagation.dt = 0.01
 cfg.propagation.n_walkers = 100
 cfg.propagation.n_eq_steps = 10
 cfg.propagation.n_blocks = 100
-cfg.propagation.n_prop_steps = 50
+cfg.propagation.n_block_steps = 50
 
 cfg.trial_type = "stochastic"
 cfg.stochastic_trial.checkpoint = "checkpoints/checkpoint.pkl"

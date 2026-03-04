@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 from typing import Any
 
 import jax
@@ -35,13 +36,12 @@ def _ensure_complex_walkers(walkers: Any) -> Any:
 
 def _log_init(logger: logging.Logger, cfg: AFQMCConfig, state: AFQMCState, start: float) -> None:
     logger.info(
-        "AFQMC init: dt=%.4g walkers=%d blocks=%d sr_blocks=%d ene_blocks=%d prop_steps=%d meas_samples=%d pop_freq=%d",
+        "AFQMC init: dt=%.4g walkers=%d blocks=%d ene_measurements=%d block_steps=%d meas_samples=%d pop_freq=%d",
         cfg.dt,
         cfg.n_walkers,
         cfg.n_blocks,
-        max(int(getattr(cfg, "n_sr_blocks", 1)), 1),
-        max(int(getattr(cfg, "n_ene_blocks", 1)), 1),
-        cfg.n_prop_steps,
+        max(int(getattr(cfg, "n_ene_measurements", 1)), 1),
+        cfg.n_block_steps,
         max(int(getattr(cfg, "n_measure_samples", 1)), 1),
         int(getattr(cfg, "pop_control_freq", 0)),
     )
@@ -107,6 +107,18 @@ def _finalize_outputs(
     if return_blocks:
         return e_mean, e_err, blocks
     return e_mean, e_err
+
+
+def _write_raw_block_data(path: str, rows: list[tuple[int, float, float, float, float, float]]) -> None:
+    p = Path(path)
+    if p.parent and str(p.parent) != "":
+        p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w", encoding="utf-8") as f:
+        f.write("# block e_blk e_est wsum block_weight elapsed_s\n")
+        for blk, e_blk, e_est, wsum, wblk, elapsed in rows:
+            f.write(
+                f"{blk:d} {e_blk:.16e} {e_est:.16e} {wsum:.16e} {wblk:.16e} {elapsed:.6f}\n"
+            )
 
 
 def _calc_force_bias_det(trial: Any, walkers: Any, prop_data: PropagationData) -> Any:
@@ -210,18 +222,18 @@ def _scan_steps_det(
     n_steps: int,
     min_weight: float,
     max_weight: float,
-    ortho_interval: int,
+    ortho_freq: int,
     step_start: int,
     record_wsum: bool,
 ):
-    ortho_interval_i = int(ortho_interval)
+    ortho_freq_i = int(ortho_freq)
     step_start_i = jnp.asarray(step_start, dtype=jnp.int32)
 
     def body(carry, _):
         st, idx = carry
         st = _propagate_step_det(trial, st, prop_data, min_weight, max_weight)
-        if ortho_interval_i > 0:
-            do_ortho = ((step_start_i + idx + 1) % ortho_interval_i) == 0
+        if ortho_freq_i > 0:
+            do_ortho = ((step_start_i + idx + 1) % ortho_freq_i) == 0
             st = _orthonormalize_det(trial, st, do_ortho)
         wsum = jnp.sum(st.weights)
         return (st, idx + 1), wsum
@@ -341,7 +353,7 @@ def _run_det_equilibration(
                     key[0],
                     cfg.min_weight,
                     cfg.max_weight,
-                    cfg.ortho_interval,
+                    cfg.ortho_freq,
                     step0,
                     key[1],
                 )
@@ -353,11 +365,11 @@ def _run_det_equilibration(
     step_counter = 0
     eq_done = 0
     log_enabled = bool(getattr(cfg, "log_enabled", True))
-    eq_interval = int(getattr(cfg, "log_equil_interval", 0))
+    eq_freq = int(getattr(cfg, "log_equil_freq", 0))
     eq_n_print = max(int(getattr(cfg, "log_equil_n_print", 5)), 0)
-    if log_enabled and eq_interval > 0:
+    if log_enabled and eq_freq > 0:
         log_eq = True
-        eq_chunk = max(eq_interval, 1)
+        eq_chunk = max(eq_freq, 1)
     elif log_enabled and eq_n_print > 0:
         log_eq = True
         eq_chunk = max(int(cfg.n_eq_steps) // eq_n_print, 1)
@@ -437,12 +449,12 @@ def run_afqmc_det(
 
     state = _run_det_equilibration(state, hamil, trial, prop_data, cfg, logger, start)
     visualizer = build_energy_visualizer(
-        enabled=bool(getattr(cfg, "visualization", False)),
+        enabled=bool(getattr(cfg, "output_visualization_enabled", False)),
         logger=logger,
         title="AFQMC Live Energy (single_det)",
-        refresh_every=int(getattr(cfg, "visualization_refresh_every", 1)),
-        show=bool(getattr(cfg, "visualization_show", True)),
-        save_path=getattr(cfg, "visualization_save_path", None),
+        refresh_every=int(getattr(cfg, "output_visualization_refresh_every", 1)),
+        show=bool(getattr(cfg, "output_visualization_show", False)),
+        save_path=getattr(cfg, "output_visualization_save_path", "eblock_afqmc.png"),
     )
 
     block_scan = jax.jit(
@@ -450,10 +462,10 @@ def run_afqmc_det(
             st,
             trial,
             prop_data,
-            cfg.n_prop_steps,
+            cfg.n_block_steps,
             cfg.min_weight,
             cfg.max_weight,
-            cfg.ortho_interval,
+            cfg.ortho_freq,
             0,
             False,
         )
@@ -462,7 +474,7 @@ def run_afqmc_det(
 
     def run_block_steps(st: AFQMCState, n_steps: int, step_start: int):
         n_steps_i = int(n_steps)
-        if n_steps_i == int(cfg.n_prop_steps) and int(step_start) == 0:
+        if n_steps_i == int(cfg.n_block_steps) and int(step_start) == 0:
             return block_scan(st)
         fn = block_scan_cache.get(n_steps_i)
         if fn is None:
@@ -474,7 +486,7 @@ def run_afqmc_det(
                     n_steps_i,
                     cfg.min_weight,
                     cfg.max_weight,
-                    cfg.ortho_interval,
+                    cfg.ortho_freq,
                     step0,
                     False,
                 )
@@ -484,51 +496,60 @@ def run_afqmc_det(
 
     block_energies: list[Any] = []
     block_weights: list[Any] = []
-    n_sr_blocks = max(int(getattr(cfg, "n_sr_blocks", 1)), 1)
-    n_ene_blocks = max(int(getattr(cfg, "n_ene_blocks", 1)), 1)
+    raw_rows: list[tuple[int, float, float, float, float, float]] = []
+    n_ene_measurements = max(int(getattr(cfg, "n_ene_measurements", 1)), 1)
     pop_freq = int(getattr(cfg, "pop_control_freq", 0))
     log_enabled = bool(getattr(cfg, "log_enabled", True))
-    block_log_interval = int(getattr(cfg, "log_block_interval", 1))
+    block_log_freq = int(getattr(cfg, "log_block_freq", 1))
     step_counter = 0
 
     for blk in range(cfg.n_blocks):
         e_num = jnp.asarray(0.0, dtype=jnp.float64)
         e_den = jnp.asarray(0.0, dtype=jnp.float64)
 
-        for _ in range(n_sr_blocks):
-            for _ in range(n_ene_blocks):
-                if cfg.resample and pop_freq > 0:
-                    steps_left = int(cfg.n_prop_steps)
-                    local_step = 0
-                    while steps_left > 0:
-                        to_pop = pop_freq - (step_counter % pop_freq)
-                        nrun = min(steps_left, to_pop)
-                        state, _ = run_block_steps(state, nrun, local_step)
-                        step_counter += nrun
-                        steps_left -= nrun
-                        local_step += nrun
-                        if step_counter % pop_freq == 0:
-                            state = _resample_state_det(trial, state)
-                else:
-                    state, _ = run_block_steps(state, cfg.n_prop_steps, 0)
-                    step_counter += int(cfg.n_prop_steps)
-                e_i = _measure_block_energy_det(hamil, trial, state, cfg)
-                w_i = jnp.maximum(jnp.sum(state.weights), 1.0e-12)
-                e_num = e_num + w_i * e_i
-                e_den = e_den + w_i
-                state = _relax_pop_control_shift(state, e_i)
+        for _ in range(n_ene_measurements):
+            if cfg.resample and pop_freq > 0:
+                steps_left = int(cfg.n_block_steps)
+                local_step = 0
+                while steps_left > 0:
+                    to_pop = pop_freq - (step_counter % pop_freq)
+                    nrun = min(steps_left, to_pop)
+                    state, _ = run_block_steps(state, nrun, local_step)
+                    step_counter += nrun
+                    steps_left -= nrun
+                    local_step += nrun
+                    if step_counter % pop_freq == 0:
+                        state = _resample_state_det(trial, state)
+            else:
+                state, _ = run_block_steps(state, cfg.n_block_steps, 0)
+                step_counter += int(cfg.n_block_steps)
+            e_i = _measure_block_energy_det(hamil, trial, state, cfg)
+            w_i = jnp.maximum(jnp.sum(state.weights), 1.0e-12)
+            e_num = e_num + w_i * e_i
+            e_den = e_den + w_i
+            state = _relax_pop_control_shift(state, e_i)
 
-            if cfg.resample and pop_freq <= 0:
-                state = _resample_state_det(trial, state)
+        if cfg.resample and pop_freq <= 0:
+            state = _resample_state_det(trial, state)
 
         block_energy = e_num / jnp.maximum(e_den, 1.0e-12)
         block_energies.append(block_energy)
         block_weights.append(e_den)
         state = _update_e_estimate(state, block_energy)
+        raw_rows.append(
+            (
+                int(blk + 1),
+                float(block_energy),
+                float(state.e_estimate),
+                float(jnp.sum(state.weights)),
+                float(e_den),
+                float(time.time() - start),
+            )
+        )
         visualizer.update(blk + 1, float(block_energy))
 
-        if log_enabled and block_log_interval > 0 and (
-            (blk + 1) % block_log_interval == 0 or blk + 1 == cfg.n_blocks
+        if log_enabled and block_log_freq > 0 and (
+            (blk + 1) % block_log_freq == 0 or blk + 1 == cfg.n_blocks
         ):
             logger.info(
                 "Block %d/%d e_blk=%.12f e_est=%.12f wsum=%.3e elapsed=%.2fs",
@@ -539,6 +560,10 @@ def run_afqmc_det(
                 float(jnp.sum(state.weights)),
                 time.time() - start,
             )
+
+    if bool(getattr(cfg, "output_write_raw", False)):
+        _write_raw_block_data(str(getattr(cfg, "output_raw_path", "raw.dat")), raw_rows)
+        logger.info("Saved AFQMC raw block data: %s", str(getattr(cfg, "output_raw_path", "raw.dat")))
 
     return _finalize_outputs(
         logger,

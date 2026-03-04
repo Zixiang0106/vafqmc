@@ -138,9 +138,16 @@ class _MatplotlibEnergyVisualizer:
         self.ax.set_xlim(0.5, max(float(x[-1]) + 1.0, 2.0))
         self.ax.set_ylim(ymin - pad, ymax + pad)
 
-        msg = f"n={self.stats.n}\nmean={self.stats.mean:.12f}\nstderr={se[-1]:.3e}"
+        msg = (
+            f"n={self.stats.n}\n"
+            f"E_mean(run)={self.stats.mean:.12f}\n"
+            f"E_err(run)={se[-1]:.3e}"
+        )
         if self.final_mean is not None and self.final_err is not None:
-            msg += f"\nfinal={self.final_mean:.12f} +/- {self.final_err:.3e}"
+            msg += (
+                f"\nE_mean(final)={self.final_mean:.12f}\n"
+                f"E_err(final)={self.final_err:.3e}"
+            )
         self.summary.set_text(msg)
 
         self.fig.canvas.draw_idle()

@@ -203,7 +203,7 @@ def parse_args():
     p.add_argument("--burn-in", type=int, default=100)
     p.add_argument("--sample-update-steps", type=int, default=1)
     p.add_argument("--pop-freq", type=int, default=5)
-    p.add_argument("--ortho-interval", type=int, default=10)
+    p.add_argument("--ortho-freq", type=int, default=10)
     p.add_argument("--weight-eps", type=float, default=1e-14)
     p.add_argument("--log-every", type=int, default=1)
     p.add_argument("--stop-on-anomaly", action="store_true")
@@ -219,12 +219,12 @@ def main():
     cfg.propagation.n_walkers = int(args.walkers)
     cfg.propagation.n_eq_steps = 0
     cfg.propagation.n_blocks = 1
-    cfg.propagation.n_prop_steps = 1
-    cfg.propagation.ortho_interval = int(args.ortho_interval)
-    cfg.propagation.log_interval = 1
+    cfg.propagation.n_block_steps = 1
+    cfg.propagation.ortho_freq = int(args.ortho_freq)
+    cfg.log.block_freq = 1
+    cfg.log.pop_control_stats = False
     cfg.pop_control.resample = True
     cfg.pop_control.freq = int(args.pop_freq)
-    cfg.pop_control.log_stats = False
 
     cfg.trial_type = "stochastic"
     cfg.stochastic_trial.checkpoint = str(args.checkpoint)
@@ -240,7 +240,7 @@ def main():
 
     print(
         f"diag init: walkers={cfg_rt.n_walkers} steps={args.steps} "
-        f"pop_freq={cfg_rt.pop_control_freq} ortho_interval={cfg_rt.ortho_interval}"
+        f"pop_freq={cfg_rt.pop_control_freq} ortho_freq={cfg_rt.ortho_freq}"
     )
     print(
         f"init weights: min={float(jnp.min(state.weights)):.3e} "
@@ -254,7 +254,7 @@ def main():
 
         state, diag_step = _probe_step_custom(hamil, trial, state, prop_data, cfg_rt)
 
-        if cfg_rt.ortho_interval > 0 and ((step + 1) % cfg_rt.ortho_interval == 0):
+        if cfg_rt.ortho_freq > 0 and ((step + 1) % cfg_rt.ortho_freq == 0):
             state = _orthonormalize_custom(trial, state, jnp.asarray(True))
 
         if cfg_rt.resample and cfg_rt.pop_control_freq > 0 and ((step + 1) % cfg_rt.pop_control_freq == 0):

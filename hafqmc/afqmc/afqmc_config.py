@@ -23,14 +23,11 @@ def propagation_default() -> ConfigDict:
         {
             "dt": 0.01,
             "n_walkers": 50,
-            "n_prop_steps": 50,
-            "n_ene_blocks": 1,
-            "n_sr_blocks": 1,
+            "n_block_steps": 50,
+            "n_ene_measurements": 1,
             "n_blocks": 20,
             "n_eq_steps": 150,
-            "ortho_interval": 10,
-            # legacy key; runtime maps logging to cfg.log.*
-            "log_interval": 1,
+            "ortho_freq": 10,
         }
     )
 
@@ -40,13 +37,12 @@ def log_default() -> ConfigDict:
         {
             "enabled": True,
             # block (production) logging cadence
-            "block_interval": 1,
+            "block_freq": 1,
             # equilibration logging cadence:
-            # - if >0: print every equil_interval steps
+            # - if >0: print every equil_freq steps
             # - if 0 and equil_n_print>0: auto-chunk to ~equil_n_print prints
-            "equil_interval": 0,
+            "equil_freq": 0,
             "equil_n_print": 5,
-            # alias to pop_control.log_stats (mapped in runtime)
             "pop_control_stats": False,
         }
     )
@@ -58,9 +54,25 @@ def pop_control_default() -> ConfigDict:
             "init_noise": 0.0,
             "resample": True,
             "freq": 0,
-            "log_stats": False,
             "min_weight": 1.0e-3,
             "max_weight": 100.0,
+        }
+    )
+
+
+def output_default() -> ConfigDict:
+    return _cfg(
+        {
+            "write_raw": False,
+            "raw_path": "raw.dat",
+            "write_hparams": False,
+            "hparams_path": "afqmc_hparams.yml",
+            "visualization": {
+                "enabled": False,
+                "refresh_every": 1,
+                "show": False,
+                "save_path": "eblock_afqmc.png",
+            },
         }
     )
 
@@ -108,7 +120,7 @@ def default() -> ConfigDict:
             "propagation": propagation_default(),
             "log": log_default(),
             "pop_control": pop_control_default(),
-            "visualization": False,
+            "output": output_default(),
             "trial_type": "single_det",
             "stochastic_trial": None,
             "cassci_trial": None,
@@ -188,6 +200,7 @@ __all__ = [
     "cassci_trial_default",
     "default",
     "log_default",
+    "output_default",
     "pop_control_default",
     "propagation_default",
     "single_det_example",
