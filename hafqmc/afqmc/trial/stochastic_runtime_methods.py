@@ -494,10 +494,12 @@ def measure_block_energy_state(
             e_chunks = []
             for start in range(0, n_walkers, chunk_i):
                 end = min(start + chunk_i, n_walkers)
+                walkers_chunk = tree_map(lambda x: x[start:end], walkers_in)
+                bra_chunk = tree_map(lambda x: x[start:end], bra_in)
                 e_chunks.append(
                     jax.vmap(one_walker_eloc)(
-                        walkers_in[start:end],
-                        bra_in[start:end],
+                        walkers_chunk,
+                        bra_chunk,
                         mweights_in[start:end],
                     )
                 )
