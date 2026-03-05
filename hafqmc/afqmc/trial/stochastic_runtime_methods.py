@@ -249,7 +249,23 @@ def calc_local_energy_state(
     walkers = tree_map(jnp.asarray, walkers)
     _, _, mix_weights = self._overlap_bundle_from_state(walkers, runtime_state)
     fn = self._get_local_energy_fn(hamil)
-    return fn(walkers, runtime_state["pool_bra"], mix_weights)
+    chunk = int(getattr(self, "local_energy_chunk_size", 0))
+    if chunk <= 0:
+        return fn(walkers, runtime_state["pool_bra"], mix_weights)
+
+    n_walkers = int(tree_leaves(walkers)[0].shape[0])
+    if chunk >= n_walkers:
+        return fn(walkers, runtime_state["pool_bra"], mix_weights)
+
+    # Reduce peak memory by evaluating local energy on walker chunks.
+    energies = []
+    for start in range(0, n_walkers, chunk):
+        end = min(start + chunk, n_walkers)
+        w_chunk = tree_map(lambda x: x[start:end], walkers)
+        bra_chunk = tree_map(lambda x: x[start:end], runtime_state["pool_bra"])
+        mw_chunk = mix_weights[start:end]
+        energies.append(fn(w_chunk, bra_chunk, mw_chunk))
+    return jnp.concatenate(energies, axis=0)
 
 
 def calc_force_bias(self, _hamil: Any, walkers: Any, prop_data: Any) -> Array:

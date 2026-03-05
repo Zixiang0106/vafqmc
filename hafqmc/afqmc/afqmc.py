@@ -254,6 +254,7 @@ def _build_trial_from_config(hamil: Hamiltonian, cfg: ConfigDict) -> Any:
             sampling_target=str(st.sampling_target),
             logdens_floor=float(st.logdens_floor),
             sample_update_steps=int(st.sample_update_steps),
+            local_energy_chunk_size=int(st.get("local_energy_chunk_size", 0)),
             init_walkers_from_trial=bool(st.init_walkers_from_trial),
             init_walkers_burn_in=int(st.init_walkers_burn_in),
             max_prop=st.max_prop,
