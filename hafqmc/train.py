@@ -15,6 +15,7 @@ from .estimator import make_eval_total
 from .sampler import make_sampler, make_multistep, make_batched, SamplerUnion
 from .utils import ensure_mapping, save_pickle, load_pickle, Printer, cfg_to_yaml
 from .utils import make_moving_avg, PyTree, tree_map
+from .utils import stabilize_hf
 from flax import jax_utils
 os.environ['XLA_FLAGS'] = '--xla_gpu_enable_command_buffer='
 def log_once(logger, process_index, message, level='info'):
@@ -40,24 +41,6 @@ def make_lr_schedule(start=1e-4, decay=1., delay=1e4):
     if decay is None:
         return start
     return lambda t: start * jnp.power((1.0 / (1.0 + (t/delay))), decay)
-
-
-def stabilize_hf(mf, n_loop: int, logger: logging.Logger, process_index: int = 0):
-    """Run PySCF stability-improvement cycles on converged mean-field."""
-    n_loop_i = max(int(n_loop), 0)
-    if n_loop_i <= 0:
-        return mf
-    for ii in range(n_loop_i):
-        mo1 = mf.stability()[0]
-        dm1 = mf.make_rdm1(mo1, mf.mo_occ)
-        mf = mf.run(dm1)
-        _ = mf.stability()
-        log_once(
-            logger,
-            process_index,
-            f"HF stability loop {ii + 1}/{n_loop_i}: E = {mf.energy_tot():.12f}",
-        )
-    return mf
 
 
 def make_loss(expect_fn, 
@@ -252,7 +235,7 @@ def train(cfg: ConfigDict):
         if "ueg" not in cfg:
             log_once(logger, process_index,"Building molecule and doing HF calculation to get Hamiltonian")
             mf = build_mf(**cfg.molecule)
-            n_stab = int(cfg.get("hf_stability", {}).get("loops", 0))
+            n_stab = int(cfg.get("hf_stability", {}).get("loops", 5))
             if n_stab > 0:
                 log_once(
                     logger,

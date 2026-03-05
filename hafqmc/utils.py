@@ -11,12 +11,28 @@ import dataclasses
 import pickle
 import time
 import pickle
+import logging
 def save_pickle(filename, data):
     with open(filename, 'wb') as file:
         pickle.dump(data, file)
 def load_pickle(filename):
     with open(filename, 'rb') as file:
         return pickle.load(file)
+
+
+def stabilize_hf(mf, n_loop: int, logger: logging.Logger, process_index: int = 0):
+    """Run PySCF stability-improvement cycles on converged mean-field."""
+    n_loop_i = max(int(n_loop), 0)
+    if n_loop_i <= 0:
+        return mf
+    for ii in range(n_loop_i):
+        mo1 = mf.stability()[0]
+        dm1 = mf.make_rdm1(mo1, mf.mo_occ)
+        mf = mf.run(dm1)
+        _ = mf.stability()
+        if process_index == 0:
+            logger.info(f"HF stability loop {ii + 1}/{n_loop_i}: E = {mf.energy_tot():.12f}")
+    return mf
 
 _t_real = jnp.float64
 _t_cplx = jnp.complex128

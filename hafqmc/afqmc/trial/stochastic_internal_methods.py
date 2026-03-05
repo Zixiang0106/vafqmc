@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+import logging
 
 import jax
 from jax import numpy as jnp
@@ -63,6 +64,13 @@ def _fields_tree_to_flat(self, fields_tree: Any) -> Array:
 
 def _sample_walkers_from_trial(self, n_walkers: int, key: Array) -> Any:
     """Initialize walkers by sampling ansatz outputs from trial distribution."""
+    logger = logging.getLogger("hafqmc.afqmc")
+    logger.info(
+        "Initializing walkers from trial sampler: n_walkers=%d sampler=%s burn_in=%d",
+        int(n_walkers),
+        str(getattr(self, "_sampler_name", "unknown")),
+        int(self.init_walkers_burn_in),
+    )
     walker_sampler = make_batched(self._sampler, n_walkers, concat=False)
     sampler_params = (self.params, self.reference_wfn)
 
@@ -79,8 +87,18 @@ def _sample_walkers_from_trial(self, n_walkers: int, key: Array) -> Any:
     key, sample_key = jax.random.split(key)
     _, (fields, _logsw) = walker_sampler.sample(sample_key, sampler_params, state)
     walkers, _ = jax.vmap(lambda f: self.ansatz.apply(self.params, f))(fields)
+    if not (isinstance(walkers, (tuple, list)) and len(walkers) == 2):
+        raise ValueError(
+            "init_walkers_from_trial requires spin-separated ansatz output (w_up, w_dn). "
+            "Current ansatz output is not in (up, down) form (likely spin-mixed/GHF). "
+            "Set cfg.stochastic_trial.init_walkers_from_trial=False, or use a non-spin-mixed checkpoint."
+        )
+
+    walkers = (walkers[0], walkers[1])
     if not _has_spin(walkers):
         raise ValueError("init_walkers_from_trial requires spin-separated ansatz output.")
+
+    logger.info("Initial walkers sampled from trial successfully.")
     return walkers
 
 
