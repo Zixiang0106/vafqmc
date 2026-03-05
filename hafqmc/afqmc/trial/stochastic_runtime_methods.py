@@ -475,16 +475,33 @@ def measure_block_energy_state(
     walkers = tree_map(jnp.asarray, walkers)
     n_meas_i = max(int(n_meas), 1)
     steps = max(int(self.sample_update_steps), 0)
-    key = (id(hamil), steps, n_meas_i)
+    chunk = int(getattr(self, "local_energy_chunk_size", 0))
+    key = (id(hamil), steps, n_meas_i, chunk)
     fn = self._block_measure_fns.get(key)
 
     if fn is None:
         n_walkers = int(tree_leaves(walkers)[0].shape[0])
+        chunk_i = chunk
         one_walker_eloc = lambda walker, bra_samples, mweights: jnp.einsum(
             "s,s->",
             mweights,
             jax.vmap(lambda bra: hamil.local_energy(bra, walker))(bra_samples),
         )
+
+        def eval_e_loc_chunked(walkers_in, bra_in, mweights_in):
+            if chunk_i <= 0 or chunk_i >= n_walkers:
+                return jax.vmap(one_walker_eloc)(walkers_in, bra_in, mweights_in)
+            e_chunks = []
+            for start in range(0, n_walkers, chunk_i):
+                end = min(start + chunk_i, n_walkers)
+                e_chunks.append(
+                    jax.vmap(one_walker_eloc)(
+                        walkers_in[start:end],
+                        bra_in[start:end],
+                        mweights_in[start:end],
+                    )
+                )
+            return jnp.concatenate(e_chunks, axis=0)
 
         def measure_fn(rng, st, fields, logsw, bra0, log_abs0, phase0, walkers_in, weights_in, e_est, dt_in):
             def advance_steps(rng_in, st_in, fields_in, logsw_in):
@@ -523,7 +540,7 @@ def measure_block_energy_state(
                     walkers_in, bra_c, log_abs_c, phase_c
                 )
 
-                e_loc = jax.vmap(one_walker_eloc)(walkers_in, bra_c, mix_weights_c)
+                e_loc = eval_e_loc_chunked(walkers_in, bra_c, mix_weights_c)
                 e_loc = jnp.real(e_loc)
                 e_loc = jnp.where(
                     jnp.abs(e_loc - e_est) > clip, e_est, e_loc
