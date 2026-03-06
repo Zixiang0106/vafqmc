@@ -102,6 +102,9 @@ def stochastic_trial_default() -> ConfigDict:
             # n_walkers * chains_per_walker chains.
             # 0 means "auto", i.e. use n_samples.
             "init_walkers_chains_per_walker": 0,
+            # Stage-1 diagnostics: run VAFQMC inference estimator for N samples
+            # right after stage-1 burn-in (0 disables diagnostics).
+            "init_walkers_diag_steps": 10,
             # How to convert sampled trial walkers to AFQMC walkers when
             # ansatz output is spin-mixed/GHF (single matrix).
             # - "auto": project GHF -> (w_up, w_dn) using per-spin QR.

@@ -258,6 +258,7 @@ def _build_trial_from_config(hamil: Hamiltonian, cfg: ConfigDict) -> Any:
             init_walkers_from_trial=bool(st.init_walkers_from_trial),
             init_walkers_burn_in=int(st.init_walkers_burn_in),
             init_walkers_chains_per_walker=int(st.get("init_walkers_chains_per_walker", 0)),
+            init_walkers_diag_steps=int(st.get("init_walkers_diag_steps", 10)),
             init_walkers_projection=str(st.get("init_walkers_projection", "auto")),
             max_prop=st.max_prop,
             seed=trial_seed,

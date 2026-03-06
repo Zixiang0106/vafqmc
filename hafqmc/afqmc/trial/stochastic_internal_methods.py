@@ -98,6 +98,46 @@ def _replace_sampler_state_fields(state: Any, fields: Any) -> Any:
     )
 
 
+def _get_init_walkers_diag_fn(self):
+    fn = getattr(self, "_init_walkers_diag_fn", None)
+    if fn is not None:
+        return fn
+
+    hamil = getattr(self, "_hamiltonian", None)
+    if hamil is None:
+        return None
+
+    apply_ansatz = jax.vmap(lambda f: self.ansatz.apply(self.params, f))
+    eval_eloc = jax.vmap(lambda b, k: hamil.local_energy(b, k))
+    eval_slov = jax.vmap(lambda b, k: calc_slov(b, k))
+    floor = float(getattr(self, "logdens_floor", -60.0))
+
+    def eval_fn(fields_pair: Any, logsw: Array):
+        bra_fields = tree_map(lambda x: x[:, 0], fields_pair)
+        ket_fields = tree_map(lambda x: x[:, 1], fields_pair)
+        bra, bra_lw = apply_ansatz(bra_fields)
+        ket, ket_lw = apply_ansatz(ket_fields)
+        eloc = eval_eloc(bra, ket)
+        sign, logabs = eval_slov(bra, ket)
+        logov = logabs + bra_lw + ket_lw
+
+        dlog = jnp.real(logov - logsw)
+        dlog = jnp.where(jnp.isfinite(dlog), dlog, floor)
+        dmax = jnp.max(dlog)
+        rel_w = jnp.exp(dlog - dmax)
+        rel_w = rel_w / jnp.maximum(jnp.mean(rel_w), 1.0e-12)
+
+        exp_es = jnp.mean((eloc * sign) * rel_w)
+        exp_s = jnp.mean(sign * rel_w)
+        denom = jnp.real(exp_s)
+        etot = jnp.where(jnp.abs(denom) > 1.0e-12, jnp.real(exp_es) / denom, jnp.nan)
+        return etot, jnp.real(exp_es), jnp.real(exp_s)
+
+    fn = jax.jit(eval_fn)
+    self._init_walkers_diag_fn = fn
+    return fn
+
+
 def _project_ghf_walkers_to_uhf(self, walkers_ghf: Array) -> Any:
     """Project sampled GHF walkers into spin-separated (w_up, w_dn) walkers.
 
@@ -193,6 +233,34 @@ def _sample_walkers_from_trial(self, n_walkers: int, key: Array) -> Any:
             state,
             self.init_walkers_burn_in,
         )
+
+    diag_steps = int(getattr(self, "init_walkers_diag_steps", 0))
+    if diag_steps > 0:
+        diag_fn = _get_init_walkers_diag_fn(self)
+        if diag_fn is None:
+            logger.warning(
+                "Stage-1 trial diagnostics skipped: no hamiltonian bound in trial object."
+            )
+        else:
+            logger.info(
+                "Stage-1 trial diagnostics (VAFQMC inference): steps=%d",
+                int(diag_steps),
+            )
+            diag_state = state
+            for ii in range(diag_steps):
+                key, diag_key = jax.random.split(key)
+                diag_state, (diag_fields, diag_logsw) = walker_sampler.sample(
+                    diag_key, sampler_params, diag_state
+                )
+                e_diag, exp_es, exp_s = diag_fn(diag_fields, diag_logsw)
+                logger.info(
+                    "Stage-1 infer %d/%d e_vafqmc=%.12f exp_es=%.12f exp_s=%.12f",
+                    ii + 1,
+                    int(diag_steps),
+                    float(e_diag),
+                    float(exp_es),
+                    float(exp_s),
+                )
     key, sample_key = jax.random.split(key)
     _, (fields, _logsw) = walker_sampler.sample(sample_key, sampler_params, state)
     fields_for_walkers = tree_map(lambda x: x[:, 1], fields)
