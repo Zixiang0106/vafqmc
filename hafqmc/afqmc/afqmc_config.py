@@ -98,6 +98,15 @@ def stochastic_trial_default() -> ConfigDict:
             "local_energy_chunk_size": 0,
             "init_walkers_from_trial": False,
             "init_walkers_burn_in": 0,
+            # Stage-1 global trial burn-in uses:
+            # n_walkers * chains_per_walker chains.
+            # 0 means "auto", i.e. use n_samples.
+            "init_walkers_chains_per_walker": 0,
+            # How to convert sampled trial walkers to AFQMC walkers when
+            # ansatz output is spin-mixed/GHF (single matrix).
+            # - "auto": project GHF -> (w_up, w_dn) using per-spin QR.
+            # - "error": raise if sampled walkers are not spin-separated.
+            "init_walkers_projection": "auto",
             "max_prop": None,
             "trial_seed": None,
             "n_measure_samples": 20,

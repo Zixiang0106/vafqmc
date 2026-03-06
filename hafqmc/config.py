@@ -123,7 +123,7 @@ def default() -> ConfigDict:
             "stat_freq": 1,
             "stat_path": "tbdata/",
             "ckpt_choice": "last", #{choose from "last" and "all"}
-            "ckpt_freq": 1000,
+            "ckpt_freq": 100,
             "ckpt_path": "checkpoints",
             "hpar_path": "hparams.yml",
             "hamil_path": "hamiltonian.pkl",

@@ -205,16 +205,45 @@ def bind_walkers(
         or int(self._pool_logsw.shape[1]) != self.n_samples
     )
     if need_init:
+        logger = logging.getLogger("hafqmc.afqmc")
+        override_fields = getattr(self, "_init_pool_fields_override", None)
+        use_override = False
+        if override_fields is not None:
+            try:
+                lead = tree_leaves(override_fields)[0]
+                use_override = (
+                    int(lead.shape[0]) == n_walkers
+                    and int(lead.shape[1]) == int(self.n_samples)
+                )
+            except Exception:
+                use_override = False
+            if not use_override:
+                logger.warning(
+                    "Stage-1 handoff fields ignored due to shape mismatch for bind_walkers."
+                )
+
         if requested_burn > 0:
             n_chains = int(n_walkers * self.n_samples)
-            logging.getLogger("hafqmc.afqmc").info(
+            logger.info(
                 "Burning in the sampler of %d chains for %d steps (n_walkers=%d, n_samples=%d).",
                 n_chains,
                 requested_burn,
                 n_walkers,
                 self.n_samples,
             )
-        self._pool_state = self._init_pool_state(walkers, requested_burn)
+        if use_override:
+            logger.info(
+                "Applying stage-1->stage-2 handoff: using corresponding auxiliary fields "
+                "as initial left pool state."
+            )
+            self._pool_state = self._init_pool_state(
+                walkers,
+                requested_burn,
+                init_fields=override_fields,
+            )
+        else:
+            self._pool_state = self._init_pool_state(walkers, requested_burn)
+        self._init_pool_fields_override = None
 
     self._n_walkers = n_walkers
     self._bound_walkers = walkers
