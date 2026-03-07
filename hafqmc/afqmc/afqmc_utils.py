@@ -403,7 +403,13 @@ def calc_force_bias(hamil: Hamiltonian, trial: Any, walkers: Any, prop_data: Pro
 
 
 def apply_trotter(walkers: Wfn, shifted_fields: Array, prop_data: PropagationData) -> Wfn:
-    if _has_spin(walkers):
+    # NOTE:
+    # ``_has_spin`` is defined for single-determinant objects and returns True
+    # for non-2D ndarrays. Batched GHF walkers are 3D ndarrays, so using
+    # ``_has_spin(walkers)`` here would misclassify them as spin-separated and
+    # crash on tuple-unpack. For propagation, only explicit (w_up, w_dn)
+    # containers are treated as spin-separated walkers.
+    if isinstance(walkers, (tuple, list)):
         w_up, w_dn = walkers
 
         w_up = jnp.einsum("ij,wjk->wik", prop_data.exp_h1, w_up)
