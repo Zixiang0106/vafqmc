@@ -31,6 +31,8 @@ def _ensure_complex_walkers(walkers: Any) -> Any:
     if isinstance(walkers, tuple) and len(walkers) == 2:
         w_up, w_dn = walkers
         return (w_up.astype(jnp.complex128), w_dn.astype(jnp.complex128))
+    if isinstance(walkers, jnp.ndarray):
+        return walkers.astype(jnp.complex128)
     return walkers
 
 

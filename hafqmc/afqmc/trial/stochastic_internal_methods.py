@@ -318,8 +318,22 @@ def _sample_walkers_from_trial(self, n_walkers: int, key: Array) -> Any:
         logger.info("Initial walkers sampled from trial successfully (spin-separated).")
         return walkers
 
-    # Spin-mixed/GHF ansatz output: optionally project to spin-separated walkers.
+    # Spin-mixed/GHF ansatz output: optionally keep as GHF or project to spin-separated.
     proj_mode = str(getattr(self, "init_walkers_projection", "auto")).lower()
+    if proj_mode in ("keep", "none", "ghf", "no_projection"):
+        walkers_arr = jnp.asarray(walkers)
+        if walkers_arr.ndim != 3:
+            raise ValueError(
+                f"Unsupported sampled GHF walker shape for keep mode: {walkers_arr.shape}."
+            )
+        logger.info(
+            "Initial walkers sampled from trial as GHF and kept in GHF form "
+            "(mode=%s, shape=%s).",
+            proj_mode,
+            tuple(map(int, walkers_arr.shape)),
+        )
+        return walkers_arr
+
     if proj_mode in ("auto", "ghf_to_uhf", "project", "drop_spin_mixing"):
         walkers_arr = jnp.asarray(walkers)
         if walkers_arr.ndim != 3:
@@ -338,7 +352,8 @@ def _sample_walkers_from_trial(self, n_walkers: int, key: Array) -> Any:
     raise ValueError(
         "init_walkers_from_trial got non-spin-separated ansatz output (likely spin-mixed/GHF), "
         f"and init_walkers_projection={proj_mode!r} forbids projection. "
-        "Set cfg.stochastic_trial.init_walkers_projection='auto' (or 'ghf_to_uhf')."
+        "Set cfg.stochastic_trial.init_walkers_projection='auto' (or 'ghf_to_uhf'), "
+        "or use 'keep' to propagate GHF walkers."
     )
 
 

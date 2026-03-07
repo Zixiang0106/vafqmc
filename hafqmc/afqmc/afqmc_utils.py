@@ -403,25 +403,55 @@ def calc_force_bias(hamil: Hamiltonian, trial: Any, walkers: Any, prop_data: Pro
 
 
 def apply_trotter(walkers: Wfn, shifted_fields: Array, prop_data: PropagationData) -> Wfn:
-    _require_spin_det(walkers)
-    w_up, w_dn = walkers
+    if _has_spin(walkers):
+        w_up, w_dn = walkers
 
-    w_up = jnp.einsum("ij,wjk->wik", prop_data.exp_h1, w_up)
-    w_dn = jnp.einsum("ij,wjk->wik", prop_data.exp_h1, w_dn)
+        w_up = jnp.einsum("ij,wjk->wik", prop_data.exp_h1, w_up)
+        w_dn = jnp.einsum("ij,wjk->wik", prop_data.exp_h1, w_dn)
 
-    vhs_sum = jnp.tensordot(shifted_fields, prop_data.vhs, axes=1)
+        vhs_sum = jnp.tensordot(shifted_fields, prop_data.vhs, axes=1)
+        vhs_sum = 1.0j * prop_data.sqrt_dt * vhs_sum
+        if not jnp.issubdtype(vhs_sum.dtype, jnp.complexfloating):
+            vhs_sum = vhs_sum.astype(jnp.complex128)
+        w_up = w_up.astype(vhs_sum.dtype)
+        w_dn = w_dn.astype(vhs_sum.dtype)
+        w_up = jax.vmap(lambda a, b: DEFAULT_EXPM(a, b))(vhs_sum, w_up)
+        w_dn = jax.vmap(lambda a, b: DEFAULT_EXPM(a, b))(vhs_sum, w_dn)
+
+        w_up = jnp.einsum("ij,wjk->wik", prop_data.exp_h1, w_up)
+        w_dn = jnp.einsum("ij,wjk->wik", prop_data.exp_h1, w_dn)
+        return (w_up, w_dn)
+
+    # GHF walker path: apply block-diagonal one-body/two-body operators.
+    walkers_ghf = walkers
+    nrow = int(walkers_ghf.shape[1])
+    nao = int(prop_data.exp_h1.shape[0])
+
+    if nrow not in (nao, 2 * nao):
+        raise ValueError(
+            f"Unsupported GHF walker row dimension {nrow}; expected {nao} or {2 * nao}."
+        )
+
+    exp_h1 = prop_data.exp_h1
+    vhs_sum = jnp.tensordot(shifted_fields, prop_data.vhs, axes=1)  # [w, nao, nao]
+
+    if nrow == 2 * nao:
+        z_h1 = jnp.zeros_like(exp_h1)
+        exp_h1 = jnp.block([[exp_h1, z_h1], [z_h1, exp_h1]])
+
+        z_v = jnp.zeros_like(vhs_sum)
+        top = jnp.concatenate([vhs_sum, z_v], axis=2)
+        bot = jnp.concatenate([z_v, vhs_sum], axis=2)
+        vhs_sum = jnp.concatenate([top, bot], axis=1)
+
+    walkers_ghf = jnp.einsum("ij,wjk->wik", exp_h1, walkers_ghf)
     vhs_sum = 1.0j * prop_data.sqrt_dt * vhs_sum
     if not jnp.issubdtype(vhs_sum.dtype, jnp.complexfloating):
         vhs_sum = vhs_sum.astype(jnp.complex128)
-    w_up = w_up.astype(vhs_sum.dtype)
-    w_dn = w_dn.astype(vhs_sum.dtype)
-    w_up = jax.vmap(lambda a, b: DEFAULT_EXPM(a, b))(vhs_sum, w_up)
-    w_dn = jax.vmap(lambda a, b: DEFAULT_EXPM(a, b))(vhs_sum, w_dn)
-
-    w_up = jnp.einsum("ij,wjk->wik", prop_data.exp_h1, w_up)
-    w_dn = jnp.einsum("ij,wjk->wik", prop_data.exp_h1, w_dn)
-
-    return (w_up, w_dn)
+    walkers_ghf = walkers_ghf.astype(vhs_sum.dtype)
+    walkers_ghf = jax.vmap(lambda a, b: DEFAULT_EXPM(a, b))(vhs_sum, walkers_ghf)
+    walkers_ghf = jnp.einsum("ij,wjk->wik", exp_h1, walkers_ghf)
+    return walkers_ghf
 
 
 def save_hamiltonian(hamil: Hamiltonian, path: str) -> None:

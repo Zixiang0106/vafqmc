@@ -108,6 +108,7 @@ def stochastic_trial_default() -> ConfigDict:
             # How to convert sampled trial walkers to AFQMC walkers when
             # ansatz output is spin-mixed/GHF (single matrix).
             # - "auto": project GHF -> (w_up, w_dn) using per-spin QR.
+            # - "keep": keep sampled walkers in GHF form and propagate as GHF.
             # - "error": raise if sampled walkers are not spin-separated.
             "init_walkers_projection": "auto",
             "max_prop": None,
