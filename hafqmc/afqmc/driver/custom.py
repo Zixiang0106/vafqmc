@@ -14,7 +14,7 @@ from jax import lax, numpy as jnp
 from ...hamiltonian import Hamiltonian
 from ...propagator import orthonormalize
 from ..afqmc_config import AFQMCConfig
-from ..afqmc_utils import (
+from ..utils import (
     PropagationData,
     analyze_energy_blocks,
     apply_trotter,

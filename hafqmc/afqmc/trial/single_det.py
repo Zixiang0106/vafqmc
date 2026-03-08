@@ -11,7 +11,7 @@ from typing import Any, Tuple
 import numpy as onp
 from jax import numpy as jnp
 
-from ..afqmc_utils import _require_spin_det
+from ..utils import _require_spin_det
 
 
 def _is_matrix(x: Any) -> bool:

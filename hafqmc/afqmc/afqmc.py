@@ -18,7 +18,7 @@ from .afqmc_config import (
     default as afqmc_default,
     stochastic_trial_default,
 )
-from .afqmc_utils import build_hamiltonian_pickle, load_hamiltonian
+from .utils import build_hamiltonian_pickle, load_hamiltonian
 from .driver.custom import run_afqmc_custom
 from .driver.det import run_afqmc_det
 from .trial.cassci import CASSCITrial

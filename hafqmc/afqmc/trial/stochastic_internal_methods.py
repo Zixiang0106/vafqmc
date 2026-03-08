@@ -11,7 +11,7 @@ from jax.tree_util import tree_leaves, tree_map
 
 from ...hamiltonian import calc_rdm, calc_slov
 from ...sampler import choose_sampler_maker, make_batched
-from ..afqmc_utils import (
+from ..utils import (
     _spin_sum_rdm,
     gaussian_logdens,
     mix_overlap_terms as _mix_overlap_terms,
@@ -188,7 +188,7 @@ def _sample_walkers_from_trial(self, n_walkers: int, key: Array) -> Any:
         self.fields_shape,
     )
 
-    def train_style_logdens(params: Any, fields_pair: Any) -> Array:
+    def pair_logdens(params: Any, fields_pair: Any) -> Array:
         bra_fields = tree_map(lambda x: x[0], fields_pair)
         ket_fields = tree_map(lambda x: x[1], fields_pair)
         bra, bra_lw = self.ansatz.apply(params, bra_fields)
@@ -198,7 +198,7 @@ def _sample_walkers_from_trial(self, n_walkers: int, key: Array) -> Any:
         return jnp.where(jnp.isfinite(logd), logd, self.logdens_floor)
 
     init_sampler = choose_sampler_maker(self._sampler_name)(
-        train_style_logdens,
+        pair_logdens,
         pair_fields_shape,
         **self._sampler_kwargs,
     )
@@ -261,7 +261,6 @@ def _sample_walkers_from_trial(self, n_walkers: int, key: Array) -> Any:
 
         walkers = tree_map(_pick_one, walkers_all)
 
-        # Stage-1 -> Stage-2 handoff:
         # keep a walker-local pool of left fields and force sample-0 to be
         # the one corresponding to the chosen right-side walker.
         def _group(x):
@@ -288,7 +287,6 @@ def _sample_walkers_from_trial(self, n_walkers: int, key: Array) -> Any:
         walkers = (walkers[0], walkers[1])
         return walkers
 
-    # Spin-mixed/GHF ansatz output: use GHF walkers directly.
     walkers_arr = jnp.asarray(walkers)
     if walkers_arr.ndim != 3:
         raise ValueError(
@@ -323,7 +321,6 @@ def _init_pool_state(self, walkers: Any, burn_steps: int, init_fields: Any = Non
         # under walker-conditioned runtime target.
         state_base = state
         try:
-            # Sampler internals store flattened coordinates as first state slot.
             init_fields_flat = self._fields_tree_to_flat(init_fields)
             state_trial = _replace_sampler_state_fields(state, init_fields_flat)
             state_trial = jax.vmap(lambda st, w: self._pool_sampler.refresh(st, (self.params, w)))(
@@ -331,7 +328,7 @@ def _init_pool_state(self, walkers: Any, burn_steps: int, init_fields: Any = Non
                 walkers,
             )
             state = state_trial
-        except Exception as exc:  # pragma: no cover - defensive fallback
+        except Exception as exc: 
             state = state_base
             logging.getLogger("hafqmc.afqmc").warning(
                 "Stage-1 handoff fields could not be applied; fallback to default pool init. "

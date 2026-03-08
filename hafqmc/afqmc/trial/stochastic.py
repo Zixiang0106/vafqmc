@@ -13,7 +13,7 @@ from ...ansatz import Ansatz
 from ...hamiltonian import _has_spin, calc_rdm
 from ...sampler import choose_sampler_maker, make_batched
 from ...utils import load_pickle
-from ..afqmc_utils import extract_params, load_ansatz_cfg_from_hparams, normalize_ansatz_params
+from ..utils import extract_params, load_ansatz_cfg_from_hparams, normalize_ansatz_params
 from .stochastic_internal_methods import (
     _build_logdens,
     _calc_overlap_bundle_from_cache,

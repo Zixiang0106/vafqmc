@@ -1,6 +1,63 @@
 """AFQMC utility submodules."""
 
+from .core import (
+    Array,
+    RuntimeState,
+    SpinWfn,
+    Wfn,
+    _is_custom_trial,
+    _is_det_trial,
+    _require_spin_det,
+    _spin_sum_rdm,
+    build_hamiltonian_pickle,
+    extract_params,
+    gaussian_logdens,
+    load_ansatz_cfg_from_hparams,
+    load_hamiltonian,
+    mix_overlap_terms,
+    normalize_ansatz_params,
+    phaseless_from_ratio,
+    save_hamiltonian,
+)
+from .propagation import (
+    PropagationData,
+    apply_trotter,
+    build_propagation_data,
+    calc_force_bias,
+    calc_local_energy_batch,
+    calc_rdm_batch,
+    calc_slov_batch,
+)
+from .stats import analyze_energy_blocks, blocking_analysis, reject_outliers
 from .visualization import build_energy_visualizer
 
-__all__ = ["build_energy_visualizer"]
-
+__all__ = [
+    "Array",
+    "PropagationData",
+    "RuntimeState",
+    "SpinWfn",
+    "Wfn",
+    "_is_custom_trial",
+    "_is_det_trial",
+    "_require_spin_det",
+    "_spin_sum_rdm",
+    "analyze_energy_blocks",
+    "apply_trotter",
+    "blocking_analysis",
+    "build_energy_visualizer",
+    "build_hamiltonian_pickle",
+    "build_propagation_data",
+    "calc_force_bias",
+    "calc_local_energy_batch",
+    "calc_rdm_batch",
+    "calc_slov_batch",
+    "extract_params",
+    "gaussian_logdens",
+    "load_ansatz_cfg_from_hparams",
+    "load_hamiltonian",
+    "mix_overlap_terms",
+    "normalize_ansatz_params",
+    "phaseless_from_ratio",
+    "reject_outliers",
+    "save_hamiltonian",
+]

@@ -19,7 +19,7 @@ from .afqmc_config import (
     stochastic_example,
     stochastic_trial_default,
 )
-from .afqmc_utils import PropagationData, load_hamiltonian, save_hamiltonian
+from .utils import PropagationData, load_hamiltonian, save_hamiltonian
 from .trial.cassci import CASSCITrial
 from .trial.stochastic import VAFQMCTrial, load_ansatz_cfg_from_hparams
 from .walker import AFQMCState, init_walkers

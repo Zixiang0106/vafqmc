@@ -10,7 +10,7 @@ from jax import numpy as jnp
 from jax import tree_util
 
 from ..propagator import orthonormalize
-from .afqmc_utils import Array, Wfn, calc_slov_batch, _require_spin_det, _is_custom_trial
+from .utils import Array, Wfn, calc_slov_batch, _require_spin_det, _is_custom_trial
 
 
 @dataclass

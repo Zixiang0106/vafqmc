@@ -11,7 +11,7 @@ from jax.tree_util import tree_leaves, tree_map
 
 from ...hamiltonian import _has_spin
 from ...propagator import orthonormalize
-from ..afqmc_utils import phaseless_from_ratio as _phaseless_from_ratio
+from ..utils import phaseless_from_ratio as _phaseless_from_ratio
 
 Array = jnp.ndarray
 RuntimeState = Dict[str, Any]
