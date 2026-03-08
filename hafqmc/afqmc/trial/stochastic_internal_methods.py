@@ -9,7 +9,7 @@ import jax
 from jax import numpy as jnp
 from jax.tree_util import tree_leaves, tree_map
 
-from ...hamiltonian import _has_spin, calc_rdm, calc_slov
+from ...hamiltonian import calc_rdm, calc_slov
 from ...sampler import choose_sampler_maker, make_batched
 from ..afqmc_utils import (
     _spin_sum_rdm,
@@ -98,8 +98,8 @@ def _replace_sampler_state_fields(state: Any, fields: Any) -> Any:
     )
 
 
-def _get_init_walkers_diag_fn(self):
-    fn = getattr(self, "_init_walkers_diag_fn", None)
+def _get_init_walkers_infer_fn(self):
+    fn = getattr(self, "_init_walkers_infer_fn", None)
     if fn is not None:
         return fn
 
@@ -111,14 +111,35 @@ def _get_init_walkers_diag_fn(self):
     eval_eloc = jax.vmap(lambda b, k: hamil.local_energy(b, k))
     eval_slov = jax.vmap(lambda b, k: calc_slov(b, k))
     floor = float(getattr(self, "logdens_floor", -60.0))
+    local_chunk = int(getattr(self, "local_energy_chunk_size", 0))
+    # Stage-1 inference has no pool-sample axis. A practical auto rule is to scale
+    # AFQMC local-energy chunk by n_samples to keep similar effective workload.
+    chunk = int(local_chunk * int(getattr(self, "n_samples", 1))) if local_chunk > 0 else 0
 
     def eval_fn(fields_pair: Any, logsw: Array):
         bra_fields = tree_map(lambda x: x[:, 0], fields_pair)
         ket_fields = tree_map(lambda x: x[:, 1], fields_pair)
         bra, bra_lw = apply_ansatz(bra_fields)
         ket, ket_lw = apply_ansatz(ket_fields)
-        eloc = eval_eloc(bra, ket)
-        sign, logabs = eval_slov(bra, ket)
+        n_walkers = int(tree_leaves(ket)[0].shape[0])
+        if chunk <= 0 or chunk >= n_walkers:
+            eloc = eval_eloc(bra, ket)
+            sign, logabs = eval_slov(bra, ket)
+        else:
+            eloc_chunks = []
+            sign_chunks = []
+            logabs_chunks = []
+            for start in range(0, n_walkers, chunk):
+                end = min(start + chunk, n_walkers)
+                bra_c = tree_map(lambda x: x[start:end], bra)
+                ket_c = tree_map(lambda x: x[start:end], ket)
+                eloc_chunks.append(eval_eloc(bra_c, ket_c))
+                sign_c, logabs_c = eval_slov(bra_c, ket_c)
+                sign_chunks.append(sign_c)
+                logabs_chunks.append(logabs_c)
+            eloc = jnp.concatenate(eloc_chunks, axis=0)
+            sign = jnp.concatenate(sign_chunks, axis=0)
+            logabs = jnp.concatenate(logabs_chunks, axis=0)
         logov = logabs + bra_lw + ket_lw
 
         dlog = jnp.real(logov - logsw)
@@ -133,49 +154,11 @@ def _get_init_walkers_diag_fn(self):
         etot = jnp.where(jnp.abs(denom) > 1.0e-12, jnp.real(exp_es) / denom, jnp.nan)
         return etot, jnp.real(exp_es), jnp.real(exp_s)
 
-    fn = jax.jit(eval_fn)
-    self._init_walkers_diag_fn = fn
+    # For chunked inference, keep eager mode to avoid giant unrolled HLO from
+    # Python chunk loops and reduce compilation memory pressure.
+    fn = eval_fn if chunk > 0 else jax.jit(eval_fn)
+    self._init_walkers_infer_fn = fn
     return fn
-
-
-def _project_ghf_walkers_to_uhf(self, walkers_ghf: Array) -> Any:
-    """Project sampled GHF walkers into spin-separated (w_up, w_dn) walkers.
-
-    This is an initialization-time approximation used when the trial ansatz
-    outputs a spin-mixed/GHF determinant but AFQMC walkers are spin separated.
-    """
-    if not _has_spin(self.reference_wfn):
-        raise ValueError(
-            "Cannot project GHF sampled walkers to UHF: reference_wfn is not spin-separated."
-        )
-
-    nbasis = int(self.nbasis)
-    nrow = int(walkers_ghf.shape[1])
-    if nrow != 2 * nbasis:
-        raise ValueError(
-            f"Unexpected GHF walker row dimension: got {nrow}, expected {2 * nbasis}."
-        )
-
-    n_alpha = int(self.reference_wfn[0].shape[1])
-    n_beta = int(self.reference_wfn[1].shape[1])
-    ncol = int(walkers_ghf.shape[2])
-    if n_alpha > ncol or n_beta > ncol:
-        raise ValueError(
-            f"Cannot project GHF walkers: ncol={ncol}, n_alpha={n_alpha}, n_beta={n_beta}."
-        )
-
-    def _proj_occ(block: Array, nocc: int) -> Array:
-        # Use principal left-singular subspace (less sensitive than QR
-        # to column ordering for spin-mixed/GHF walkers).
-        u, _s, _vh = jnp.linalg.svd(block, full_matrices=False)
-        return u[:, :nocc]
-
-    def _proj_one(w: Array) -> Any:
-        up_block = w[:nbasis, :]
-        dn_block = w[nbasis:, :]
-        return _proj_occ(up_block, n_alpha), _proj_occ(dn_block, n_beta)
-
-    return jax.vmap(_proj_one)(walkers_ghf)
 
 
 def _sample_walkers_from_trial(self, n_walkers: int, key: Array) -> Any:
@@ -192,7 +175,7 @@ def _sample_walkers_from_trial(self, n_walkers: int, key: Array) -> Any:
         chains_per_walker = int(self.n_samples)
     n_init_chains = int(n_walkers * chains_per_walker)
     logger.info(
-        "Stage-1 trial burn-in: total_chains=%d (%d walkers x %d chains/walker)",
+        "Trial & walker burn-in: total_chains=%d (%d walkers x %d chains/walker)",
         n_init_chains,
         int(n_walkers),
         int(chains_per_walker),
@@ -234,30 +217,30 @@ def _sample_walkers_from_trial(self, n_walkers: int, key: Array) -> Any:
             self.init_walkers_burn_in,
         )
 
-    diag_steps = int(getattr(self, "init_walkers_diag_steps", 0))
-    if diag_steps > 0:
-        diag_fn = _get_init_walkers_diag_fn(self)
-        if diag_fn is None:
+    infer_steps = int(getattr(self, "init_walkers_infer_steps", 0))
+    if infer_steps > 0:
+        infer_fn = _get_init_walkers_infer_fn(self)
+        if infer_fn is None:
             logger.warning(
-                "Stage-1 trial diagnostics skipped: no hamiltonian bound in trial object."
+                "Trial inference skipped: no hamiltonian bound in trial object."
             )
         else:
             logger.info(
-                "Stage-1 trial diagnostics (VAFQMC inference): steps=%d",
-                int(diag_steps),
+                "Starting trial energy inference for %d steps",
+                int(infer_steps),
             )
-            diag_state = state
-            for ii in range(diag_steps):
-                key, diag_key = jax.random.split(key)
-                diag_state, (diag_fields, diag_logsw) = walker_sampler.sample(
-                    diag_key, sampler_params, diag_state
+            infer_state = state
+            for ii in range(infer_steps):
+                key, infer_key = jax.random.split(key)
+                infer_state, (infer_fields, infer_logsw) = walker_sampler.sample(
+                    infer_key, sampler_params, infer_state
                 )
-                e_diag, exp_es, exp_s = diag_fn(diag_fields, diag_logsw)
+                e_infer, exp_es, exp_s = infer_fn(infer_fields, infer_logsw)
                 logger.info(
-                    "Stage-1 infer %d/%d e_vafqmc=%.12f exp_es=%.12f exp_s=%.12f",
+                    "Infer %d/%d e_vafqmc=%.12f exp_es=%.12f exp_s=%.12f",
                     ii + 1,
-                    int(diag_steps),
-                    float(e_diag),
+                    int(infer_steps),
+                    float(e_infer),
                     float(exp_es),
                     float(exp_s),
                 )
@@ -291,11 +274,11 @@ def _sample_walkers_from_trial(self, n_walkers: int, key: Array) -> Any:
         self._init_pool_fields_override = pool_seed
 
         logger.info(
-            "Stage-1 trial burn-in: selected 1 ket per walker from %d candidates.",
+            "End of walker burn-in, selected 1 ket per walker from %d candidates.",
             int(chains_per_walker),
         )
         logger.info(
-            "Stage-1 handoff prepared: left pool initialized from corresponding chain fields "
+            "Initial trial prepared: left pool initialized from corresponding chain fields "
             "(n_samples=%d).",
             int(self.n_samples),
         )
@@ -308,53 +291,27 @@ def _sample_walkers_from_trial(self, n_walkers: int, key: Array) -> Any:
         )
         self._init_pool_fields_override = pool_seed
         logger.info(
-            "Stage-1 handoff prepared from single-chain fields (replicated to n_samples=%d).",
+            "Initial trial prepared from single-chain fields (replicated to n_samples=%d).",
             int(self.n_samples),
         )
     if isinstance(walkers, (tuple, list)) and len(walkers) == 2:
         walkers = (walkers[0], walkers[1])
-        if not _has_spin(walkers):
-            raise ValueError("init_walkers_from_trial requires spin-separated ansatz output.")
-        logger.info("Initial walkers sampled from trial successfully (spin-separated).")
+        #logger.info("Initial walkers sampled from trial successfully (spin-separated).")
         return walkers
 
-    # Spin-mixed/GHF ansatz output: optionally keep as GHF or project to spin-separated.
-    proj_mode = str(getattr(self, "init_walkers_projection", "auto")).lower()
-    if proj_mode in ("keep", "none", "ghf", "no_projection"):
-        walkers_arr = jnp.asarray(walkers)
-        if walkers_arr.ndim != 3:
-            raise ValueError(
-                f"Unsupported sampled GHF walker shape for keep mode: {walkers_arr.shape}."
-            )
-        logger.info(
-            "Initial walkers sampled from trial as GHF and kept in GHF form "
-            "(mode=%s, shape=%s).",
-            proj_mode,
-            tuple(map(int, walkers_arr.shape)),
+    # Spin-mixed/GHF ansatz output: use GHF walkers directly.
+    walkers_arr = jnp.asarray(walkers)
+    if walkers_arr.ndim != 3:
+        raise ValueError(
+            "init_walkers_from_trial got unsupported ansatz output shape "
+            f"{walkers_arr.shape}; expected spin-separated tuple/list or 3D GHF array."
         )
-        return walkers_arr
-
-    if proj_mode in ("auto", "ghf_to_uhf", "project", "drop_spin_mixing"):
-        walkers_arr = jnp.asarray(walkers)
-        if walkers_arr.ndim != 3:
-            raise ValueError(
-                f"Unsupported sampled walker shape for projection: {walkers_arr.shape}."
-            )
-        walkers = _project_ghf_walkers_to_uhf(self, walkers_arr)
-        logger.info(
-            "Initial walkers sampled from trial as GHF and projected to spin-separated form "
-            "(mode=%s, shape=%s).",
-            proj_mode,
-            tuple(map(int, walkers_arr.shape)),
-        )
-        return walkers
-
-    raise ValueError(
-        "init_walkers_from_trial got non-spin-separated ansatz output (likely spin-mixed/GHF), "
-        f"and init_walkers_projection={proj_mode!r} forbids projection. "
-        "Set cfg.stochastic_trial.init_walkers_projection='auto' (or 'ghf_to_uhf'), "
-        "or use 'keep' to propagate GHF walkers."
-    )
+    # logger.info(
+    #     "Initial walkers sampled from trial as GHF and used directly "
+    #     "(shape=%s).",
+    #     tuple(map(int, walkers_arr.shape)),
+    # )
+    return walkers_arr
 
 
 def _evaluate_pool_bra(self, fields: Any, logsw: Array) -> tuple[Any, Array]:
@@ -493,7 +450,6 @@ __all__ = [
     "_get_force_bias_fn",
     "_get_local_energy_fn",
     "_init_pool_state",
-    "_project_ghf_walkers_to_uhf",
     "_replace_sampler_state_fields",
     "_sample_pool_step",
     "_sample_walkers_from_trial",

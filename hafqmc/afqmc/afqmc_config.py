@@ -22,7 +22,7 @@ def propagation_default() -> ConfigDict:
     return _cfg(
         {
             "dt": 0.01,
-            "n_walkers": 50,
+            "n_walkers": 100,
             "n_block_steps": 50,
             "n_ene_measurements": 1,
             "n_blocks": 20,
@@ -53,7 +53,7 @@ def pop_control_default() -> ConfigDict:
         {
             "init_noise": 0.0,
             "resample": True,
-            "freq": 0,
+            "freq": 10,
             "min_weight": 1.0e-3,
             "max_weight": 100.0,
         }
@@ -102,15 +102,9 @@ def stochastic_trial_default() -> ConfigDict:
             # n_walkers * chains_per_walker chains.
             # 0 means "auto", i.e. use n_samples.
             "init_walkers_chains_per_walker": 0,
-            # Stage-1 diagnostics: run VAFQMC inference estimator for N samples
-            # right after stage-1 burn-in (0 disables diagnostics).
-            "init_walkers_diag_steps": 10,
-            # How to convert sampled trial walkers to AFQMC walkers when
-            # ansatz output is spin-mixed/GHF (single matrix).
-            # - "auto": project GHF -> (w_up, w_dn) using per-spin QR.
-            # - "keep": keep sampled walkers in GHF form and propagate as GHF.
-            # - "error": raise if sampled walkers are not spin-separated.
-            "init_walkers_projection": "auto",
+            # Stage-1 inference: run VAFQMC inference estimator for N samples
+            # right after stage-1 burn-in (0 disables inference).
+            "init_walkers_infer_steps": 10,
             "max_prop": None,
             "trial_seed": None,
             "n_measure_samples": 20,

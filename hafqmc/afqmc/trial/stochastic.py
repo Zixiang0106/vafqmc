@@ -85,8 +85,7 @@ class VAFQMCTrial:
         init_walkers_from_trial: bool = False,
         init_walkers_burn_in: int = 0,
         init_walkers_chains_per_walker: int = 0,
-        init_walkers_diag_steps: int = 10,
-        init_walkers_projection: str = "auto",
+        init_walkers_infer_steps: int = 10,
         max_prop: Optional[Any] = None,
         seed: int = 0,
     ) -> None:
@@ -104,8 +103,7 @@ class VAFQMCTrial:
         self.init_walkers_from_trial = bool(init_walkers_from_trial)
         self.init_walkers_burn_in = int(init_walkers_burn_in)
         self.init_walkers_chains_per_walker = int(init_walkers_chains_per_walker)
-        self.init_walkers_diag_steps = int(init_walkers_diag_steps)
-        self.init_walkers_projection = str(init_walkers_projection).lower()
+        self.init_walkers_infer_steps = int(init_walkers_infer_steps)
         self.sampling_target = str(sampling_target).lower()
         self.logdens_floor = float(logdens_floor)
         self.max_prop = max_prop
@@ -120,7 +118,7 @@ class VAFQMCTrial:
             or self.local_energy_chunk_size < 0
             or self.init_walkers_burn_in < 0
             or self.init_walkers_chains_per_walker < 0
-            or self.init_walkers_diag_steps < 0
+            or self.init_walkers_infer_steps < 0
         ):
             raise ValueError("burn-in/update steps must be non-negative.")
 
@@ -160,7 +158,7 @@ class VAFQMCTrial:
         # Optional handoff cache from stage-1 init-walker sampling:
         # shape tree [n_walkers, n_samples, ...] in self.fields_shape.
         self._init_pool_fields_override = None
-        self._init_walkers_diag_fn = None
+        self._init_walkers_infer_fn = None
 
         self._local_energy_fns: Dict[int, Any] = {}
         self._force_bias_fns: Dict[int, Any] = {}
@@ -186,8 +184,7 @@ class VAFQMCTrial:
         init_walkers_from_trial: bool = False,
         init_walkers_burn_in: int = 0,
         init_walkers_chains_per_walker: int = 0,
-        init_walkers_diag_steps: int = 10,
-        init_walkers_projection: str = "auto",
+        init_walkers_infer_steps: int = 10,
         max_prop: Optional[Any] = None,
         seed: int = 0,
     ) -> "VAFQMCTrial":
@@ -210,8 +207,7 @@ class VAFQMCTrial:
             init_walkers_from_trial=init_walkers_from_trial,
             init_walkers_burn_in=init_walkers_burn_in,
             init_walkers_chains_per_walker=init_walkers_chains_per_walker,
-            init_walkers_diag_steps=init_walkers_diag_steps,
-            init_walkers_projection=init_walkers_projection,
+            init_walkers_infer_steps=init_walkers_infer_steps,
             max_prop=max_prop,
             seed=seed,
         )
@@ -234,8 +230,7 @@ class VAFQMCTrial:
         init_walkers_from_trial: bool = False,
         init_walkers_burn_in: int = 0,
         init_walkers_chains_per_walker: int = 0,
-        init_walkers_diag_steps: int = 10,
-        init_walkers_projection: str = "auto",
+        init_walkers_infer_steps: int = 10,
         max_prop: Optional[Any] = None,
         seed: int = 0,
     ) -> "VAFQMCTrial":
@@ -255,8 +250,7 @@ class VAFQMCTrial:
             init_walkers_from_trial=init_walkers_from_trial,
             init_walkers_burn_in=init_walkers_burn_in,
             init_walkers_chains_per_walker=init_walkers_chains_per_walker,
-            init_walkers_diag_steps=init_walkers_diag_steps,
-            init_walkers_projection=init_walkers_projection,
+            init_walkers_infer_steps=init_walkers_infer_steps,
             max_prop=max_prop,
             seed=seed,
         )

@@ -224,8 +224,8 @@ def bind_walkers(
 
         if use_override:
             logger.info(
-                "Applying stage-1->stage-2 handoff: using corresponding auxiliary fields "
-                "as initial left pool state."
+                "Using corresponding auxiliary fields "
+                "as initial trial state."
             )
         if requested_burn > 0:
             n_chains = int(n_walkers * self.n_samples)
