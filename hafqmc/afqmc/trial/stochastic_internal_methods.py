@@ -111,35 +111,14 @@ def _get_init_walkers_infer_fn(self):
     eval_eloc = jax.vmap(lambda b, k: hamil.local_energy(b, k))
     eval_slov = jax.vmap(lambda b, k: calc_slov(b, k))
     floor = float(getattr(self, "logdens_floor", -60.0))
-    local_chunk = int(getattr(self, "local_energy_chunk_size", 0))
-    # Stage-1 inference has no pool-sample axis. A practical auto rule is to scale
-    # AFQMC local-energy chunk by n_samples to keep similar effective workload.
-    chunk = int(local_chunk * int(getattr(self, "n_samples", 1))) if local_chunk > 0 else 0
 
     def eval_fn(fields_pair: Any, logsw: Array):
         bra_fields = tree_map(lambda x: x[:, 0], fields_pair)
         ket_fields = tree_map(lambda x: x[:, 1], fields_pair)
         bra, bra_lw = apply_ansatz(bra_fields)
         ket, ket_lw = apply_ansatz(ket_fields)
-        n_walkers = int(tree_leaves(ket)[0].shape[0])
-        if chunk <= 0 or chunk >= n_walkers:
-            eloc = eval_eloc(bra, ket)
-            sign, logabs = eval_slov(bra, ket)
-        else:
-            eloc_chunks = []
-            sign_chunks = []
-            logabs_chunks = []
-            for start in range(0, n_walkers, chunk):
-                end = min(start + chunk, n_walkers)
-                bra_c = tree_map(lambda x: x[start:end], bra)
-                ket_c = tree_map(lambda x: x[start:end], ket)
-                eloc_chunks.append(eval_eloc(bra_c, ket_c))
-                sign_c, logabs_c = eval_slov(bra_c, ket_c)
-                sign_chunks.append(sign_c)
-                logabs_chunks.append(logabs_c)
-            eloc = jnp.concatenate(eloc_chunks, axis=0)
-            sign = jnp.concatenate(sign_chunks, axis=0)
-            logabs = jnp.concatenate(logabs_chunks, axis=0)
+        eloc = eval_eloc(bra, ket)
+        sign, logabs = eval_slov(bra, ket)
         logov = logabs + bra_lw + ket_lw
 
         dlog = jnp.real(logov - logsw)
@@ -154,9 +133,7 @@ def _get_init_walkers_infer_fn(self):
         etot = jnp.where(jnp.abs(denom) > 1.0e-12, jnp.real(exp_es) / denom, jnp.nan)
         return etot, jnp.real(exp_es), jnp.real(exp_s)
 
-    # For chunked inference, keep eager mode to avoid giant unrolled HLO from
-    # Python chunk loops and reduce compilation memory pressure.
-    fn = eval_fn if chunk > 0 else jax.jit(eval_fn)
+    fn = jax.jit(eval_fn)
     self._init_walkers_infer_fn = fn
     return fn
 
