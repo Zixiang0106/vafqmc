@@ -366,16 +366,8 @@ def _run_det_equilibration(
     eq_done = 0
     log_enabled = bool(getattr(cfg, "log_enabled", True))
     eq_freq = int(getattr(cfg, "log_equil_freq", 0))
-    eq_n_print = max(int(getattr(cfg, "log_equil_n_print", 5)), 0)
-    if log_enabled and eq_freq > 0:
-        log_eq = True
-        eq_chunk = max(eq_freq, 1)
-    elif log_enabled and eq_n_print > 0:
-        log_eq = True
-        eq_chunk = max(int(cfg.n_eq_steps) // eq_n_print, 1)
-    else:
-        log_eq = False
-        eq_chunk = int(cfg.n_eq_steps)
+    log_eq = bool(log_enabled and eq_freq > 0)
+    eq_chunk = max(eq_freq, 1) if eq_freq > 0 else int(cfg.n_eq_steps)
     if log_eq:
         logger.info(
             "Equilibration sweeps: steps=%d, print_every=%d",

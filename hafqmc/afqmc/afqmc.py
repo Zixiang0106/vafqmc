@@ -131,8 +131,6 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
         lg.block_freq = out.log_block_freq
     if "log_equil_freq" in out:
         lg.equil_freq = out.log_equil_freq
-    if "log_equil_n_print" in out:
-        lg.equil_n_print = out.log_equil_n_print
     # Backward-compatible top-level visualization aliases.
     if "visualization" in out:
         vis.enabled = out.visualization
@@ -177,7 +175,6 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
     out.log_enabled = bool(lg.get("enabled", True))
     out.log_block_freq = int(lg.get("block_freq", 1))
     out.log_equil_freq = int(lg.get("equil_freq", 0))
-    out.log_equil_n_print = int(lg.get("equil_n_print", 5))
 
     out.init_noise = float(pop.init_noise)
     out.resample = bool(pop.resample)
@@ -305,7 +302,6 @@ def afqmc_energy(
 
     if bool(getattr(cfg_runtime, "output_write_hparams", False)):
         _save_afqmc_hparams(cfg_user, str(cfg_runtime.output_hparams_path))
-        logger.info("Saved AFQMC config: %s", str(cfg_runtime.output_hparams_path))
 
     if trial is None:
         trial = _build_trial_from_config(hamil, cfg_runtime)

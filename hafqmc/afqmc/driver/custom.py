@@ -532,25 +532,19 @@ def _run_custom_equilibration(
 ) -> AFQMCState:
     log_enabled = bool(getattr(cfg, "log_enabled", True))
     eq_freq = int(getattr(cfg, "log_equil_freq", 0))
-    eq_n_print = max(int(getattr(cfg, "log_equil_n_print", 5)), 0)
-    if not log_enabled:
-        return runner.run_steps(state, cfg.n_eq_steps, "eql")
-    if eq_freq > 0:
-        eq_chunk = max(eq_freq, 1)
-    elif eq_n_print > 0:
-        eq_chunk = max(int(cfg.n_eq_steps) // eq_n_print, 1)
-    else:
-        return runner.run_steps(state, cfg.n_eq_steps, "eql")
+    log_eq = bool(log_enabled and eq_freq > 0)
+    eq_chunk = max(eq_freq, 1) if eq_freq > 0 else int(cfg.n_eq_steps)
 
     pop_freq = int(getattr(cfg, "pop_control_freq", 0))
     log_pop_stats = bool(getattr(cfg, "pop_control_log_stats", False))
     step_counter = 0
     eq_done = 0
-    logger.info(
-        "Equilibration sweeps: steps=%d, print_every=%d",
-        int(cfg.n_eq_steps),
-        int(eq_chunk),
-    )
+    if log_eq:
+        logger.info(
+            "Equilibration sweeps: steps=%d, print_every=%d",
+            int(cfg.n_eq_steps),
+            int(eq_chunk),
+        )
     while eq_done < cfg.n_eq_steps:
         nrun = min(eq_chunk, cfg.n_eq_steps - eq_done)
         if pop_freq > 0:
@@ -580,15 +574,16 @@ def _run_custom_equilibration(
             if log_pop_stats:
                 _log_pop_control_stats(logger, state, f"post-resample(eql={eq_done})")
 
-        logger.info(
-            "Eql %d/%d wsum=%.3e e_mix=%.12f e_est=%.12f elapsed=%.2fs",
-            eq_done,
-            cfg.n_eq_steps,
-            float(jnp.sum(state.weights)),
-            float(e_mix),
-            float(state.e_estimate),
-            time.time() - start,
-        )
+        if log_eq:
+            logger.info(
+                "Eql %d/%d wsum=%.3e e_mix=%.12f e_est=%.12f elapsed=%.2fs",
+                eq_done,
+                cfg.n_eq_steps,
+                float(jnp.sum(state.weights)),
+                float(e_mix),
+                float(state.e_estimate),
+                time.time() - start,
+            )
     return state
 
 

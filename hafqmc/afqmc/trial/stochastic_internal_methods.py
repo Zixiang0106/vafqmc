@@ -272,16 +272,6 @@ def _sample_walkers_from_trial(self, n_walkers: int, key: Array) -> Any:
         left_selected = tree_map(_pick_one, left_fields_all)
         pool_seed = tree_map(lambda x, s: x.at[:, 0].set(s), pool_seed, left_selected)
         self._init_pool_fields_override = pool_seed
-
-        logger.info(
-            "End of walker burn-in, selected 1 ket per walker from %d candidates.",
-            int(chains_per_walker),
-        )
-        logger.info(
-            "Initial trial prepared: left pool initialized from corresponding chain fields "
-            "(n_samples=%d).",
-            int(self.n_samples),
-        )
     else:
         walkers = walkers_all
         left_selected = left_fields_all
@@ -290,18 +280,12 @@ def _sample_walkers_from_trial(self, n_walkers: int, key: Array) -> Any:
             left_selected,
         )
         self._init_pool_fields_override = pool_seed
-        logger.info(
-            "Initial trial prepared from single-chain fields (replicated to n_samples=%d).",
-            int(self.n_samples),
-        )
+    logger.info(
+        "End of walker burn-in: total walkers=%d.",
+        int(n_walkers),
+    )
     if isinstance(walkers, (tuple, list)) and len(walkers) == 2:
         walkers = (walkers[0], walkers[1])
-        logger.info(
-            "Initial walkers sampled from trial in spin-separated form "
-            "(up_shape=%s dn_shape=%s).",
-            tuple(map(int, walkers[0].shape)),
-            tuple(map(int, walkers[1].shape)),
-        )
         return walkers
 
     # Spin-mixed/GHF ansatz output: use GHF walkers directly.
@@ -311,11 +295,6 @@ def _sample_walkers_from_trial(self, n_walkers: int, key: Array) -> Any:
             "init_walkers_from_trial got unsupported ansatz output shape "
             f"{walkers_arr.shape}; expected spin-separated tuple/list or 3D GHF array."
         )
-    logger.info(
-        "Initial walkers sampled from trial as GHF and used directly "
-        "(shape=%s).",
-        tuple(map(int, walkers_arr.shape)),
-    )
     return walkers_arr
 
 

@@ -226,19 +226,10 @@ def bind_walkers(
                     "Stage-1 handoff fields ignored due to shape mismatch for bind_walkers."
                 )
 
-        if use_override:
-            logger.info(
-                "Using corresponding auxiliary fields "
-                "as initial trial state."
-            )
         if requested_burn > 0:
-            n_chains = int(n_walkers * self.n_samples)
             logger.info(
-                "Burning in the sampler of %d chains for %d steps (n_walkers=%d, n_samples=%d).",
-                n_chains,
+                "Burning in the trial for %d steps.",
                 requested_burn,
-                n_walkers,
-                self.n_samples,
             )
         if use_override:
             self._pool_state = self._init_pool_state(

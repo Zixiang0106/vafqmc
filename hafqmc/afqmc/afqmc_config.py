@@ -38,11 +38,8 @@ def log_default() -> ConfigDict:
             "enabled": True,
             # block (production) logging cadence
             "block_freq": 1,
-            # equilibration logging cadence:
-            # - if >0: print every equil_freq steps
-            # - if 0 and equil_n_print>0: auto-chunk to ~equil_n_print prints
+            # equilibration logging cadence: if >0 print every equil_freq steps.
             "equil_freq": 0,
-            "equil_n_print": 5,
             "pop_control_stats": False,
         }
     )
