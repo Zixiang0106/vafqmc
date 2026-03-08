@@ -482,9 +482,10 @@ def measure_block_energy_state(
     runtime_state: RuntimeState,
 ) -> tuple[RuntimeState, Array, Array, Array]:
     walkers = tree_map(jnp.asarray, walkers)
+    n_walkers = int(tree_leaves(walkers)[0].shape[0])
     n_meas_i = max(int(n_meas), 1)
     steps = max(int(self.sample_update_steps), 0)
-    key = (id(hamil), steps, n_meas_i)
+    key = (id(hamil), steps, n_meas_i, n_walkers)
     fn = self._block_measure_fns.get(key)
 
     if fn is None:
