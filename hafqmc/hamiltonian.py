@@ -221,12 +221,28 @@ def calc_e2b_opt(ceri, bra, theta):
     return ej - ek
 
 def calc_ejk_opt_r(ceri, bra, theta):
+    # Keep einsum operands on a single dtype to avoid GPU graph-capture GEMM
+    # issues with mixed real/complex inputs.
+    dtype = jnp.result_type(ceri.dtype, bra.dtype, theta.dtype)
+    ceri = ceri.astype(dtype)
+    bra = bra.astype(dtype)
+    theta = theta.astype(dtype)
     f = jnp.einsum("kpq,pi,qj->kij", ceri, bra.conj(), theta)
     ej = 2 * jnp.sum(f.trace(0, -1, -2) ** 2)
     ek = jnp.einsum("kij,kji", f, f)
     return ej, ek
 
 def calc_ejk_opt_u(ceri, bra, theta):
+    dtype = jnp.result_type(
+        ceri.dtype,
+        bra[0].dtype,
+        bra[1].dtype,
+        theta[0].dtype,
+        theta[1].dtype,
+    )
+    ceri = ceri.astype(dtype)
+    bra = (bra[0].astype(dtype), bra[1].astype(dtype))
+    theta = (theta[0].astype(dtype), theta[1].astype(dtype))
     ej = ek = 0.
     fup = jnp.einsum("kpq,pi,qj->kij", ceri, bra[0].conj(), theta[0])
     cup = fup.trace(0, -1, -2)
@@ -243,6 +259,10 @@ def calc_ejk_opt_g(ceri, bra, theta):
     nele = bra.shape[-1]
     bra = bra.reshape(2, nao, nele)
     theta = theta.reshape(2, nao, nele)
+    dtype = jnp.result_type(ceri.dtype, bra.dtype, theta.dtype)
+    ceri = ceri.astype(dtype)
+    bra = bra.astype(dtype)
+    theta = theta.astype(dtype)
     f = jnp.einsum("kpq,api,aqj->kij", ceri, bra.conj(), theta)
     ej = 0.5 * jnp.sum(f.trace(0, -1, -2) ** 2)
     ek = 0.5 * jnp.einsum("kij,kji", f, f)
@@ -686,4 +706,3 @@ def solve_UHF(hamiltonian, init_wfn,
         prev_ene = curr_ene
     
     return curr_ene, ensure_ortho(wfn), converged
-

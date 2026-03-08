@@ -64,6 +64,8 @@ def default() -> ConfigDict:
             "hamiltonian": None,
             "params": None,
             "states": None,
+            "lower_state_params": [],
+            "weights":[]
         },
         "seed": None,
         "molecule": {},
@@ -72,6 +74,9 @@ def default() -> ConfigDict:
             "orth_ao": None,
             "full_eri": False,
             "with_cc": False,
+        },
+        "hf_stability": {
+            "loops": 0,
         },
         "ansatz":{
             "propagators":[default_prop()],
@@ -99,6 +104,8 @@ def default() -> ConfigDict:
             "std_factor": 0.,
             "std_target": 100.,
             "std_power": 2.,
+#            "num_states": 1,
+#            "weights": [],
         },
         "optim": {
             "batch": None,
@@ -115,7 +122,8 @@ def default() -> ConfigDict:
         "log": {
             "stat_freq": 1,
             "stat_path": "tbdata/",
-            "ckpt_freq": 1000,
+            "ckpt_choice": "last", #{choose from "last" and "all"}
+            "ckpt_freq": 100,
             "ckpt_path": "checkpoints",
             "hpar_path": "hparams.yml",
             "hamil_path": "hamiltonian.pkl",

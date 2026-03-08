@@ -60,7 +60,8 @@ class Ansatz(nn.Module):
         if isinstance(fields, ndarray):
             fields = (fields,)
         assert (tree_map(jnp.shape, fields) 
-                == tree_map(tuple, self.fields_shape(len(fields))))
+                == tree_map(tuple, self.fields_shape(len(fields)))), \
+            "Fields shape mismatch with Ansatz propagators."
         wfn = self.wfn
         log_weight = 0.
         for prop, flds in zip(self.propagators, fields):
