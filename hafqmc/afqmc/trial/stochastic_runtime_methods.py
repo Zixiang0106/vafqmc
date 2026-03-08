@@ -150,11 +150,15 @@ def init_walkers(self, n_walkers: int, key: Array, noise: float = 0.0) -> Any:
         walkers = (w_up, w_dn)
 
     if noise > 0.0:
-        key, k1, k2 = jax.random.split(key, 3)
-        w_up, w_dn = walkers
-        w_up = w_up + noise * jax.random.normal(k1, w_up.shape)
-        w_dn = w_dn + noise * jax.random.normal(k2, w_dn.shape)
-        walkers = (w_up, w_dn)
+        if isinstance(walkers, (tuple, list)) and len(walkers) == 2:
+            key, k1, k2 = jax.random.split(key, 3)
+            w_up, w_dn = walkers
+            w_up = w_up + noise * jax.random.normal(k1, w_up.shape)
+            w_dn = w_dn + noise * jax.random.normal(k2, w_dn.shape)
+            walkers = (w_up, w_dn)
+        else:
+            key, kn = jax.random.split(key, 2)
+            walkers = walkers + noise * jax.random.normal(kn, walkers.shape)
 
     walkers, _ = orthonormalize(walkers)
     return walkers

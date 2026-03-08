@@ -296,7 +296,12 @@ def _sample_walkers_from_trial(self, n_walkers: int, key: Array) -> Any:
         )
     if isinstance(walkers, (tuple, list)) and len(walkers) == 2:
         walkers = (walkers[0], walkers[1])
-        #logger.info("Initial walkers sampled from trial successfully (spin-separated).")
+        logger.info(
+            "Initial walkers sampled from trial in spin-separated form "
+            "(up_shape=%s dn_shape=%s).",
+            tuple(map(int, walkers[0].shape)),
+            tuple(map(int, walkers[1].shape)),
+        )
         return walkers
 
     # Spin-mixed/GHF ansatz output: use GHF walkers directly.
@@ -306,11 +311,11 @@ def _sample_walkers_from_trial(self, n_walkers: int, key: Array) -> Any:
             "init_walkers_from_trial got unsupported ansatz output shape "
             f"{walkers_arr.shape}; expected spin-separated tuple/list or 3D GHF array."
         )
-    # logger.info(
-    #     "Initial walkers sampled from trial as GHF and used directly "
-    #     "(shape=%s).",
-    #     tuple(map(int, walkers_arr.shape)),
-    # )
+    logger.info(
+        "Initial walkers sampled from trial as GHF and used directly "
+        "(shape=%s).",
+        tuple(map(int, walkers_arr.shape)),
+    )
     return walkers_arr
 
 
