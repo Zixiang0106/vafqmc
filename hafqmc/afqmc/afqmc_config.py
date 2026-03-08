@@ -36,9 +36,7 @@ def log_default() -> ConfigDict:
     return _cfg(
         {
             "enabled": True,
-            # block (production) logging cadence
             "block_freq": 1,
-            # equilibration logging cadence: if >0 print every equil_freq steps.
             "equil_freq": 0,
             "pop_control_stats": False,
         }
@@ -90,17 +88,9 @@ def stochastic_trial_default() -> ConfigDict:
             "sampling_target": "walker_overlap",
             "logdens_floor": -60.0,
             "sample_update_steps": 1,
-            # Optional chunk size (walker axis) for local-energy evaluation.
-            # 0 disables chunking.
-            "local_energy_chunk_size": 0,
             "init_walkers_from_trial": False,
             "init_walkers_burn_in": 0,
-            # Stage-1 global trial burn-in uses:
-            # n_walkers * chains_per_walker chains.
-            # 0 means "auto", i.e. use n_samples.
             "init_walkers_chains_per_walker": 0,
-            # Stage-1 inference: run VAFQMC inference estimator for N samples
-            # right after stage-1 burn-in (0 disables inference).
             "init_walkers_infer_steps": 10,
             "max_prop": None,
             "trial_seed": None,
