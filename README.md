@@ -1,7 +1,12 @@
 # Hybrid AFQMC
 
-This repository contains the code for:
-> Chen, Y., Zhang, L., E, W. & Car, R. (2022). Hybrid Auxiliary Field Quantum Monte Carlo for Molecular Systems. arXiv preprint [arXiv:2211.10824](https://arxiv.org/pdf/2211.10824.pdf).
+This repository contains code related to:
+- VAFQMC paper: Chen, Y.; Zhang, L.; E, W.; Car, R.  
+  Hybrid Auxiliary Field Quantum Monte Carlo for Molecular Systems.  
+  [arXiv:2211.10824](https://arxiv.org/abs/2211.10824)
+- AFQMC paper: Xiao, Z.-Y.; Lu, Z.; Chen, Y.; Xiang, T.; Zhang, S.  
+  Implementing advanced trial wave functions in fermion quantum Monte Carlo via stochastic sampling.  
+  [arXiv:2505.18519](https://arxiv.org/abs/2505.18519)
 
 ## Installation
 
@@ -19,7 +24,7 @@ pip install --upgrade "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-re
 
 ## What Is Included
 
-- `hafqmc.train`: VAFQMC training/optimization.
+- `hafqmc.train`: VAFQMC trial training/optimization.
 - `hafqmc.afqmc`: AFQMC energy evaluation with stochastic VAFQMC trial (`trial_type="stochastic"`).
 
 All runtime configs use `ml_collections.ConfigDict`.
