@@ -58,6 +58,7 @@ cfg.stochastic_trial.n_measure_samples = 20
 cfg.stochastic_trial.sampler.name = "hmc"
 cfg.stochastic_trial.sampler.dt = 0.1
 cfg.stochastic_trial.sampler.length = 1.0
+cfg.stochastic_trial.local_energy_chunk_size = 50
 cfg.stochastic_trial.init_walkers_from_trial = True
 cfg.stochastic_trial.init_walkers_infer_steps = 20
 cfg.stochastic_trial.init_walkers_burn_in = 200

@@ -81,6 +81,7 @@ class VAFQMCTrial:
         sampling_target: str = "walker_overlap",
         logdens_floor: float = -60.0,
         sample_update_steps: int = 1,
+        local_energy_chunk_size: int = 0,
         init_walkers_from_trial: bool = False,
         init_walkers_burn_in: int = 0,
         init_walkers_chains_per_walker: int = 0,
@@ -98,6 +99,7 @@ class VAFQMCTrial:
         self.n_samples = int(n_samples)
         self.burn_in = int(burn_in)
         self.sample_update_steps = int(sample_update_steps)
+        self.local_energy_chunk_size = int(local_energy_chunk_size)
         self.init_walkers_from_trial = bool(init_walkers_from_trial)
         self.init_walkers_burn_in = int(init_walkers_burn_in)
         self.init_walkers_chains_per_walker = int(init_walkers_chains_per_walker)
@@ -113,6 +115,7 @@ class VAFQMCTrial:
         if (
             self.burn_in < 0
             or self.sample_update_steps < 0
+            or self.local_energy_chunk_size < 0
             or self.init_walkers_burn_in < 0
             or self.init_walkers_chains_per_walker < 0
             or self.init_walkers_infer_steps < 0
@@ -177,6 +180,7 @@ class VAFQMCTrial:
         sampling_target: str = "walker_overlap",
         logdens_floor: float = -60.0,
         sample_update_steps: int = 1,
+        local_energy_chunk_size: int = 0,
         init_walkers_from_trial: bool = False,
         init_walkers_burn_in: int = 0,
         init_walkers_chains_per_walker: int = 0,
@@ -199,6 +203,7 @@ class VAFQMCTrial:
             sampling_target=sampling_target,
             logdens_floor=logdens_floor,
             sample_update_steps=sample_update_steps,
+            local_energy_chunk_size=local_energy_chunk_size,
             init_walkers_from_trial=init_walkers_from_trial,
             init_walkers_burn_in=init_walkers_burn_in,
             init_walkers_chains_per_walker=init_walkers_chains_per_walker,
@@ -221,6 +226,7 @@ class VAFQMCTrial:
         sampling_target: str = "walker_overlap",
         logdens_floor: float = -60.0,
         sample_update_steps: int = 1,
+        local_energy_chunk_size: int = 0,
         init_walkers_from_trial: bool = False,
         init_walkers_burn_in: int = 0,
         init_walkers_chains_per_walker: int = 0,
@@ -240,6 +246,7 @@ class VAFQMCTrial:
             sampling_target=sampling_target,
             logdens_floor=logdens_floor,
             sample_update_steps=sample_update_steps,
+            local_energy_chunk_size=local_energy_chunk_size,
             init_walkers_from_trial=init_walkers_from_trial,
             init_walkers_burn_in=init_walkers_burn_in,
             init_walkers_chains_per_walker=init_walkers_chains_per_walker,
