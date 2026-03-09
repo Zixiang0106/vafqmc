@@ -88,6 +88,9 @@ def stochastic_trial_default() -> ConfigDict:
             "sampling_target": "walker_overlap",
             "logdens_floor": -60.0,
             "sample_update_steps": 1,
+            # Optional chunk size (walker axis) for local-energy evaluation.
+            # 0 disables chunking.
+            "local_energy_chunk_size": 0,
             "init_walkers_from_trial": False,
             "init_walkers_burn_in": 0,
             "init_walkers_chains_per_walker": 0,
