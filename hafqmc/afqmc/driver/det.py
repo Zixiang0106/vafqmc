@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 import jax
 from jax import lax, numpy as jnp
@@ -119,6 +119,26 @@ def _write_raw_block_data(path: str, rows: list[tuple[int, float, float, float, 
             f.write(
                 f"{blk:d} {e_blk:.16e} {e_est:.16e} {wsum:.16e} {wblk:.16e} {elapsed:.6f}\n"
             )
+
+
+def _open_raw_block_stream(path: str) -> TextIO:
+    p = Path(path)
+    if p.parent and str(p.parent) != "":
+        p.parent.mkdir(parents=True, exist_ok=True)
+    f = p.open("w", encoding="utf-8")
+    f.write("# block e_blk e_est wsum block_weight elapsed_s\n")
+    f.flush()
+    return f
+
+
+def _append_raw_block_row(
+    f: TextIO, row: tuple[int, float, float, float, float, float]
+) -> None:
+    blk, e_blk, e_est, wsum, wblk, elapsed = row
+    f.write(
+        f"{blk:d} {e_blk:.16e} {e_est:.16e} {wsum:.16e} {wblk:.16e} {elapsed:.6f}\n"
+    )
+    f.flush()
 
 
 def _calc_force_bias_det(trial: Any, walkers: Any, prop_data: PropagationData) -> Any:
@@ -489,47 +509,50 @@ def run_afqmc_det(
     block_energies: list[Any] = []
     block_weights: list[Any] = []
     raw_rows: list[tuple[int, float, float, float, float, float]] = []
+    write_raw = bool(getattr(cfg, "output_write_raw", False))
+    raw_path = str(getattr(cfg, "output_raw_path", "raw.dat"))
+    raw_stream: TextIO | None = _open_raw_block_stream(raw_path) if write_raw else None
     n_ene_measurements = max(int(getattr(cfg, "n_ene_measurements", 1)), 1)
     pop_freq = int(getattr(cfg, "pop_control_freq", 0))
     log_enabled = bool(getattr(cfg, "log_enabled", True))
     block_log_freq = int(getattr(cfg, "log_block_freq", 1))
     step_counter = 0
 
-    for blk in range(cfg.n_blocks):
-        e_num = jnp.asarray(0.0, dtype=jnp.float64)
-        e_den = jnp.asarray(0.0, dtype=jnp.float64)
+    try:
+        for blk in range(cfg.n_blocks):
+            e_num = jnp.asarray(0.0, dtype=jnp.float64)
+            e_den = jnp.asarray(0.0, dtype=jnp.float64)
 
-        for _ in range(n_ene_measurements):
-            if cfg.resample and pop_freq > 0:
-                steps_left = int(cfg.n_block_steps)
-                local_step = 0
-                while steps_left > 0:
-                    to_pop = pop_freq - (step_counter % pop_freq)
-                    nrun = min(steps_left, to_pop)
-                    state, _ = run_block_steps(state, nrun, local_step)
-                    step_counter += nrun
-                    steps_left -= nrun
-                    local_step += nrun
-                    if step_counter % pop_freq == 0:
-                        state = _resample_state_det(trial, state)
-            else:
-                state, _ = run_block_steps(state, cfg.n_block_steps, 0)
-                step_counter += int(cfg.n_block_steps)
-            e_i = _measure_block_energy_det(hamil, trial, state, cfg)
-            w_i = jnp.maximum(jnp.sum(state.weights), 1.0e-12)
-            e_num = e_num + w_i * e_i
-            e_den = e_den + w_i
-            state = _relax_pop_control_shift(state, e_i)
+            for _ in range(n_ene_measurements):
+                if cfg.resample and pop_freq > 0:
+                    steps_left = int(cfg.n_block_steps)
+                    local_step = 0
+                    while steps_left > 0:
+                        to_pop = pop_freq - (step_counter % pop_freq)
+                        nrun = min(steps_left, to_pop)
+                        state, _ = run_block_steps(state, nrun, local_step)
+                        step_counter += nrun
+                        steps_left -= nrun
+                        local_step += nrun
+                        if step_counter % pop_freq == 0:
+                            state = _resample_state_det(trial, state)
+                else:
+                    state, _ = run_block_steps(state, cfg.n_block_steps, 0)
+                    step_counter += int(cfg.n_block_steps)
+                e_i = _measure_block_energy_det(hamil, trial, state, cfg)
+                w_i = jnp.maximum(jnp.sum(state.weights), 1.0e-12)
+                e_num = e_num + w_i * e_i
+                e_den = e_den + w_i
+                state = _relax_pop_control_shift(state, e_i)
 
-        if cfg.resample and pop_freq <= 0:
-            state = _resample_state_det(trial, state)
+            if cfg.resample and pop_freq <= 0:
+                state = _resample_state_det(trial, state)
 
-        block_energy = e_num / jnp.maximum(e_den, 1.0e-12)
-        block_energies.append(block_energy)
-        block_weights.append(e_den)
-        state = _update_e_estimate(state, block_energy)
-        raw_rows.append(
-            (
+            block_energy = e_num / jnp.maximum(e_den, 1.0e-12)
+            block_energies.append(block_energy)
+            block_weights.append(e_den)
+            state = _update_e_estimate(state, block_energy)
+            row = (
                 int(blk + 1),
                 float(block_energy),
                 float(state.e_estimate),
@@ -537,25 +560,29 @@ def run_afqmc_det(
                 float(e_den),
                 float(time.time() - start),
             )
-        )
-        visualizer.update(blk + 1, float(block_energy))
+            raw_rows.append(row)
+            if raw_stream is not None:
+                _append_raw_block_row(raw_stream, row)
+            visualizer.update(blk + 1, float(block_energy))
 
-        if log_enabled and block_log_freq > 0 and (
-            (blk + 1) % block_log_freq == 0 or blk + 1 == cfg.n_blocks
-        ):
-            logger.info(
-                "Block %d/%d e_blk=%.12f e_est=%.12f wsum=%.3e elapsed=%.2fs",
-                blk + 1,
-                cfg.n_blocks,
-                float(block_energy),
-                float(state.e_estimate),
-                float(jnp.sum(state.weights)),
-                time.time() - start,
-            )
+            if log_enabled and block_log_freq > 0 and (
+                (blk + 1) % block_log_freq == 0 or blk + 1 == cfg.n_blocks
+            ):
+                logger.info(
+                    "Block %d/%d e_blk=%.12f e_est=%.12f wsum=%.3e elapsed=%.2fs",
+                    blk + 1,
+                    cfg.n_blocks,
+                    float(block_energy),
+                    float(state.e_estimate),
+                    float(jnp.sum(state.weights)),
+                    time.time() - start,
+                )
+    finally:
+        if raw_stream is not None:
+            raw_stream.close()
 
-    if bool(getattr(cfg, "output_write_raw", False)):
-        _write_raw_block_data(str(getattr(cfg, "output_raw_path", "raw.dat")), raw_rows)
-        logger.info("Saved AFQMC raw block data: %s", str(getattr(cfg, "output_raw_path", "raw.dat")))
+    if write_raw:
+        logger.info("Saved AFQMC raw block data: %s", raw_path)
 
     return _finalize_outputs(
         logger,
