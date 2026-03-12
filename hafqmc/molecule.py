@@ -81,8 +81,12 @@ def initwfn_from_scf(mf, orth_ao=None):
         mo_a = mf.mo_coeff[0][:, mf.mo_occ[0] > 0]
         mo_b = mf.mo_coeff[1][:, mf.mo_occ[1] > 0]
     else:
-        mo_a = mf.mo_coeff[:, mf.mo_occ > 0]
-        mo_b = mf.mo_coeff[:, mf.mo_occ > 0]
+        # Restricted closed-shell: mo_occ is typically 2/0.
+        # Restricted open-shell (ROHF-like): mo_occ can be 2/1/0.
+        # Use >0 for alpha and >1 for beta so (nalpha, nbeta) matches mol.nelec.
+        occ = np.asarray(mf.mo_occ)
+        mo_a = mf.mo_coeff[:, occ > 0.0]
+        mo_b = mf.mo_coeff[:, occ > 1.0]
     assert (mo_a.shape[1], mo_b.shape[1]) == mf.mol.nelec
     return rotate_wfn((mo_a, mo_b), X, mf.get_ovlp())
 
