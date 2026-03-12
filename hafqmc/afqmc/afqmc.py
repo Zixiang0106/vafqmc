@@ -93,6 +93,8 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
         p.n_eq_steps = out.n_eq_steps
     if "measure_equil_energy" in out:
         p.measure_equil_energy = out.measure_equil_energy
+    if "e_estimate_init" in out:
+        p.e_estimate_init = out.e_estimate_init
     if "ortho_freq" in out:
         p.ortho_freq = out.ortho_freq
 
@@ -173,6 +175,7 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
     out.n_blocks = int(p.n_blocks)
     out.n_eq_steps = int(p.n_eq_steps)
     out.measure_equil_energy = bool(p.get("measure_equil_energy", True))
+    out.e_estimate_init = p.get("e_estimate_init", None)
     out.ortho_freq = int(p.ortho_freq)
 
     out.log_enabled = bool(lg.get("enabled", True))

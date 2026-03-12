@@ -279,8 +279,12 @@ def _build_initial_state_det(
     logov = logov.astype(jnp.float64)
     weights = jnp.ones((cfg.n_walkers,), dtype=jnp.float64)
 
-    e_samples = jnp.real(calc_local_energy_batch(hamil, trial, walkers))
-    e_estimate = jnp.sum(e_samples) / cfg.n_walkers
+    e_est_init = getattr(cfg, "e_estimate_init", None)
+    if e_est_init is None:
+        e_samples = jnp.real(calc_local_energy_batch(hamil, trial, walkers))
+        e_estimate = jnp.sum(e_samples) / cfg.n_walkers
+    else:
+        e_estimate = jnp.asarray(float(e_est_init), dtype=jnp.float64)
 
     state = AFQMCState(
         walkers=walkers,

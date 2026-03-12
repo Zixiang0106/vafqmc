@@ -28,6 +28,7 @@ def propagation_default() -> ConfigDict:
             "n_blocks": 20,
             "n_eq_steps": 150,
             "measure_equil_energy": True,
+            "e_estimate_init": None,
             "ortho_freq": 10,
         }
     )
