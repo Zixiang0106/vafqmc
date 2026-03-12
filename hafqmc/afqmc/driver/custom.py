@@ -189,6 +189,10 @@ def _init_pop_summary() -> dict[str, float]:
         "n_zero_max": 0.0,
         "wsum_min": float("inf"),
         "wsum_max": 0.0,
+        "neff_min": float("inf"),
+        "neff_max": 0.0,
+        "pcs_min": float("inf"),
+        "pcs_max": float("-inf"),
     }
 
 
@@ -196,11 +200,18 @@ def _update_pop_summary(summary: dict[str, float], state: AFQMCState) -> None:
     w = jnp.real(state.weights)
     n_zero = float(jnp.sum(w <= 0.0))
     wsum = float(jnp.sum(w))
+    w2sum = float(jnp.sum(w * w))
+    neff = float((wsum * wsum) / max(w2sum, 1.0e-16))
+    pcs = float(state.pop_control_shift)
     summary["events"] += 1.0
     summary["n_zero_sum"] += n_zero
     summary["n_zero_max"] = max(summary["n_zero_max"], n_zero)
     summary["wsum_min"] = min(summary["wsum_min"], wsum)
     summary["wsum_max"] = max(summary["wsum_max"], wsum)
+    summary["neff_min"] = min(summary["neff_min"], neff)
+    summary["neff_max"] = max(summary["neff_max"], neff)
+    summary["pcs_min"] = min(summary["pcs_min"], pcs)
+    summary["pcs_max"] = max(summary["pcs_max"], pcs)
 
 
 def _merge_pop_summary(dst: dict[str, float], src: dict[str, float]) -> None:
@@ -211,6 +222,10 @@ def _merge_pop_summary(dst: dict[str, float], src: dict[str, float]) -> None:
     dst["n_zero_max"] = max(dst["n_zero_max"], src["n_zero_max"])
     dst["wsum_min"] = min(dst["wsum_min"], src["wsum_min"])
     dst["wsum_max"] = max(dst["wsum_max"], src["wsum_max"])
+    dst["neff_min"] = min(dst["neff_min"], src["neff_min"])
+    dst["neff_max"] = max(dst["neff_max"], src["neff_max"])
+    dst["pcs_min"] = min(dst["pcs_min"], src["pcs_min"])
+    dst["pcs_max"] = max(dst["pcs_max"], src["pcs_max"])
 
 
 def _propagate_step_custom(
@@ -743,15 +758,24 @@ def run_afqmc_custom(
                 _merge_pop_summary(pop_summary_block, pop_summary_pre_block)
                 if pop_summary_block["events"] > 0.0:
                     ev = max(pop_summary_block["events"], 1.0)
+                    n_w = max(int(cfg.n_walkers), 1)
                     logger.info(
                         "PopCtrl block=%d pre-resample: events=%d n_zero_mean=%.2f n_zero_max=%d "
-                        "wsum_min=%.6e wsum_max=%.6e",
+                        "wsum_min=%.6e wsum_max=%.6e neff_min=%.2f neff_max=%.2f "
+                        "neff_ratio_min=%.4f neff_ratio_max=%.4f "
+                        "pcs_min=%.6e pcs_max=%.6e",
                         int(blk + 1),
                         int(pop_summary_block["events"]),
                         float(pop_summary_block["n_zero_sum"] / ev),
                         int(pop_summary_block["n_zero_max"]),
                         float(pop_summary_block["wsum_min"]),
                         float(pop_summary_block["wsum_max"]),
+                        float(pop_summary_block["neff_min"]),
+                        float(pop_summary_block["neff_max"]),
+                        float(pop_summary_block["neff_min"] / n_w),
+                        float(pop_summary_block["neff_max"] / n_w),
+                        float(pop_summary_block["pcs_min"]),
+                        float(pop_summary_block["pcs_max"]),
                     )
                 else:
                     _log_pop_control_stats(logger, state, f"block={blk + 1}")
