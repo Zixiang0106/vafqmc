@@ -384,6 +384,7 @@ def _run_det_equilibration(
     pop_freq = int(getattr(cfg, "pop_control_freq", 0))
     step_counter = 0
     eq_done = 0
+    measure_equil_energy = bool(getattr(cfg, "measure_equil_energy", True))
     log_enabled = bool(getattr(cfg, "log_enabled", True))
     eq_freq = int(getattr(cfg, "log_equil_freq", 0))
     log_eq = bool(log_enabled and eq_freq > 0)
@@ -413,23 +414,34 @@ def _run_det_equilibration(
             wsum_last = wsum_hist[-1] if record_wsum and wsum_hist.size > 0 else jnp.sum(state.weights)
         eq_done += nrun
 
-        e_mix = _measure_block_energy_det(hamil, trial, state, cfg)
-        state = _update_e_estimate(state, e_mix)
-        state = _relax_pop_control_shift(state, e_mix)
+        if measure_equil_energy:
+            e_mix = _measure_block_energy_det(hamil, trial, state, cfg)
+            state = _update_e_estimate(state, e_mix)
+            state = _relax_pop_control_shift(state, e_mix)
 
         if cfg.resample and pop_freq <= 0:
             state = _resample_state_det(trial, state)
 
         if log_eq:
-            logger.info(
-                "Eql %d/%d wsum=%.3e e_mix=%.12f e_est=%.12f elapsed=%.2fs",
-                eq_done,
-                cfg.n_eq_steps,
-                float(wsum_last),
-                float(e_mix),
-                float(state.e_estimate),
-                time.time() - start,
-            )
+            if measure_equil_energy:
+                logger.info(
+                    "Eql %d/%d wsum=%.3e e_mix=%.12f e_est=%.12f elapsed=%.2fs",
+                    eq_done,
+                    cfg.n_eq_steps,
+                    float(wsum_last),
+                    float(e_mix),
+                    float(state.e_estimate),
+                    time.time() - start,
+                )
+            else:
+                logger.info(
+                    "Eql %d/%d wsum=%.3e e_est=%.12f elapsed=%.2fs",
+                    eq_done,
+                    cfg.n_eq_steps,
+                    float(wsum_last),
+                    float(state.e_estimate),
+                    time.time() - start,
+                )
     return state
 
 

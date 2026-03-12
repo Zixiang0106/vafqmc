@@ -585,6 +585,7 @@ def _run_custom_equilibration(
     pop_freq = int(getattr(cfg, "pop_control_freq", 0))
     step_counter = 0
     eq_done = 0
+    measure_equil_energy = bool(getattr(cfg, "measure_equil_energy", True))
     if log_eq:
         logger.info(
             "Equilibration sweeps: steps=%d, print_every=%d",
@@ -607,23 +608,34 @@ def _run_custom_equilibration(
         else:
             state = runner.run_steps(state, nrun, "eql")
         eq_done += nrun
-        e_mix = _calc_mixed_energy_custom(hamil, trial, state)
-        state = _update_e_estimate(state, e_mix)
-        state = _relax_pop_control_shift(state, e_mix)
+        if measure_equil_energy:
+            e_mix = _calc_mixed_energy_custom(hamil, trial, state)
+            state = _update_e_estimate(state, e_mix)
+            state = _relax_pop_control_shift(state, e_mix)
 
         if cfg.resample and pop_freq <= 0:
             state = _resample_state_custom(trial, state)
 
         if log_eq:
-            logger.info(
-                "Eql %d/%d wsum=%.3e e_mix=%.12f e_est=%.12f elapsed=%.2fs",
-                eq_done,
-                cfg.n_eq_steps,
-                float(jnp.sum(state.weights)),
-                float(e_mix),
-                float(state.e_estimate),
-                time.time() - start,
-            )
+            if measure_equil_energy:
+                logger.info(
+                    "Eql %d/%d wsum=%.3e e_mix=%.12f e_est=%.12f elapsed=%.2fs",
+                    eq_done,
+                    cfg.n_eq_steps,
+                    float(jnp.sum(state.weights)),
+                    float(e_mix),
+                    float(state.e_estimate),
+                    time.time() - start,
+                )
+            else:
+                logger.info(
+                    "Eql %d/%d wsum=%.3e e_est=%.12f elapsed=%.2fs",
+                    eq_done,
+                    cfg.n_eq_steps,
+                    float(jnp.sum(state.weights)),
+                    float(state.e_estimate),
+                    time.time() - start,
+                )
     return state
 
 
