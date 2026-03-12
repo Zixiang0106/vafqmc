@@ -537,7 +537,7 @@ def _build_initial_state_custom(
     return prop_data, state
 
 
-def _resample_state_custom(trial: Any, state: AFQMCState) -> AFQMCState:
+def _resample_state_custom(trial: Any, state: AFQMCState, cfg: AFQMCConfig) -> AFQMCState:
     key_new, subkey = jax.random.split(state.key)
     state = AFQMCState(
         walkers=state.walkers,
@@ -550,7 +550,23 @@ def _resample_state_custom(trial: Any, state: AFQMCState) -> AFQMCState:
         walker_fields=state.walker_fields,
         trial_state=state.trial_state,
     )
-    return stochastic_reconfiguration(trial, state, subkey)
+    state = stochastic_reconfiguration(trial, state, subkey)
+    if bool(getattr(cfg, "resample_normalize_wsum", False)):
+        n_walkers = jnp.asarray(state.weights.shape[0], dtype=state.weights.dtype)
+        wsum = jnp.maximum(jnp.sum(state.weights), 1.0e-12)
+        weights = state.weights * (n_walkers / wsum)
+        state = AFQMCState(
+            walkers=state.walkers,
+            weights=weights,
+            sign=state.sign,
+            logov=state.logov,
+            key=state.key,
+            e_estimate=state.e_estimate,
+            pop_control_shift=state.pop_control_shift,
+            walker_fields=state.walker_fields,
+            trial_state=state.trial_state,
+        )
+    return state
 
 
 def _run_steps_with_pop_control_custom(
@@ -579,7 +595,7 @@ def _run_steps_with_pop_control_custom(
         local_step += nrun
         if do_resample and pop_freq > 0 and step_counter % pop_freq == 0:
             _update_pop_summary(summary, state)
-            state = _resample_state_custom(trial, state)
+            state = _resample_state_custom(trial, state, runner.cfg)
     return state, step_counter, summary
 
 
@@ -627,7 +643,7 @@ def _run_custom_equilibration(
         state = _relax_pop_control_shift(state, e_mix)
 
         if cfg.resample and pop_freq <= 0:
-            state = _resample_state_custom(trial, state)
+            state = _resample_state_custom(trial, state, cfg)
 
         if log_eq:
             logger.info(
@@ -748,7 +764,7 @@ def run_afqmc_custom(
 
             if cfg.resample and pop_freq <= 0:
                 _update_pop_summary(pop_summary_pre_block, state)
-                state = _resample_state_custom(trial, state)
+                state = _resample_state_custom(trial, state, cfg)
 
             block_energy = e_num / jnp.maximum(e_den, 1.0e-12)
             block_energies.append(block_energy)

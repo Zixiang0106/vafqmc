@@ -98,6 +98,8 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
         pop.init_noise = out.init_noise
     if "resample" in out:
         pop.resample = out.resample
+    if "resample_normalize_wsum" in out:
+        pop.normalize_wsum_after_resample = out.resample_normalize_wsum
     if "pop_control_freq" in out:
         pop.freq = out.pop_control_freq
     if "pop_control_log_stats" in out:
@@ -178,6 +180,7 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
 
     out.init_noise = float(pop.init_noise)
     out.resample = bool(pop.resample)
+    out.resample_normalize_wsum = bool(pop.get("normalize_wsum_after_resample", False))
     out.pop_control_freq = int(pop.get("freq", 0))
     out.pop_control_log_stats = bool(lg.get("pop_control_stats", False))
     out.min_weight = float(pop.min_weight)
