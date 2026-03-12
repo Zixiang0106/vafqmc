@@ -182,6 +182,37 @@ def _log_pop_control_stats(logger: logging.Logger, state: AFQMCState, label: str
     )
 
 
+def _init_pop_summary() -> dict[str, float]:
+    return {
+        "events": 0.0,
+        "n_zero_sum": 0.0,
+        "n_zero_max": 0.0,
+        "wsum_min": float("inf"),
+        "wsum_max": 0.0,
+    }
+
+
+def _update_pop_summary(summary: dict[str, float], state: AFQMCState) -> None:
+    w = jnp.real(state.weights)
+    n_zero = float(jnp.sum(w <= 0.0))
+    wsum = float(jnp.sum(w))
+    summary["events"] += 1.0
+    summary["n_zero_sum"] += n_zero
+    summary["n_zero_max"] = max(summary["n_zero_max"], n_zero)
+    summary["wsum_min"] = min(summary["wsum_min"], wsum)
+    summary["wsum_max"] = max(summary["wsum_max"], wsum)
+
+
+def _merge_pop_summary(dst: dict[str, float], src: dict[str, float]) -> None:
+    if src["events"] <= 0.0:
+        return
+    dst["events"] += src["events"]
+    dst["n_zero_sum"] += src["n_zero_sum"]
+    dst["n_zero_max"] = max(dst["n_zero_max"], src["n_zero_max"])
+    dst["wsum_min"] = min(dst["wsum_min"], src["wsum_min"])
+    dst["wsum_max"] = max(dst["wsum_max"], src["wsum_max"])
+
+
 def _propagate_step_custom(
     hamil: Hamiltonian,
     trial: Any,
@@ -517,9 +548,10 @@ def _run_steps_with_pop_control_custom(
     do_resample: bool,
     trial: Any,
     label: str,
-) -> tuple[AFQMCState, int]:
+) -> tuple[AFQMCState, int, dict[str, float]]:
     steps_done = 0
     local_step = 0
+    summary = _init_pop_summary()
     while steps_done < n_steps:
         if pop_freq > 0:
             to_pop = pop_freq - (step_counter % pop_freq)
@@ -531,8 +563,9 @@ def _run_steps_with_pop_control_custom(
         steps_done += nrun
         local_step += nrun
         if do_resample and pop_freq > 0 and step_counter % pop_freq == 0:
+            _update_pop_summary(summary, state)
             state = _resample_state_custom(trial, state)
-    return state, step_counter
+    return state, step_counter, summary
 
 
 def _run_custom_equilibration(
@@ -561,7 +594,7 @@ def _run_custom_equilibration(
     while eq_done < cfg.n_eq_steps:
         nrun = min(eq_chunk, cfg.n_eq_steps - eq_done)
         if pop_freq > 0:
-            state, step_counter = _run_steps_with_pop_control_custom(
+            state, step_counter, _ = _run_steps_with_pop_control_custom(
                 state,
                 runner,
                 n_steps=nrun,
@@ -673,10 +706,12 @@ def run_afqmc_custom(
         for blk in range(cfg.n_blocks):
             e_num = jnp.asarray(0.0, dtype=jnp.float64)
             e_den = jnp.asarray(0.0, dtype=jnp.float64)
+            pop_summary_block = _init_pop_summary()
+            pop_summary_pre_block = _init_pop_summary()
 
             for _ in range(n_ene_measurements):
                 if pop_freq > 0:
-                    state, step_counter = _run_steps_with_pop_control_custom(
+                    state, step_counter, pop_summary = _run_steps_with_pop_control_custom(
                         state,
                         custom_runner,
                         n_steps=int(cfg.n_block_steps),
@@ -686,6 +721,7 @@ def run_afqmc_custom(
                         trial=trial,
                         label="block",
                     )
+                    _merge_pop_summary(pop_summary_block, pop_summary)
                 else:
                     state = custom_runner.run_steps(state, cfg.n_block_steps, "block")
                     step_counter += int(cfg.n_block_steps)
@@ -696,6 +732,7 @@ def run_afqmc_custom(
                 state = _relax_pop_control_shift(state, e_i)
 
             if cfg.resample and pop_freq <= 0:
+                _update_pop_summary(pop_summary_pre_block, state)
                 state = _resample_state_custom(trial, state)
 
             block_energy = e_num / jnp.maximum(e_den, 1.0e-12)
@@ -703,7 +740,21 @@ def run_afqmc_custom(
             block_weights.append(e_den)
             state = _update_e_estimate(state, block_energy)
             if log_pop_stats:
-                _log_pop_control_stats(logger, state, f"block={blk + 1}")
+                _merge_pop_summary(pop_summary_block, pop_summary_pre_block)
+                if pop_summary_block["events"] > 0.0:
+                    ev = max(pop_summary_block["events"], 1.0)
+                    logger.info(
+                        "PopCtrl block=%d pre-resample: events=%d n_zero_mean=%.2f n_zero_max=%d "
+                        "wsum_min=%.6e wsum_max=%.6e",
+                        int(blk + 1),
+                        int(pop_summary_block["events"]),
+                        float(pop_summary_block["n_zero_sum"] / ev),
+                        int(pop_summary_block["n_zero_max"]),
+                        float(pop_summary_block["wsum_min"]),
+                        float(pop_summary_block["wsum_max"]),
+                    )
+                else:
+                    _log_pop_control_stats(logger, state, f"block={blk + 1}")
             row = (
                 int(blk + 1),
                 float(block_energy),
