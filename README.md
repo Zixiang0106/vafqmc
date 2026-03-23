@@ -15,12 +15,6 @@ Install the package:
 pip install -e .
 ```
 
-For GPU runs (recommended), install CUDA-enabled JAX (example for CUDA 12):
-```bash
-pip install --upgrade "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-```
-
-`jaxlib` must match your CUDA runtime. See the official [JAX installation guide](https://github.com/jax-ml/jax#installation).
 
 ## What Is Included
 
