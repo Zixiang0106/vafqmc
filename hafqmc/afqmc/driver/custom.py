@@ -1286,6 +1286,7 @@ def _scan_steps_custom_multi(
 ):
     ortho_freq_i = int(cfg.ortho_freq)
     step_start_i = jnp.asarray(step_start, dtype=jnp.int32)
+    weight_dtype = state.weights.dtype
 
     def body(carry, _):
         st, idx = carry
@@ -1301,7 +1302,10 @@ def _scan_steps_custom_multi(
         if ortho_freq_i > 0:
             do_ortho = ((step_start_i + idx + 1) % ortho_freq_i) == 0
             st = _orthonormalize_custom(trial, st, do_ortho)
-        wsum = lax.psum(jnp.sum(st.weights), axis_name)
+        if record_wsum:
+            wsum = lax.psum(jnp.sum(st.weights), axis_name)
+        else:
+            wsum = jnp.asarray(0.0, dtype=weight_dtype)
         return (st, idx + 1), wsum
 
     (state, _), wsum_hist = lax.scan(body, (state, 0), None, length=n_steps)
@@ -1367,6 +1371,9 @@ class _CustomScanRunnerMulti:
         n_steps_i = int(n_steps)
         if n_steps_i <= 0:
             return state
+
+        if bool(getattr(self.cfg, "multi_gpu_force_step_loop", False)):
+            self.enabled = False
 
         if self.enabled:
             try:
@@ -1551,6 +1558,8 @@ def _run_steps_with_pop_control_custom_multi(
     collect_summary: bool,
     trial: Any,
     label: str,
+    logger: logging.Logger | None = None,
+    debug_trace: bool = False,
 ) -> tuple[AFQMCState, int, dict[str, float]]:
     steps_done = 0
     local_step = 0
@@ -1561,14 +1570,49 @@ def _run_steps_with_pop_control_custom_multi(
             nrun = min(n_steps - steps_done, to_pop)
         else:
             nrun = n_steps - steps_done
+        if debug_trace and logger is not None:
+            logger.info(
+                "Trace %s chunk-start: steps_done=%d/%d step_counter=%d local_step=%d nrun=%d do_resample=%s",
+                label,
+                int(steps_done),
+                int(n_steps),
+                int(step_counter),
+                int(local_step),
+                int(nrun),
+                str(bool(do_resample)),
+            )
         state = runner.run_steps(state, nrun, label, step_start=local_step)
+        if debug_trace and logger is not None:
+            logger.info(
+                "Trace %s chunk-done: steps_done=%d/%d step_counter=%d local_step=%d nrun=%d",
+                label,
+                int(steps_done + nrun),
+                int(n_steps),
+                int(step_counter + nrun),
+                int(local_step + nrun),
+                int(nrun),
+            )
         step_counter += nrun
         steps_done += nrun
         local_step += nrun
         if do_resample and pop_freq > 0 and step_counter % pop_freq == 0:
             if collect_summary:
                 _update_pop_summary_host(summary, state, pop_stats_fn)
+            if debug_trace and logger is not None:
+                logger.info(
+                    "Trace %s resample-start: step_counter=%d pop_freq=%d",
+                    label,
+                    int(step_counter),
+                    int(pop_freq),
+                )
             state = resample_fn(state)
+            if debug_trace and logger is not None:
+                logger.info(
+                    "Trace %s resample-done: step_counter=%d pop_freq=%d",
+                    label,
+                    int(step_counter),
+                    int(pop_freq),
+                )
     return state, step_counter, summary
 
 
@@ -1584,6 +1628,7 @@ def _run_custom_equilibration_multi(
     log_enabled = bool(getattr(cfg, "log_enabled", True))
     eq_freq = int(getattr(cfg, "log_equil_freq", 0))
     log_eq = bool(log_enabled and eq_freq > 0)
+    debug_trace = bool(log_enabled and getattr(cfg, "log_equil_debug_trace", False))
     eq_chunk = max(eq_freq, 1) if eq_freq > 0 else int(cfg.n_eq_steps)
 
     global_wsum_fn = jax.pmap(
@@ -1648,17 +1693,41 @@ def _run_custom_equilibration_multi(
                 collect_summary=False,
                 trial=trial,
                 label="eql",
+                logger=logger,
+                debug_trace=debug_trace,
             )
         else:
+            if debug_trace:
+                logger.info(
+                    "Trace eql chunk-start: steps_done=%d/%d nrun=%d mode=no-pop-control",
+                    int(eq_done),
+                    int(cfg.n_eq_steps),
+                    int(nrun),
+                )
             state = runner.run_steps(state, nrun, "eql")
+            if debug_trace:
+                logger.info(
+                    "Trace eql chunk-done: steps_done=%d/%d nrun=%d mode=no-pop-control",
+                    int(eq_done + nrun),
+                    int(cfg.n_eq_steps),
+                    int(nrun),
+                )
         eq_done += nrun
         if measure_equil_energy:
+            if debug_trace:
+                logger.info("Trace eql mixed-energy-start: eq_done=%d/%d", int(eq_done), int(cfg.n_eq_steps))
             e_mix = float(host_replicated_value(mixed_energy_fn(state)))
+            if debug_trace:
+                logger.info("Trace eql mixed-energy-done: eq_done=%d/%d", int(eq_done), int(cfg.n_eq_steps))
             state = update_e_fn(state, e_mix)
             state = update_shift_fn(state, e_mix)
 
         if cfg.resample and pop_freq <= 0:
+            if debug_trace:
+                logger.info("Trace eql resample-start: eq_done=%d/%d", int(eq_done), int(cfg.n_eq_steps))
             state = resample_fn(state)
+            if debug_trace:
+                logger.info("Trace eql resample-done: eq_done=%d/%d", int(eq_done), int(cfg.n_eq_steps))
 
         if log_eq:
             wsum = float(host_replicated_value(global_wsum_fn(state)))

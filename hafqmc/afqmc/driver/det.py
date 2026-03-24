@@ -559,6 +559,7 @@ def _scan_steps_det_multi(
 ):
     ortho_freq_i = int(ortho_freq)
     step_start_i = jnp.asarray(step_start, dtype=jnp.int32)
+    weight_dtype = state.weights.dtype
 
     def body(carry, _):
         st, idx = carry
@@ -574,7 +575,10 @@ def _scan_steps_det_multi(
         if ortho_freq_i > 0:
             do_ortho = ((step_start_i + idx + 1) % ortho_freq_i) == 0
             st = _orthonormalize_det(trial, st, do_ortho)
-        wsum = lax.psum(jnp.sum(st.weights), axis_name)
+        if record_wsum:
+            wsum = lax.psum(jnp.sum(st.weights), axis_name)
+        else:
+            wsum = jnp.asarray(0.0, dtype=weight_dtype)
         return (st, idx + 1), wsum
 
     (state, _), wsum_hist = lax.scan(body, (state, 0), None, length=n_steps)

@@ -114,6 +114,8 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
         p.e_estimate_init = out.e_estimate_init
     if "multi_gpu" in out:
         p.multi_gpu = out.multi_gpu
+    if "multi_gpu_force_step_loop" in out:
+        p.multi_gpu_force_step_loop = out.multi_gpu_force_step_loop
     if "ortho_freq" in out:
         p.ortho_freq = out.ortho_freq
 
@@ -154,6 +156,8 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
         lg.block_freq = out.log_block_freq
     if "log_equil_freq" in out:
         lg.equil_freq = out.log_equil_freq
+    if "log_equil_debug_trace" in out:
+        lg.equil_debug_trace = out.log_equil_debug_trace
     # Backward-compatible top-level visualization aliases.
     if "visualization" in out:
         vis.enabled = out.visualization
@@ -196,11 +200,13 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
     out.measure_equil_energy = bool(p.get("measure_equil_energy", True))
     out.e_estimate_init = p.get("e_estimate_init", None)
     out.multi_gpu = bool(p.get("multi_gpu", False))
+    out.multi_gpu_force_step_loop = bool(p.get("multi_gpu_force_step_loop", False))
     out.ortho_freq = int(p.ortho_freq)
 
     out.log_enabled = bool(lg.get("enabled", True))
     out.log_block_freq = int(lg.get("block_freq", 1))
     out.log_equil_freq = int(lg.get("equil_freq", 0))
+    out.log_equil_debug_trace = bool(lg.get("equil_debug_trace", False))
 
     out.init_noise = float(pop.init_noise)
     out.resample = bool(pop.resample)
