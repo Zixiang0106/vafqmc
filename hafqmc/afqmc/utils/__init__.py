@@ -19,6 +19,18 @@ from .core import (
     phaseless_from_ratio,
     save_hamiltonian,
 )
+from .distributed import (
+    PMAP_AXIS_NAME,
+    distributed_stochastic_reconfiguration,
+    host_gather_state,
+    host_global_sum,
+    host_replicated_state,
+    host_replicated_value,
+    make_local_device_keys,
+    replicate_state,
+    require_local_devices,
+    shard_local_pytrees,
+)
 from .propagation import (
     PropagationData,
     apply_trotter,
@@ -33,6 +45,7 @@ from .visualization import build_energy_visualizer
 
 __all__ = [
     "Array",
+    "PMAP_AXIS_NAME",
     "PropagationData",
     "RuntimeState",
     "SpinWfn",
@@ -51,13 +64,22 @@ __all__ = [
     "calc_local_energy_batch",
     "calc_rdm_batch",
     "calc_slov_batch",
+    "distributed_stochastic_reconfiguration",
     "extract_params",
     "gaussian_logdens",
+    "host_gather_state",
+    "host_global_sum",
+    "host_replicated_state",
+    "host_replicated_value",
     "load_ansatz_cfg_from_hparams",
     "load_hamiltonian",
+    "make_local_device_keys",
     "mix_overlap_terms",
     "normalize_ansatz_params",
     "phaseless_from_ratio",
     "reject_outliers",
+    "replicate_state",
+    "require_local_devices",
     "save_hamiltonian",
+    "shard_local_pytrees",
 ]

@@ -60,7 +60,11 @@ def shard_local_pytrees(local_values: Sequence[Any], devices: Sequence[Any]) -> 
     )
 
 
-def host_global_sum(local_values: Sequence[Any], devices: Sequence[Any], axis_name: str = PMAP_AXIS_NAME) -> float:
+def host_global_sum(
+    local_values: Sequence[Any],
+    devices: Sequence[Any],
+    axis_name: str = PMAP_AXIS_NAME,
+) -> float:
     sharded = jax.device_put_sharded(
         [jnp.asarray(x, dtype=jnp.float64) for x in local_values],
         devices,

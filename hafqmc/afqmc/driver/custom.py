@@ -11,15 +11,13 @@ from typing import Any, TextIO
 
 import jax
 from jax import lax, numpy as jnp
-from jax.tree_util import tree_leaves, tree_map
 
-from ...hamiltonian import Hamiltonian, calc_slov
+from ...hamiltonian import Hamiltonian
 from ...propagator import orthonormalize
-from ...sampler import choose_sampler_maker, make_batched
 from ..afqmc_config import AFQMCConfig
 from ..trial.stochastic import VAFQMCTrial
-from ..trial.stochastic_internal_methods import _ensure_pool_field_batch_size
 from ..utils import (
+    PMAP_AXIS_NAME,
     PropagationData,
     analyze_energy_blocks,
     apply_trotter,
@@ -27,13 +25,7 @@ from ..utils import (
     calc_force_bias,
     calc_local_energy_batch,
     calc_slov_batch,
-)
-from ..utils.visualization import build_energy_visualizer
-from ..walker import AFQMCState, init_walkers, stochastic_reconfiguration
-from .multi_gpu import (
-    PMAP_AXIS_NAME,
     distributed_stochastic_reconfiguration,
-    host_gather_state,
     host_global_sum,
     host_replicated_state,
     host_replicated_value,
@@ -42,10 +34,12 @@ from .multi_gpu import (
     require_local_devices,
     shard_local_pytrees,
 )
+from ..utils.visualization import build_energy_visualizer
+from ..walker import AFQMCState, init_walkers, stochastic_reconfiguration
 
 
-def _ensure_complex_walkers(walkers: Any) -> Any:
-    if isinstance(walkers, tuple) and len(walkers) == 2:
+def ensure_complex_walkers(walkers: Any) -> Any:
+    if isinstance(walkers, (tuple, list)) and len(walkers) == 2:
         w_up, w_dn = walkers
         return (w_up.astype(jnp.complex128), w_dn.astype(jnp.complex128))
     if isinstance(walkers, jnp.ndarray):
@@ -53,7 +47,7 @@ def _ensure_complex_walkers(walkers: Any) -> Any:
     return walkers
 
 
-def _log_init(logger: logging.Logger, cfg: AFQMCConfig, state: AFQMCState, start: float) -> None:
+def log_init(logger: logging.Logger, cfg: AFQMCConfig, state: AFQMCState, start: float) -> None:
     logger.info(
         "AFQMC init: dt=%.4g walkers=%d blocks=%d ene_measurements=%d block_steps=%d meas_samples=%d pop_freq=%d",
         cfg.dt,
@@ -67,7 +61,7 @@ def _log_init(logger: logging.Logger, cfg: AFQMCConfig, state: AFQMCState, start
     logger.info("Init e_est=%.12f elapsed=%.2fs", float(state.e_estimate), time.time() - start)
 
 
-def _update_e_estimate(state: AFQMCState, block_energy: Any) -> AFQMCState:
+def update_e_estimate(state: AFQMCState, block_energy: Any) -> AFQMCState:
     return AFQMCState(
         walkers=state.walkers,
         weights=state.weights,
@@ -81,7 +75,7 @@ def _update_e_estimate(state: AFQMCState, block_energy: Any) -> AFQMCState:
     )
 
 
-def _relax_pop_control_shift(state: AFQMCState, block_energy: Any) -> AFQMCState:
+def relax_pop_control_shift(state: AFQMCState, block_energy: Any) -> AFQMCState:
     return AFQMCState(
         walkers=state.walkers,
         weights=state.weights,
@@ -95,7 +89,7 @@ def _relax_pop_control_shift(state: AFQMCState, block_energy: Any) -> AFQMCState
     )
 
 
-def _finalize_outputs(
+def finalize_outputs(
     logger: logging.Logger,
     start: float,
     block_energies: list[Any],
@@ -128,19 +122,7 @@ def _finalize_outputs(
     return e_mean, e_err
 
 
-def _write_raw_block_data(path: str, rows: list[tuple[int, float, float, float, float, float]]) -> None:
-    p = Path(path)
-    if p.parent and str(p.parent) != "":
-        p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", encoding="utf-8") as f:
-        f.write("# block e_blk e_est wsum block_weight elapsed_s\n")
-        for blk, e_blk, e_est, wsum, wblk, elapsed in rows:
-            f.write(
-                f"{blk:d} {e_blk:.16e} {e_est:.16e} {wsum:.16e} {wblk:.16e} {elapsed:.6f}\n"
-            )
-
-
-def _open_raw_block_stream(path: str) -> TextIO:
+def open_raw_block_stream(path: str) -> TextIO:
     p = Path(path)
     if p.parent and str(p.parent) != "":
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -150,7 +132,7 @@ def _open_raw_block_stream(path: str) -> TextIO:
     return f
 
 
-def _append_raw_block_row(
+def append_raw_block_row(
     f: TextIO, row: tuple[int, float, float, float, float, float]
 ) -> None:
     blk, e_blk, e_est, wsum, wblk, elapsed = row
@@ -160,74 +142,43 @@ def _append_raw_block_row(
     f.flush()
 
 
-def _log_pop_control_stats(logger: logging.Logger, state: AFQMCState, label: str) -> None:
-    w = jnp.real(state.weights)
-    w_min = float(jnp.min(w))
-    w_max = float(jnp.max(w))
-    w_mean = float(jnp.mean(w))
-    w_sum = float(jnp.sum(w))
-    n_zero_w = int(jnp.sum(w <= 0.0))
-
-    logov = jnp.real(state.logov)
-    finite = jnp.isfinite(logov)
-    n_total = int(logov.shape[0])
-    n_finite = int(jnp.sum(finite))
-    n_nonfinite = n_total - n_finite
-    if n_finite > 0:
-        lo_min = float(jnp.min(jnp.where(finite, logov, jnp.inf)))
-        lo_max = float(jnp.max(jnp.where(finite, logov, -jnp.inf)))
-        lo_mean = float(jnp.sum(jnp.where(finite, logov, 0.0)) / n_finite)
-    else:
-        lo_min = float("nan")
-        lo_max = float("nan")
-        lo_mean = float("nan")
-
-    logger.info(
-        "PopCtrl %s: "
-        "w_min=%.6e w_max=%.6e w_mean=%.6e w_sum=%.6e n_zero_w=%d | "
-        "logov_min=%.6e logov_max=%.6e logov_mean=%.6e n_logov_nonfinite=%d",
-        label,
-        w_min,
-        w_max,
-        w_mean,
-        w_sum,
-        n_zero_w,
-        lo_min,
-        lo_max,
-        lo_mean,
-        n_nonfinite,
-    )
+def _bind_trial_runtime_state_custom(trial: Any, walkers: Any, key: Any) -> tuple[Any, Any]:
+    trial_state = None
+    if hasattr(trial, "bind_walkers"):
+        if hasattr(trial, "init_runtime_state"):
+            key, trial_key = jax.random.split(key)
+            trial_state = trial.init_runtime_state(walkers, key=trial_key, reinit=True)
+        else:
+            key, trial_key = jax.random.split(key)
+            trial.bind_walkers(walkers, key=trial_key, reinit=True)
+            if hasattr(trial, "export_runtime_state"):
+                trial_state = trial.export_runtime_state()
+    return trial_state, key
 
 
-def _init_pop_summary() -> dict[str, float]:
-    return {
-        "events": 0.0,
-        "n_zero_sum": 0.0,
-        "n_zero_max": 0.0,
-        "wsum_min": float("inf"),
-        "wsum_max": 0.0,
-    }
+def _calc_trial_overlap_custom(trial: Any, walkers: Any, trial_state: Any):
+    if trial_state is not None and hasattr(trial, "calc_slov_state"):
+        return trial.calc_slov_state(walkers, trial_state)
+    return calc_slov_batch(trial, walkers)
 
 
-def _update_pop_summary(summary: dict[str, float], state: AFQMCState) -> None:
-    w = jnp.real(state.weights)
-    n_zero = float(jnp.sum(w <= 0.0))
-    wsum = float(jnp.sum(w))
-    summary["events"] += 1.0
-    summary["n_zero_sum"] += n_zero
-    summary["n_zero_max"] = max(summary["n_zero_max"], n_zero)
-    summary["wsum_min"] = min(summary["wsum_min"], wsum)
-    summary["wsum_max"] = max(summary["wsum_max"], wsum)
+def _calc_trial_local_energy_custom(
+    hamil: Hamiltonian,
+    trial: Any,
+    walkers: Any,
+    trial_state: Any,
+):
+    if trial_state is not None and hasattr(trial, "calc_local_energy_state"):
+        return jnp.real(trial.calc_local_energy_state(hamil, walkers, trial_state))
+    return jnp.real(calc_local_energy_batch(hamil, trial, walkers))
 
 
-def _merge_pop_summary(dst: dict[str, float], src: dict[str, float]) -> None:
-    if src["events"] <= 0.0:
-        return
-    dst["events"] += src["events"]
-    dst["n_zero_sum"] += src["n_zero_sum"]
-    dst["n_zero_max"] = max(dst["n_zero_max"], src["n_zero_max"])
-    dst["wsum_min"] = min(dst["wsum_min"], src["wsum_min"])
-    dst["wsum_max"] = max(dst["wsum_max"], src["wsum_max"])
+def _initial_walker_fields_custom(trial: Any, trial_state: Any):
+    if isinstance(trial_state, dict) and ("walker_fields" in trial_state):
+        return trial_state["walker_fields"]
+    if hasattr(trial, "walker_fields") and getattr(trial, "walker_fields") is not None:
+        return trial.walker_fields
+    return jnp.zeros((0, 0, 0), dtype=jnp.float64)
 
 
 def _propagate_step_custom(
@@ -466,339 +417,6 @@ class _CustomScanRunner:
                 state = _orthonormalize_custom(self.trial, state, jnp.asarray(True))
         return state
 
-
-def _bind_trial_runtime_state_custom(trial: Any, walkers: Any, key: Any) -> tuple[Any, Any]:
-    trial_state = None
-    if hasattr(trial, "bind_walkers"):
-        if hasattr(trial, "init_runtime_state"):
-            key, trial_key = jax.random.split(key)
-            trial_state = trial.init_runtime_state(walkers, key=trial_key, reinit=True)
-        else:
-            key, trial_key = jax.random.split(key)
-            trial.bind_walkers(walkers, key=trial_key, reinit=True)
-            if hasattr(trial, "export_runtime_state"):
-                trial_state = trial.export_runtime_state()
-    return trial_state, key
-
-
-def _calc_trial_overlap_custom(trial: Any, walkers: Any, trial_state: Any):
-    if trial_state is not None and hasattr(trial, "calc_slov_state"):
-        return trial.calc_slov_state(walkers, trial_state)
-    return calc_slov_batch(trial, walkers)
-
-
-def _calc_trial_local_energy_custom(
-    hamil: Hamiltonian,
-    trial: Any,
-    walkers: Any,
-    trial_state: Any,
-):
-    if trial_state is not None and hasattr(trial, "calc_local_energy_state"):
-        return jnp.real(trial.calc_local_energy_state(hamil, walkers, trial_state))
-    return jnp.real(calc_local_energy_batch(hamil, trial, walkers))
-
-
-def _initial_walker_fields_custom(trial: Any, trial_state: Any):
-    if isinstance(trial_state, dict) and ("walker_fields" in trial_state):
-        return trial_state["walker_fields"]
-    if hasattr(trial, "walker_fields") and getattr(trial, "walker_fields") is not None:
-        return trial.walker_fields
-    return jnp.zeros((0, 0, 0), dtype=jnp.float64)
-
-
-@dataclass
-class _StochasticInitContext:
-    device: Any
-    root_key: Any
-    stage_key: Any
-    walker_sampler: Any
-    sampler_params: Any
-    sample_state: Any
-    infer_state: Any
-    chains_per_walker: int
-
-
-def _clone_stochastic_trial_for_runtime_init(
-    trial: VAFQMCTrial,
-    *,
-    seed: int,
-) -> VAFQMCTrial:
-    clone = VAFQMCTrial(
-        trial.ansatz,
-        trial.params,
-        hamiltonian=getattr(trial, "_hamiltonian", None),
-        reference_wfn=trial.reference_wfn,
-        n_samples=int(trial.n_samples),
-        burn_in=int(trial.burn_in),
-        sampler_name=str(trial._sampler_name),
-        sampler_kwargs=dict(getattr(trial, "_sampler_kwargs", {}) or {}),
-        sampling_target=str(trial.sampling_target),
-        logdens_floor=float(trial.logdens_floor),
-        sample_update_steps=int(trial.sample_update_steps),
-        local_energy_chunk_size=int(trial.local_energy_chunk_size),
-        init_walkers_from_trial=bool(trial.init_walkers_from_trial),
-        init_walkers_burn_in=int(trial.init_walkers_burn_in),
-        init_walkers_chains_per_walker=int(trial.init_walkers_chains_per_walker),
-        init_walkers_infer_steps=int(trial.init_walkers_infer_steps),
-        max_prop=trial.max_prop,
-        seed=int(seed),
-    )
-    return clone
-
-
-def _make_stochastic_init_infer_pm(trial: VAFQMCTrial):
-    hamil = getattr(trial, "_hamiltonian", None)
-    if hamil is None:
-        return None
-
-    apply_ansatz = jax.vmap(lambda f: trial.ansatz.apply(trial.params, f))
-    eval_eloc = jax.vmap(lambda b, k: hamil.local_energy(b, k))
-    eval_slov = jax.vmap(lambda b, k: calc_slov(b, k))
-    floor = float(getattr(trial, "logdens_floor", -60.0))
-    local_chunk = int(getattr(trial, "local_energy_chunk_size", 0))
-    chunk = int(local_chunk * int(getattr(trial, "n_samples", 1))) if local_chunk > 0 else 0
-
-    def infer_pm(fields_pair_local: Any, logsw_local: Any):
-        bra_fields = tree_map(lambda x: x[:, 0], fields_pair_local)
-        ket_fields = tree_map(lambda x: x[:, 1], fields_pair_local)
-        bra, bra_lw = apply_ansatz(bra_fields)
-        ket, ket_lw = apply_ansatz(ket_fields)
-        n_local_walkers = int(tree_leaves(ket)[0].shape[0])
-
-        if chunk <= 0 or chunk >= n_local_walkers:
-            eloc = eval_eloc(bra, ket)
-            sign, logabs = eval_slov(bra, ket)
-        else:
-            eloc_chunks = []
-            sign_chunks = []
-            logabs_chunks = []
-            for start in range(0, n_local_walkers, chunk):
-                end = min(start + chunk, n_local_walkers)
-                bra_c = tree_map(lambda x: x[start:end], bra)
-                ket_c = tree_map(lambda x: x[start:end], ket)
-                eloc_chunks.append(eval_eloc(bra_c, ket_c))
-                sign_c, logabs_c = eval_slov(bra_c, ket_c)
-                sign_chunks.append(sign_c)
-                logabs_chunks.append(logabs_c)
-            eloc = jnp.concatenate(eloc_chunks, axis=0)
-            sign = jnp.concatenate(sign_chunks, axis=0)
-            logabs = jnp.concatenate(logabs_chunks, axis=0)
-
-        logov = logabs + bra_lw + ket_lw
-        dlog = jnp.real(logov - logsw_local)
-        dlog = jnp.where(jnp.isfinite(dlog), dlog, floor)
-        dmax = lax.pmax(jnp.max(dlog), PMAP_AXIS_NAME)
-        rel_w = jnp.exp(dlog - dmax)
-
-        global_wsum = jnp.maximum(lax.psum(jnp.sum(rel_w), PMAP_AXIS_NAME), 1.0e-12)
-        global_es_num = lax.psum(jnp.sum((eloc * sign) * rel_w), PMAP_AXIS_NAME)
-        global_s_num = lax.psum(jnp.sum(sign * rel_w), PMAP_AXIS_NAME)
-
-        exp_es = global_es_num / global_wsum
-        exp_s = global_s_num / global_wsum
-        denom = jnp.real(exp_s)
-        etot = jnp.where(jnp.abs(denom) > 1.0e-12, jnp.real(exp_es) / denom, jnp.nan)
-        return jnp.real(etot), jnp.real(exp_es), jnp.real(exp_s)
-
-    return jax.pmap(infer_pm, axis_name=PMAP_AXIS_NAME)
-
-
-def _build_stochastic_init_context_local(
-    trial: VAFQMCTrial,
-    n_local: int,
-    key: Any,
-    device: Any,
-) -> _StochasticInitContext:
-    chains_per_walker = int(getattr(trial, "init_walkers_chains_per_walker", 0))
-    if chains_per_walker <= 0:
-        chains_per_walker = int(trial.n_samples)
-    n_init_chains = int(n_local * chains_per_walker)
-
-    pair_fields_shape = tree_map(
-        lambda s: jnp.asarray((2, *tuple(map(int, jnp.asarray(s).reshape(-1).tolist())))),
-        trial.fields_shape,
-    )
-
-    def pair_logdens(params: Any, fields_pair: Any):
-        bra_fields = tree_map(lambda x: x[0], fields_pair)
-        ket_fields = tree_map(lambda x: x[1], fields_pair)
-        bra, bra_lw = trial.ansatz.apply(params, bra_fields)
-        ket, ket_lw = trial.ansatz.apply(params, ket_fields)
-        _sign, logov = calc_slov(bra, ket)
-        logd = jnp.real(logov + bra_lw + ket_lw)
-        return jnp.where(jnp.isfinite(logd), logd, trial.logdens_floor)
-
-    init_sampler = choose_sampler_maker(str(trial._sampler_name))(
-        pair_logdens,
-        pair_fields_shape,
-        **dict(getattr(trial, "_sampler_kwargs", {}) or {}),
-    )
-    walker_sampler = make_batched(init_sampler, n_init_chains, concat=False)
-    sampler_params = trial.params
-
-    with jax.default_device(device):
-        stage_key, init_key = jax.random.split(key)
-        sample_state = walker_sampler.init(init_key, sampler_params)
-        if int(trial.init_walkers_burn_in) > 0:
-            stage_key, burn_key = jax.random.split(stage_key)
-            sample_state = walker_sampler.burn_in(
-                burn_key,
-                sampler_params,
-                sample_state,
-                int(trial.init_walkers_burn_in),
-            )
-
-    return _StochasticInitContext(
-        device=device,
-        root_key=key,
-        stage_key=stage_key,
-        walker_sampler=walker_sampler,
-        sampler_params=sampler_params,
-        sample_state=sample_state,
-        infer_state=sample_state,
-        chains_per_walker=chains_per_walker,
-    )
-
-
-def _sample_stochastic_infer_local(
-    ctx: _StochasticInitContext,
-) -> tuple[_StochasticInitContext, Any, Any]:
-    with jax.default_device(ctx.device):
-        stage_key, infer_key = jax.random.split(ctx.stage_key)
-        infer_state, (infer_fields, infer_logsw) = ctx.walker_sampler.sample(
-            infer_key,
-            ctx.sampler_params,
-            ctx.infer_state,
-        )
-    return (
-        _StochasticInitContext(
-            device=ctx.device,
-            root_key=ctx.root_key,
-            stage_key=stage_key,
-            walker_sampler=ctx.walker_sampler,
-            sampler_params=ctx.sampler_params,
-            sample_state=ctx.sample_state,
-            infer_state=infer_state,
-            chains_per_walker=ctx.chains_per_walker,
-        ),
-        infer_fields,
-        infer_logsw,
-    )
-
-
-def _finalize_stochastic_walkers_local(
-    trial: VAFQMCTrial,
-    ctx: _StochasticInitContext,
-    n_local: int,
-    noise: float,
-):
-    with jax.default_device(ctx.device):
-        stage_key, sample_key = jax.random.split(ctx.stage_key)
-        _, (fields, _logsw) = ctx.walker_sampler.sample(
-            sample_key,
-            ctx.sampler_params,
-            ctx.sample_state,
-        )
-        fields_for_walkers = tree_map(lambda x: x[:, 1], fields)
-        walkers_all, _ = jax.vmap(lambda f: trial.ansatz.apply(trial.params, f))(fields_for_walkers)
-        left_fields_all = tree_map(lambda x: x[:, 0], fields)
-
-        if int(ctx.chains_per_walker) > 1:
-            stage_key, pick_key = jax.random.split(stage_key)
-            pick = jax.random.randint(pick_key, (n_local,), 0, int(ctx.chains_per_walker))
-            idx = jnp.arange(n_local)
-
-            def _pick_one(x):
-                x = x.reshape((n_local, int(ctx.chains_per_walker)) + x.shape[1:])
-                return x[idx, pick]
-
-            walkers = tree_map(_pick_one, walkers_all)
-
-            def _group(x):
-                return x.reshape((n_local, int(ctx.chains_per_walker)) + x.shape[1:])
-
-            grouped_left = tree_map(_group, left_fields_all)
-            pool_seed = _ensure_pool_field_batch_size(trial, grouped_left, int(trial.n_samples))
-            left_selected = tree_map(_pick_one, left_fields_all)
-            pool_seed = tree_map(lambda x, s: x.at[:, 0].set(s), pool_seed, left_selected)
-        else:
-            walkers = walkers_all
-            left_selected = left_fields_all
-            pool_seed = tree_map(
-                lambda x: jnp.repeat(x[:, None], int(trial.n_samples), axis=1),
-                left_selected,
-            )
-
-        walkers = _ensure_complex_walkers(walkers)
-        if noise > 0.0:
-            if isinstance(walkers, (tuple, list)) and len(walkers) == 2:
-                _, k1, k2 = jax.random.split(ctx.root_key, 3)
-                w_up, w_dn = walkers
-                walkers = (
-                    w_up + noise * jax.random.normal(k1, w_up.shape),
-                    w_dn + noise * jax.random.normal(k2, w_dn.shape),
-                )
-            else:
-                _, kn = jax.random.split(ctx.root_key, 2)
-                walkers = walkers + noise * jax.random.normal(kn, walkers.shape)
-
-        walkers, _ = orthonormalize(walkers)
-    return walkers, pool_seed
-
-
-def _initialize_runtime_state_local(
-    trial: VAFQMCTrial,
-    hamil: Hamiltonian,
-    walkers: Any,
-    pool_seed: Any,
-    key: Any,
-    device: Any,
-    e_est_init: Any,
-) -> tuple[AFQMCState, float]:
-    trial_local = _clone_stochastic_trial_for_runtime_init(trial, seed=int(jax.device_get(key)[0]))
-    trial_local._runtime_burnin_log_enabled = False
-    trial_local._init_pool_fields_override = pool_seed
-
-    with jax.default_device(device):
-        key_out, trial_key = jax.random.split(key)
-        trial_state = trial_local.init_runtime_state(walkers, key=trial_key, reinit=True)
-        sign, logov = trial_local.calc_slov_state(walkers, trial_state)
-        sign = sign.astype(jnp.complex128)
-        logov = logov.astype(jnp.float64)
-        weights = jnp.ones((int(tree_leaves(walkers)[0].shape[0]),), dtype=jnp.float64)
-        e_sum = 0.0
-        if e_est_init is None:
-            e_local = jnp.sum(jnp.real(trial_local.calc_local_energy_state(hamil, walkers, trial_state)))
-            e_sum = float(jax.device_get(e_local))
-
-        state = AFQMCState(
-            walkers=walkers,
-            weights=weights,
-            sign=sign,
-            logov=logov,
-            key=key_out,
-            e_estimate=jnp.asarray(0.0, dtype=jnp.float64),
-            pop_control_shift=jnp.asarray(0.0, dtype=jnp.float64),
-            walker_fields=_initial_walker_fields_custom(trial_local, trial_state),
-            trial_state=trial_state,
-        )
-    return state, e_sum
-
-
-def _initialize_stochastic_reference_walkers_local(
-    trial: VAFQMCTrial,
-    n_local: int,
-    key: Any,
-    noise: float,
-    device: Any,
-) -> Any:
-    trial_local = _clone_stochastic_trial_for_runtime_init(trial, seed=int(jax.device_get(key)[0]))
-    with jax.default_device(device):
-        walkers, _ = init_walkers(trial_local, n_local, key, noise=noise)
-        walkers = _ensure_complex_walkers(walkers)
-    return walkers
-
-
 def _build_initial_state_custom_multi_stochastic(
     hamil: Hamiltonian,
     trial: VAFQMCTrial,
@@ -835,13 +453,13 @@ def _build_initial_state_custom_multi_stochastic(
 
         with ThreadPoolExecutor(max_workers=n_local_devices) as executor:
             init_ctx_futs = [
-                executor.submit(_build_stochastic_init_context_local, trial, n_local, key_i, dev)
+                executor.submit(trial._build_stochastic_init_context_local, n_local, key_i, dev)
                 for dev, key_i in zip(devices, local_keys)
             ]
             contexts = [f.result() for f in init_ctx_futs]
 
             infer_steps = int(getattr(trial, "init_walkers_infer_steps", 0))
-            infer_pm = _make_stochastic_init_infer_pm(trial) if infer_steps > 0 else None
+            infer_pm = trial._make_stochastic_init_infer_pm() if infer_steps > 0 else None
             if infer_steps > 0 and infer_pm is not None:
                 logger.info(
                     "Starting trial energy inference for %d steps on %d devices",
@@ -849,7 +467,7 @@ def _build_initial_state_custom_multi_stochastic(
                     int(n_devices),
                 )
                 for ii in range(infer_steps):
-                    step_futs = [executor.submit(_sample_stochastic_infer_local, ctx) for ctx in contexts]
+                    step_futs = [executor.submit(trial._sample_stochastic_infer_local, ctx) for ctx in contexts]
                     step_out = [f.result() for f in step_futs]
                     contexts = [x[0] for x in step_out]
                     infer_fields_local = [x[1] for x in step_out]
@@ -867,7 +485,7 @@ def _build_initial_state_custom_multi_stochastic(
                     )
 
             final_futs = [
-                executor.submit(_finalize_stochastic_walkers_local, trial, ctx, n_local, cfg.init_noise)
+                executor.submit(trial._finalize_stochastic_walkers_local, ctx, n_local, cfg.init_noise)
                 for ctx in contexts
             ]
             final_out = [f.result() for f in final_futs]
@@ -883,8 +501,7 @@ def _build_initial_state_custom_multi_stochastic(
 
             runtime_futs = [
                 executor.submit(
-                    _initialize_runtime_state_local,
-                    trial,
+                    trial._initialize_runtime_state_local,
                     hamil,
                     walkers_i,
                     pool_seed_i,
@@ -906,8 +523,7 @@ def _build_initial_state_custom_multi_stochastic(
         with ThreadPoolExecutor(max_workers=n_local_devices) as executor:
             walkers_futs = [
                 executor.submit(
-                    _initialize_stochastic_reference_walkers_local,
-                    trial,
+                    trial._initialize_stochastic_reference_walkers_local,
                     n_local,
                     key_i,
                     cfg.init_noise,
@@ -926,8 +542,7 @@ def _build_initial_state_custom_multi_stochastic(
 
             runtime_futs = [
                 executor.submit(
-                    _initialize_runtime_state_local,
-                    trial,
+                    trial._initialize_runtime_state_local,
                     hamil,
                     walkers_i,
                     None,
@@ -971,7 +586,7 @@ def _build_initial_state_custom(
     prop_data = build_propagation_data(hamil, trial, cfg.dt)
     key = jax.random.PRNGKey(cfg.seed)
     walkers, key = init_walkers(trial, cfg.n_walkers, key, noise=cfg.init_noise)
-    walkers = _ensure_complex_walkers(walkers)
+    walkers = ensure_complex_walkers(walkers)
 
     trial_state, key = _bind_trial_runtime_state_custom(trial, walkers, key)
     sign, logov = _calc_trial_overlap_custom(trial, walkers, trial_state)
@@ -1026,10 +641,9 @@ def _run_steps_with_pop_control_custom(
     do_resample: bool,
     trial: Any,
     label: str,
-) -> tuple[AFQMCState, int, dict[str, float]]:
+) -> tuple[AFQMCState, int]:
     steps_done = 0
     local_step = 0
-    summary = _init_pop_summary()
     while steps_done < n_steps:
         if pop_freq > 0:
             to_pop = pop_freq - (step_counter % pop_freq)
@@ -1041,9 +655,8 @@ def _run_steps_with_pop_control_custom(
         steps_done += nrun
         local_step += nrun
         if do_resample and pop_freq > 0 and step_counter % pop_freq == 0:
-            _update_pop_summary(summary, state)
             state = _resample_state_custom(trial, state)
-    return state, step_counter, summary
+    return state, step_counter
 
 
 def _run_custom_equilibration(
@@ -1073,7 +686,7 @@ def _run_custom_equilibration(
     while eq_done < cfg.n_eq_steps:
         nrun = min(eq_chunk, cfg.n_eq_steps - eq_done)
         if pop_freq > 0:
-            state, step_counter, _ = _run_steps_with_pop_control_custom(
+            state, step_counter = _run_steps_with_pop_control_custom(
                 state,
                 runner,
                 n_steps=nrun,
@@ -1088,8 +701,8 @@ def _run_custom_equilibration(
         eq_done += nrun
         if measure_equil_energy:
             e_mix = _calc_mixed_energy_custom(hamil, trial, state)
-            state = _update_e_estimate(state, e_mix)
-            state = _relax_pop_control_shift(state, e_mix)
+            state = update_e_estimate(state, e_mix)
+            state = relax_pop_control_shift(state, e_mix)
 
         if cfg.resample and pop_freq <= 0:
             state = _resample_state_custom(trial, state)
@@ -1372,9 +985,6 @@ class _CustomScanRunnerMulti:
         if n_steps_i <= 0:
             return state
 
-        if bool(getattr(self.cfg, "multi_gpu_force_step_loop", False)):
-            self.enabled = False
-
         if self.enabled:
             try:
                 state, _ = self._get_scan(n_steps_i)(state, int(step_start))
@@ -1496,7 +1106,7 @@ def _build_initial_state_custom_multi(
     for dev, key_i in zip(devices, local_keys):
         with jax.default_device(dev):
             walkers, key_out = init_walkers(trial, n_local, key_i, noise=cfg.init_noise)
-            walkers = _ensure_complex_walkers(walkers)
+            walkers = ensure_complex_walkers(walkers)
             trial_state, key_out = _bind_trial_runtime_state_custom(trial, walkers, key_out)
             sign, logov = _calc_trial_overlap_custom(trial, walkers, trial_state)
             sign = sign.astype(jnp.complex128)
@@ -1524,7 +1134,10 @@ def _build_initial_state_custom_multi(
     e_estimate = (
         jnp.asarray(float(e_est_init), dtype=jnp.float64)
         if e_est_init is not None
-        else jnp.asarray(host_global_sum(e_sum_local, devices) / float(cfg.n_walkers), dtype=jnp.float64)
+        else jnp.asarray(
+            host_global_sum(e_sum_local, devices) / float(cfg.n_walkers),
+            dtype=jnp.float64,
+        )
     )
     local_states = [
         AFQMCState(
@@ -1543,99 +1156,32 @@ def _build_initial_state_custom_multi(
     return prop_data, shard_local_pytrees(local_states, devices), n_devices, n_local
 
 
-def _update_pop_summary_host(summary: dict[str, float], state: AFQMCState, pop_stats_fn: Any) -> None:
-    n_zero_rep, wsum_rep = pop_stats_fn(state)
-    n_zero = float(host_replicated_value(n_zero_rep))
-    wsum = float(host_replicated_value(wsum_rep))
-    summary["events"] += 1.0
-    summary["n_zero_sum"] += n_zero
-    summary["n_zero_max"] = max(summary["n_zero_max"], n_zero)
-    summary["wsum_min"] = min(summary["wsum_min"], wsum)
-    summary["wsum_max"] = max(summary["wsum_max"], wsum)
-
-
-def _block_ready_tree(x: Any) -> Any:
-    return tree_map(lambda y: y.block_until_ready() if hasattr(y, "block_until_ready") else y, x)
-
-
 def _run_steps_with_pop_control_custom_multi(
     state: AFQMCState,
     runner: _CustomScanRunnerMulti,
-    pop_stats_fn: Any,
     resample_fn: Any,
     *,
     n_steps: int,
     step_counter: int,
     pop_freq: int,
     do_resample: bool,
-    collect_summary: bool,
-    trial: Any,
     label: str,
-    logger: logging.Logger | None = None,
-    debug_trace: bool = False,
-) -> tuple[AFQMCState, int, dict[str, float]]:
+) -> tuple[AFQMCState, int]:
     steps_done = 0
     local_step = 0
-    summary = _init_pop_summary()
-    proc = int(jax.process_index()) if debug_trace else 0
     while steps_done < n_steps:
         if pop_freq > 0:
             to_pop = pop_freq - (step_counter % pop_freq)
             nrun = min(n_steps - steps_done, to_pop)
         else:
             nrun = n_steps - steps_done
-        if debug_trace and logger is not None:
-            logger.info(
-                "Trace proc=%d %s chunk-start: steps_done=%d/%d step_counter=%d local_step=%d nrun=%d do_resample=%s",
-                int(proc),
-                label,
-                int(steps_done),
-                int(n_steps),
-                int(step_counter),
-                int(local_step),
-                int(nrun),
-                str(bool(do_resample)),
-            )
         state = runner.run_steps(state, nrun, label, step_start=local_step)
-        if debug_trace:
-            _ = _block_ready_tree(state.weights)
-        if debug_trace and logger is not None:
-            logger.info(
-                "Trace proc=%d %s chunk-done: steps_done=%d/%d step_counter=%d local_step=%d nrun=%d",
-                int(proc),
-                label,
-                int(steps_done + nrun),
-                int(n_steps),
-                int(step_counter + nrun),
-                int(local_step + nrun),
-                int(nrun),
-            )
         step_counter += nrun
         steps_done += nrun
         local_step += nrun
         if do_resample and pop_freq > 0 and step_counter % pop_freq == 0:
-            if collect_summary:
-                _update_pop_summary_host(summary, state, pop_stats_fn)
-            if debug_trace and logger is not None:
-                logger.info(
-                    "Trace proc=%d %s resample-start: step_counter=%d pop_freq=%d",
-                    int(proc),
-                    label,
-                    int(step_counter),
-                    int(pop_freq),
-                )
             state = resample_fn(state)
-            if debug_trace:
-                _ = _block_ready_tree(state.weights)
-            if debug_trace and logger is not None:
-                logger.info(
-                    "Trace proc=%d %s resample-done: step_counter=%d pop_freq=%d",
-                    int(proc),
-                    label,
-                    int(step_counter),
-                    int(pop_freq),
-                )
-    return state, step_counter, summary
+    return state, step_counter
 
 
 def _run_custom_equilibration_multi(
@@ -1650,20 +1196,11 @@ def _run_custom_equilibration_multi(
     log_enabled = bool(getattr(cfg, "log_enabled", True))
     eq_freq = int(getattr(cfg, "log_equil_freq", 0))
     log_eq = bool(log_enabled and eq_freq > 0)
-    debug_trace = bool(getattr(cfg, "log_equil_debug_trace", False))
     sync_eq_wsum = bool(eq_freq > 0)
-    proc = int(jax.process_index()) if debug_trace else 0
     eq_chunk = max(eq_freq, 1) if eq_freq > 0 else int(cfg.n_eq_steps)
 
     global_wsum_fn = jax.pmap(
         lambda st: lax.psum(jnp.sum(st.weights), PMAP_AXIS_NAME),
-        axis_name=PMAP_AXIS_NAME,
-    )
-    pop_stats_fn = jax.pmap(
-        lambda st: (
-            lax.psum(jnp.sum(jnp.real(st.weights) <= 0.0), PMAP_AXIS_NAME),
-            lax.psum(jnp.sum(st.weights), PMAP_AXIS_NAME),
-        ),
         axis_name=PMAP_AXIS_NAME,
     )
     resample_fn = jax.pmap(
@@ -1683,30 +1220,12 @@ def _run_custom_equilibration_multi(
         ),
         axis_name=PMAP_AXIS_NAME,
     )
-    mixed_energy_terms_fn = None
-    mixed_energy_reduce_fn = None
-    if debug_trace:
-        mixed_energy_terms_fn = jax.pmap(
-            lambda st: _calc_mixed_energy_terms_custom_multi(
-                hamil,
-                trial,
-                st,
-            ),
-            axis_name=PMAP_AXIS_NAME,
-        )
-        mixed_energy_reduce_fn = jax.pmap(
-            lambda num, den: (
-                lax.psum(num, PMAP_AXIS_NAME),
-                jnp.maximum(lax.psum(den, PMAP_AXIS_NAME), 1.0e-12),
-            ),
-            axis_name=PMAP_AXIS_NAME,
-        )
     update_e_fn = jax.pmap(
-        lambda st, e_blk: _update_e_estimate(st, e_blk),
+        lambda st, e_blk: update_e_estimate(st, e_blk),
         in_axes=(0, None),
     )
     update_shift_fn = jax.pmap(
-        lambda st, e_blk: _relax_pop_control_shift(st, e_blk),
+        lambda st, e_blk: relax_pop_control_shift(st, e_blk),
         in_axes=(0, None),
     )
 
@@ -1723,117 +1242,27 @@ def _run_custom_equilibration_multi(
     while eq_done < cfg.n_eq_steps:
         nrun = min(eq_chunk, cfg.n_eq_steps - eq_done)
         if pop_freq > 0:
-            state, step_counter, _ = _run_steps_with_pop_control_custom_multi(
+            state, step_counter = _run_steps_with_pop_control_custom_multi(
                 state,
                 runner,
-                pop_stats_fn,
                 resample_fn,
                 n_steps=nrun,
                 step_counter=step_counter,
                 pop_freq=pop_freq,
                 do_resample=bool(cfg.resample),
-                collect_summary=False,
-                trial=trial,
                 label="eql",
-                logger=logger,
-                debug_trace=debug_trace,
             )
         else:
-            if debug_trace:
-                logger.info(
-                    "Trace proc=%d eql chunk-start: steps_done=%d/%d nrun=%d mode=no-pop-control",
-                    int(proc),
-                    int(eq_done),
-                    int(cfg.n_eq_steps),
-                    int(nrun),
-                )
             state = runner.run_steps(state, nrun, "eql")
-            if debug_trace:
-                _ = _block_ready_tree(state.weights)
-            if debug_trace:
-                logger.info(
-                    "Trace proc=%d eql chunk-done: steps_done=%d/%d nrun=%d mode=no-pop-control",
-                    int(proc),
-                    int(eq_done + nrun),
-                    int(cfg.n_eq_steps),
-                    int(nrun),
-                )
         eq_done += nrun
         if measure_equil_energy:
-            if debug_trace and mixed_energy_terms_fn is not None and mixed_energy_reduce_fn is not None:
-                logger.info(
-                    "Trace proc=%d eql mixed-energy-start: eq_done=%d/%d",
-                    int(proc),
-                    int(eq_done),
-                    int(cfg.n_eq_steps),
-                )
-                logger.info(
-                    "Trace proc=%d eql mixed-energy-local-start: eq_done=%d/%d",
-                    int(proc),
-                    int(eq_done),
-                    int(cfg.n_eq_steps),
-                )
-                local_num_rep, local_den_rep = mixed_energy_terms_fn(state)
-                _ = _block_ready_tree((local_num_rep, local_den_rep))
-                logger.info(
-                    "Trace proc=%d eql mixed-energy-local-done: eq_done=%d/%d",
-                    int(proc),
-                    int(eq_done),
-                    int(cfg.n_eq_steps),
-                )
-                logger.info(
-                    "Trace proc=%d eql mixed-energy-reduce-start: eq_done=%d/%d",
-                    int(proc),
-                    int(eq_done),
-                    int(cfg.n_eq_steps),
-                )
-                global_num_rep, global_den_rep = mixed_energy_reduce_fn(local_num_rep, local_den_rep)
-                _ = _block_ready_tree((global_num_rep, global_den_rep))
-                e_mix = float(host_replicated_value(global_num_rep / global_den_rep))
-                logger.info(
-                    "Trace proc=%d eql mixed-energy-reduce-done: eq_done=%d/%d",
-                    int(proc),
-                    int(eq_done),
-                    int(cfg.n_eq_steps),
-                )
-            else:
-                if debug_trace:
-                    logger.info(
-                        "Trace proc=%d eql mixed-energy-start: eq_done=%d/%d",
-                        int(proc),
-                        int(eq_done),
-                        int(cfg.n_eq_steps),
-                    )
-                e_mix_rep = mixed_energy_fn(state)
-                if debug_trace:
-                    _ = _block_ready_tree(e_mix_rep)
-                e_mix = float(host_replicated_value(e_mix_rep))
-            if debug_trace:
-                logger.info(
-                    "Trace proc=%d eql mixed-energy-done: eq_done=%d/%d",
-                    int(proc),
-                    int(eq_done),
-                    int(cfg.n_eq_steps),
-                )
+            e_mix_rep = mixed_energy_fn(state)
+            e_mix = float(host_replicated_value(e_mix_rep))
             state = update_e_fn(state, e_mix)
             state = update_shift_fn(state, e_mix)
 
         if cfg.resample and pop_freq <= 0:
-            if debug_trace:
-                logger.info(
-                    "Trace proc=%d eql resample-start: eq_done=%d/%d",
-                    int(proc),
-                    int(eq_done),
-                    int(cfg.n_eq_steps),
-                )
             state = resample_fn(state)
-            if debug_trace:
-                logger.info(
-                    "Trace proc=%d eql resample-done: eq_done=%d/%d",
-                    int(proc),
-                    int(eq_done),
-                    int(cfg.n_eq_steps),
-                )
 
         wsum = None
         if sync_eq_wsum:
@@ -1908,23 +1337,15 @@ def run_afqmc_custom_multi(
     raw_rows: list[tuple[int, float, float, float, float, float]] = []
     write_raw = bool(getattr(cfg, "output_write_raw", False)) and is_root_process
     raw_path = str(getattr(cfg, "output_raw_path", "raw.dat"))
-    raw_stream: TextIO | None = _open_raw_block_stream(raw_path) if write_raw else None
+    raw_stream: TextIO | None = open_raw_block_stream(raw_path) if write_raw else None
     n_ene_measurements = max(int(getattr(cfg, "n_ene_measurements", 1)), 1)
     pop_freq = int(getattr(cfg, "pop_control_freq", 0))
-    log_pop_stats = bool(getattr(cfg, "pop_control_log_stats", False))
     log_enabled = bool(getattr(cfg, "log_enabled", True))
     block_log_freq = int(getattr(cfg, "log_block_freq", 1))
     step_counter = 0
 
     global_wsum_fn = jax.pmap(
         lambda st: lax.psum(jnp.sum(st.weights), PMAP_AXIS_NAME),
-        axis_name=PMAP_AXIS_NAME,
-    )
-    pop_stats_fn = jax.pmap(
-        lambda st: (
-            lax.psum(jnp.sum(jnp.real(st.weights) <= 0.0), PMAP_AXIS_NAME),
-            lax.psum(jnp.sum(st.weights), PMAP_AXIS_NAME),
-        ),
         axis_name=PMAP_AXIS_NAME,
     )
     resample_fn = jax.pmap(
@@ -1946,11 +1367,11 @@ def run_afqmc_custom_multi(
         axis_name=PMAP_AXIS_NAME,
     )
     update_shift_fn = jax.pmap(
-        lambda st, e_blk: _relax_pop_control_shift(st, e_blk),
+        lambda st, e_blk: relax_pop_control_shift(st, e_blk),
         in_axes=(0, None),
     )
     update_est_fn = jax.pmap(
-        lambda st, e_blk: _update_e_estimate(st, e_blk),
+        lambda st, e_blk: update_e_estimate(st, e_blk),
         in_axes=(0, None),
     )
 
@@ -1958,25 +1379,19 @@ def run_afqmc_custom_multi(
         for blk in range(cfg.n_blocks):
             e_num = 0.0
             e_den = 0.0
-            pop_summary_block = _init_pop_summary()
-            pop_summary_pre_block = _init_pop_summary()
 
             for _ in range(n_ene_measurements):
                 if pop_freq > 0:
-                    state, step_counter, pop_summary = _run_steps_with_pop_control_custom_multi(
+                    state, step_counter = _run_steps_with_pop_control_custom_multi(
                         state,
                         runner,
-                        pop_stats_fn,
                         resample_fn,
                         n_steps=int(cfg.n_block_steps),
                         step_counter=step_counter,
                         pop_freq=pop_freq,
                         do_resample=bool(cfg.resample),
-                        collect_summary=log_pop_stats,
-                        trial=trial,
                         label="block",
                     )
-                    _merge_pop_summary(pop_summary_block, pop_summary)
                 else:
                     state = runner.run_steps(state, cfg.n_block_steps, "block")
                     step_counter += int(cfg.n_block_steps)
@@ -1988,8 +1403,6 @@ def run_afqmc_custom_multi(
                 state = update_shift_fn(state, e_i)
 
             if cfg.resample and pop_freq <= 0:
-                if log_pop_stats:
-                    _update_pop_summary_host(pop_summary_pre_block, state, pop_stats_fn)
                 state = resample_fn(state)
 
             block_energy = e_num / max(e_den, 1.0e-12)
@@ -1998,33 +1411,6 @@ def run_afqmc_custom_multi(
             state = update_est_fn(state, block_energy)
             wsum_now = float(host_replicated_value(global_wsum_fn(state)))
             e_est_now = float(host_replicated_value(state.e_estimate))
-            if log_pop_stats:
-                _merge_pop_summary(pop_summary_block, pop_summary_pre_block)
-                if pop_summary_block["events"] > 0.0:
-                    ev = max(pop_summary_block["events"], 1.0)
-                    logger.info(
-                        "PopCtrl block=%d pre-resample: events=%d n_zero_mean=%.2f n_zero_max=%d "
-                        "wsum_min=%.6e wsum_max=%.6e",
-                        int(blk + 1),
-                        int(pop_summary_block["events"]),
-                        float(pop_summary_block["n_zero_sum"] / ev),
-                        int(pop_summary_block["n_zero_max"]),
-                        float(pop_summary_block["wsum_min"]),
-                        float(pop_summary_block["wsum_max"]),
-                    )
-                else:
-                    summary_now = _init_pop_summary()
-                    _update_pop_summary_host(summary_now, state, pop_stats_fn)
-                    logger.info(
-                        "PopCtrl block=%d pre-resample: events=%d n_zero_mean=%.2f n_zero_max=%d "
-                        "wsum_min=%.6e wsum_max=%.6e",
-                        int(blk + 1),
-                        0,
-                        float(summary_now["n_zero_sum"]),
-                        int(summary_now["n_zero_max"]),
-                        float(summary_now["wsum_min"]),
-                        float(summary_now["wsum_max"]),
-                    )
             row = (
                 int(blk + 1),
                 float(block_energy),
@@ -2035,7 +1421,7 @@ def run_afqmc_custom_multi(
             )
             raw_rows.append(row)
             if raw_stream is not None:
-                _append_raw_block_row(raw_stream, row)
+                append_raw_block_row(raw_stream, row)
             visualizer.update(blk + 1, float(block_energy))
 
             if log_enabled and block_log_freq > 0 and (
@@ -2065,7 +1451,7 @@ def run_afqmc_custom_multi(
         final_state = host_replicated_state(gather_state_fn(state))
     else:
         final_state = state
-    return _finalize_outputs(
+    return finalize_outputs(
         logger,
         start,
         block_energies,
@@ -2104,7 +1490,7 @@ def run_afqmc_custom(
         )
 
     prop_data, state = _build_initial_state_custom(hamil, trial, cfg)
-    _log_init(logger, cfg, state, start)
+    log_init(logger, cfg, state, start)
 
     custom_runner = _CustomScanRunner(hamil, trial, prop_data, cfg, logger)
     state = _run_custom_equilibration(state, custom_runner, hamil, trial, cfg, logger, start)
@@ -2122,10 +1508,9 @@ def run_afqmc_custom(
     raw_rows: list[tuple[int, float, float, float, float, float]] = []
     write_raw = bool(getattr(cfg, "output_write_raw", False))
     raw_path = str(getattr(cfg, "output_raw_path", "raw.dat"))
-    raw_stream: TextIO | None = _open_raw_block_stream(raw_path) if write_raw else None
+    raw_stream: TextIO | None = open_raw_block_stream(raw_path) if write_raw else None
     n_ene_measurements = max(int(getattr(cfg, "n_ene_measurements", 1)), 1)
     pop_freq = int(getattr(cfg, "pop_control_freq", 0))
-    log_pop_stats = bool(getattr(cfg, "pop_control_log_stats", False))
     log_enabled = bool(getattr(cfg, "log_enabled", True))
     block_log_freq = int(getattr(cfg, "log_block_freq", 1))
     step_counter = 0
@@ -2134,12 +1519,10 @@ def run_afqmc_custom(
         for blk in range(cfg.n_blocks):
             e_num = jnp.asarray(0.0, dtype=jnp.float64)
             e_den = jnp.asarray(0.0, dtype=jnp.float64)
-            pop_summary_block = _init_pop_summary()
-            pop_summary_pre_block = _init_pop_summary()
 
             for _ in range(n_ene_measurements):
                 if pop_freq > 0:
-                    state, step_counter, pop_summary = _run_steps_with_pop_control_custom(
+                    state, step_counter = _run_steps_with_pop_control_custom(
                         state,
                         custom_runner,
                         n_steps=int(cfg.n_block_steps),
@@ -2149,7 +1532,6 @@ def run_afqmc_custom(
                         trial=trial,
                         label="block",
                     )
-                    _merge_pop_summary(pop_summary_block, pop_summary)
                 else:
                     state = custom_runner.run_steps(state, cfg.n_block_steps, "block")
                     step_counter += int(cfg.n_block_steps)
@@ -2157,32 +1539,15 @@ def run_afqmc_custom(
                 w_i = jnp.maximum(jnp.sum(state.weights), 1.0e-12)
                 e_num = e_num + w_i * e_i
                 e_den = e_den + w_i
-                state = _relax_pop_control_shift(state, e_i)
+                state = relax_pop_control_shift(state, e_i)
 
             if cfg.resample and pop_freq <= 0:
-                _update_pop_summary(pop_summary_pre_block, state)
                 state = _resample_state_custom(trial, state)
 
             block_energy = e_num / jnp.maximum(e_den, 1.0e-12)
             block_energies.append(block_energy)
             block_weights.append(e_den)
-            state = _update_e_estimate(state, block_energy)
-            if log_pop_stats:
-                _merge_pop_summary(pop_summary_block, pop_summary_pre_block)
-                if pop_summary_block["events"] > 0.0:
-                    ev = max(pop_summary_block["events"], 1.0)
-                    logger.info(
-                        "PopCtrl block=%d pre-resample: events=%d n_zero_mean=%.2f n_zero_max=%d "
-                        "wsum_min=%.6e wsum_max=%.6e",
-                        int(blk + 1),
-                        int(pop_summary_block["events"]),
-                        float(pop_summary_block["n_zero_sum"] / ev),
-                        int(pop_summary_block["n_zero_max"]),
-                        float(pop_summary_block["wsum_min"]),
-                        float(pop_summary_block["wsum_max"]),
-                    )
-                else:
-                    _log_pop_control_stats(logger, state, f"block={blk + 1}")
+            state = update_e_estimate(state, block_energy)
             row = (
                 int(blk + 1),
                 float(block_energy),
@@ -2193,7 +1558,7 @@ def run_afqmc_custom(
             )
             raw_rows.append(row)
             if raw_stream is not None:
-                _append_raw_block_row(raw_stream, row)
+                append_raw_block_row(raw_stream, row)
             visualizer.update(blk + 1, float(block_energy))
 
             if log_enabled and block_log_freq > 0 and (
@@ -2215,7 +1580,7 @@ def run_afqmc_custom(
     if write_raw:
         logger.info("Saved AFQMC raw block data: %s", raw_path)
 
-    return _finalize_outputs(
+    return finalize_outputs(
         logger,
         start,
         block_energies,

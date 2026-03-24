@@ -24,7 +24,6 @@ cfg.propagation.ortho_freq = 10
 cfg.log.enabled = True
 cfg.log.block_freq = 1
 cfg.log.equil_freq = 40
-cfg.log.pop_control_stats = False
 
 # ---------------------------------------------------------------------------
 # Output files

@@ -14,6 +14,7 @@ from ...hamiltonian import Hamiltonian
 from ...propagator import orthonormalize
 from ..afqmc_config import AFQMCConfig
 from ..utils import (
+    PMAP_AXIS_NAME,
     PropagationData,
     analyze_energy_blocks,
     apply_trotter,
@@ -21,12 +22,6 @@ from ..utils import (
     calc_local_energy_batch,
     calc_rdm_batch,
     calc_slov_batch,
-    _spin_sum_rdm,
-)
-from ..utils.visualization import build_energy_visualizer
-from ..walker import AFQMCState, init_walkers, stochastic_reconfiguration
-from .multi_gpu import (
-    PMAP_AXIS_NAME,
     distributed_stochastic_reconfiguration,
     host_gather_state,
     host_global_sum,
@@ -36,17 +31,22 @@ from .multi_gpu import (
     replicate_state,
     require_local_devices,
     shard_local_pytrees,
+    _spin_sum_rdm,
 )
+from ..utils.visualization import build_energy_visualizer
+from ..walker import AFQMCState, init_walkers, stochastic_reconfiguration
 
 
-def _ensure_complex_walkers(walkers: Any) -> Any:
-    if isinstance(walkers, tuple) and len(walkers) == 2:
+def ensure_complex_walkers(walkers: Any) -> Any:
+    if isinstance(walkers, (tuple, list)) and len(walkers) == 2:
         w_up, w_dn = walkers
         return (w_up.astype(jnp.complex128), w_dn.astype(jnp.complex128))
+    if isinstance(walkers, jnp.ndarray):
+        return walkers.astype(jnp.complex128)
     return walkers
 
 
-def _log_init(logger: logging.Logger, cfg: AFQMCConfig, state: AFQMCState, start: float) -> None:
+def log_init(logger: logging.Logger, cfg: AFQMCConfig, state: AFQMCState, start: float) -> None:
     logger.info(
         "AFQMC init: dt=%.4g walkers=%d blocks=%d ene_measurements=%d block_steps=%d meas_samples=%d pop_freq=%d",
         cfg.dt,
@@ -60,7 +60,7 @@ def _log_init(logger: logging.Logger, cfg: AFQMCConfig, state: AFQMCState, start
     logger.info("Init e_est=%.12f elapsed=%.2fs", float(state.e_estimate), time.time() - start)
 
 
-def _update_e_estimate(state: AFQMCState, block_energy: Any) -> AFQMCState:
+def update_e_estimate(state: AFQMCState, block_energy: Any) -> AFQMCState:
     return AFQMCState(
         walkers=state.walkers,
         weights=state.weights,
@@ -74,7 +74,7 @@ def _update_e_estimate(state: AFQMCState, block_energy: Any) -> AFQMCState:
     )
 
 
-def _relax_pop_control_shift(state: AFQMCState, block_energy: Any) -> AFQMCState:
+def relax_pop_control_shift(state: AFQMCState, block_energy: Any) -> AFQMCState:
     return AFQMCState(
         walkers=state.walkers,
         weights=state.weights,
@@ -88,7 +88,7 @@ def _relax_pop_control_shift(state: AFQMCState, block_energy: Any) -> AFQMCState
     )
 
 
-def _finalize_outputs(
+def finalize_outputs(
     logger: logging.Logger,
     start: float,
     block_energies: list[Any],
@@ -121,19 +121,7 @@ def _finalize_outputs(
     return e_mean, e_err
 
 
-def _write_raw_block_data(path: str, rows: list[tuple[int, float, float, float, float, float]]) -> None:
-    p = Path(path)
-    if p.parent and str(p.parent) != "":
-        p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", encoding="utf-8") as f:
-        f.write("# block e_blk e_est wsum block_weight elapsed_s\n")
-        for blk, e_blk, e_est, wsum, wblk, elapsed in rows:
-            f.write(
-                f"{blk:d} {e_blk:.16e} {e_est:.16e} {wsum:.16e} {wblk:.16e} {elapsed:.6f}\n"
-            )
-
-
-def _open_raw_block_stream(path: str) -> TextIO:
+def open_raw_block_stream(path: str) -> TextIO:
     p = Path(path)
     if p.parent and str(p.parent) != "":
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -143,7 +131,7 @@ def _open_raw_block_stream(path: str) -> TextIO:
     return f
 
 
-def _append_raw_block_row(
+def append_raw_block_row(
     f: TextIO, row: tuple[int, float, float, float, float, float]
 ) -> None:
     blk, e_blk, e_est, wsum, wblk, elapsed = row
@@ -284,7 +272,7 @@ def _build_initial_state_det(
     prop_data = build_propagation_data(hamil, trial, cfg.dt)
     key = jax.random.PRNGKey(cfg.seed)
     walkers, key = init_walkers(trial, cfg.n_walkers, key, noise=cfg.init_noise)
-    walkers = _ensure_complex_walkers(walkers)
+    walkers = ensure_complex_walkers(walkers)
 
     sign, logov = calc_slov_batch(trial, walkers)
     sign = sign.astype(jnp.complex128)
@@ -433,8 +421,8 @@ def _run_det_equilibration(
 
         if measure_equil_energy:
             e_mix = _measure_block_energy_det(hamil, trial, state, cfg)
-            state = _update_e_estimate(state, e_mix)
-            state = _relax_pop_control_shift(state, e_mix)
+            state = update_e_estimate(state, e_mix)
+            state = relax_pop_control_shift(state, e_mix)
 
         if cfg.resample and pop_freq <= 0:
             state = _resample_state_det(trial, state)
@@ -620,7 +608,7 @@ def _build_initial_state_det_multi(
     for dev, key_i in zip(devices, local_keys):
         with jax.default_device(dev):
             walkers, key_out = init_walkers(trial, n_local, key_i, noise=cfg.init_noise)
-            walkers = _ensure_complex_walkers(walkers)
+            walkers = ensure_complex_walkers(walkers)
             sign, logov = calc_slov_batch(trial, walkers)
             sign = sign.astype(jnp.complex128)
             logov = logov.astype(jnp.float64)
@@ -754,7 +742,7 @@ def _run_det_equilibration_multi(
         axis_name=PMAP_AXIS_NAME,
     )
     update_fn = jax.pmap(
-        lambda st, e_blk: _relax_pop_control_shift(_update_e_estimate(st, e_blk), e_blk),
+        lambda st, e_blk: relax_pop_control_shift(update_e_estimate(st, e_blk), e_blk),
         in_axes=(0, None),
     )
 
@@ -929,11 +917,11 @@ def run_afqmc_det_multi(
         axis_name=PMAP_AXIS_NAME,
     )
     update_shift_fn = jax.pmap(
-        lambda st, e_blk: _relax_pop_control_shift(st, e_blk),
+        lambda st, e_blk: relax_pop_control_shift(st, e_blk),
         in_axes=(0, None),
     )
     update_est_fn = jax.pmap(
-        lambda st, e_blk: _update_e_estimate(st, e_blk),
+        lambda st, e_blk: update_e_estimate(st, e_blk),
         in_axes=(0, None),
     )
 
@@ -942,7 +930,7 @@ def run_afqmc_det_multi(
     raw_rows: list[tuple[int, float, float, float, float, float]] = []
     write_raw = bool(getattr(cfg, "output_write_raw", False)) and is_root_process
     raw_path = str(getattr(cfg, "output_raw_path", "raw.dat"))
-    raw_stream: TextIO | None = _open_raw_block_stream(raw_path) if write_raw else None
+    raw_stream: TextIO | None = open_raw_block_stream(raw_path) if write_raw else None
     n_ene_measurements = max(int(getattr(cfg, "n_ene_measurements", 1)), 1)
     pop_freq = int(getattr(cfg, "pop_control_freq", 0))
     log_enabled = bool(getattr(cfg, "log_enabled", True))
@@ -996,7 +984,7 @@ def run_afqmc_det_multi(
             )
             raw_rows.append(row)
             if raw_stream is not None:
-                _append_raw_block_row(raw_stream, row)
+                append_raw_block_row(raw_stream, row)
             visualizer.update(blk + 1, float(block_energy))
 
             if log_enabled and block_log_freq > 0 and (
@@ -1026,7 +1014,7 @@ def run_afqmc_det_multi(
         final_state = host_replicated_state(gather_state_fn(state))
     else:
         final_state = state
-    return _finalize_outputs(
+    return finalize_outputs(
         logger,
         start,
         block_energies,
@@ -1065,7 +1053,7 @@ def run_afqmc_det(
         )
 
     prop_data, state = _build_initial_state_det(hamil, trial, cfg)
-    _log_init(logger, cfg, state, start)
+    log_init(logger, cfg, state, start)
 
     state = _run_det_equilibration(state, hamil, trial, prop_data, cfg, logger, start)
     visualizer = build_energy_visualizer(
@@ -1119,7 +1107,7 @@ def run_afqmc_det(
     raw_rows: list[tuple[int, float, float, float, float, float]] = []
     write_raw = bool(getattr(cfg, "output_write_raw", False))
     raw_path = str(getattr(cfg, "output_raw_path", "raw.dat"))
-    raw_stream: TextIO | None = _open_raw_block_stream(raw_path) if write_raw else None
+    raw_stream: TextIO | None = open_raw_block_stream(raw_path) if write_raw else None
     n_ene_measurements = max(int(getattr(cfg, "n_ene_measurements", 1)), 1)
     pop_freq = int(getattr(cfg, "pop_control_freq", 0))
     log_enabled = bool(getattr(cfg, "log_enabled", True))
@@ -1151,7 +1139,7 @@ def run_afqmc_det(
                 w_i = jnp.maximum(jnp.sum(state.weights), 1.0e-12)
                 e_num = e_num + w_i * e_i
                 e_den = e_den + w_i
-                state = _relax_pop_control_shift(state, e_i)
+                state = relax_pop_control_shift(state, e_i)
 
             if cfg.resample and pop_freq <= 0:
                 state = _resample_state_det(trial, state)
@@ -1159,7 +1147,7 @@ def run_afqmc_det(
             block_energy = e_num / jnp.maximum(e_den, 1.0e-12)
             block_energies.append(block_energy)
             block_weights.append(e_den)
-            state = _update_e_estimate(state, block_energy)
+            state = update_e_estimate(state, block_energy)
             row = (
                 int(blk + 1),
                 float(block_energy),
@@ -1170,7 +1158,7 @@ def run_afqmc_det(
             )
             raw_rows.append(row)
             if raw_stream is not None:
-                _append_raw_block_row(raw_stream, row)
+                append_raw_block_row(raw_stream, row)
             visualizer.update(blk + 1, float(block_energy))
 
             if log_enabled and block_log_freq > 0 and (
@@ -1192,7 +1180,7 @@ def run_afqmc_det(
     if write_raw:
         logger.info("Saved AFQMC raw block data: %s", raw_path)
 
-    return _finalize_outputs(
+    return finalize_outputs(
         logger,
         start,
         block_energies,

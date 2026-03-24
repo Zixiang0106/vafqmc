@@ -42,7 +42,6 @@ def _get_logger(logger: Optional[logging.Logger] = None) -> logging.Logger:
 
 
 def _configure_process_local_runtime(
-    cfg_user: ConfigDict,
     cfg_runtime: ConfigDict,
     logger: logging.Logger,
 ) -> int:
@@ -52,8 +51,7 @@ def _configure_process_local_runtime(
         cfg_runtime.output_write_hparams = False
         cfg_runtime.output_write_raw = False
         cfg_runtime.output_visualization_enabled = False
-        if not bool(getattr(cfg_runtime, "log_equil_debug_trace", False)):
-            logger.disabled = True
+        logger.disabled = True
     return process_index
 
 
@@ -115,8 +113,6 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
         p.e_estimate_init = out.e_estimate_init
     if "multi_gpu" in out:
         p.multi_gpu = out.multi_gpu
-    if "multi_gpu_force_step_loop" in out:
-        p.multi_gpu_force_step_loop = out.multi_gpu_force_step_loop
     if "ortho_freq" in out:
         p.ortho_freq = out.ortho_freq
 
@@ -126,8 +122,6 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
         pop.resample = out.resample
     if "pop_control_freq" in out:
         pop.freq = out.pop_control_freq
-    if "pop_control_log_stats" in out:
-        lg.pop_control_stats = out.pop_control_log_stats
     if "min_weight" in out:
         pop.min_weight = out.min_weight
     if "max_weight" in out:
@@ -157,8 +151,6 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
         lg.block_freq = out.log_block_freq
     if "log_equil_freq" in out:
         lg.equil_freq = out.log_equil_freq
-    if "log_equil_debug_trace" in out:
-        lg.equil_debug_trace = out.log_equil_debug_trace
     # Backward-compatible top-level visualization aliases.
     if "visualization" in out:
         vis.enabled = out.visualization
@@ -201,18 +193,15 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
     out.measure_equil_energy = bool(p.get("measure_equil_energy", True))
     out.e_estimate_init = p.get("e_estimate_init", None)
     out.multi_gpu = bool(p.get("multi_gpu", False))
-    out.multi_gpu_force_step_loop = bool(p.get("multi_gpu_force_step_loop", False))
     out.ortho_freq = int(p.ortho_freq)
 
     out.log_enabled = bool(lg.get("enabled", True))
     out.log_block_freq = int(lg.get("block_freq", 1))
     out.log_equil_freq = int(lg.get("equil_freq", 0))
-    out.log_equil_debug_trace = bool(lg.get("equil_debug_trace", False))
 
     out.init_noise = float(pop.init_noise)
     out.resample = bool(pop.resample)
     out.pop_control_freq = int(pop.get("freq", 0))
-    out.pop_control_log_stats = bool(lg.get("pop_control_stats", False))
     out.min_weight = float(pop.min_weight)
     out.max_weight = float(pop.max_weight)
     out.output_write_raw = bool(otp.get("write_raw", False))
@@ -333,7 +322,7 @@ def afqmc_energy(
     logger = _get_logger(logger)
     if bool(getattr(cfg_runtime, "multi_gpu", False)):
         maybe_initialize_distributed(logger)
-        process_index = _configure_process_local_runtime(cfg_user, cfg_runtime, logger)
+        process_index = _configure_process_local_runtime(cfg_runtime, logger)
         if process_index == 0:
             logger.info(
                 "AFQMC distributed runtime: total_devices=%d local_devices=%d processes=%d",

@@ -2,22 +2,38 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 import logging
 
 import jax
-from jax import numpy as jnp
+from jax import lax, numpy as jnp
 from jax.tree_util import tree_leaves, tree_map
 
 from ...hamiltonian import calc_rdm, calc_slov
+from ...propagator import orthonormalize
 from ...sampler import choose_sampler_maker, make_batched
 from ..utils import (
+    PMAP_AXIS_NAME,
     _spin_sum_rdm,
     gaussian_logdens,
     mix_overlap_terms as _mix_overlap_terms,
 )
+from ..walker import AFQMCState, init_walkers
 
 Array = jnp.ndarray
+
+
+@dataclass
+class _StochasticInitContext:
+    device: Any
+    root_key: Any
+    stage_key: Any
+    walker_sampler: Any
+    sampler_params: Any
+    sample_state: Any
+    infer_state: Any
+    chains_per_walker: int
 
 
 def _build_logdens(self):
@@ -285,15 +301,301 @@ def _sample_walkers_from_trial(self, n_walkers: int, key: Array) -> Any:
     )
     if isinstance(walkers, (tuple, list)) and len(walkers) == 2:
         walkers = (walkers[0], walkers[1])
-        return walkers
+    return walkers
 
-    walkers_arr = jnp.asarray(walkers)
-    if walkers_arr.ndim != 3:
-        raise ValueError(
-            "init_walkers_from_trial got unsupported ansatz output shape "
-            f"{walkers_arr.shape}; expected spin-separated tuple/list or 3D GHF array."
+
+def _clone_stochastic_trial_for_runtime_init(self, *, seed: int):
+    from .stochastic import VAFQMCTrial
+
+    return VAFQMCTrial(
+        self.ansatz,
+        self.params,
+        hamiltonian=getattr(self, "_hamiltonian", None),
+        reference_wfn=self.reference_wfn,
+        n_samples=int(self.n_samples),
+        burn_in=int(self.burn_in),
+        sampler_name=str(self._sampler_name),
+        sampler_kwargs=dict(getattr(self, "_sampler_kwargs", {}) or {}),
+        sampling_target=str(self.sampling_target),
+        logdens_floor=float(self.logdens_floor),
+        sample_update_steps=int(self.sample_update_steps),
+        local_energy_chunk_size=int(self.local_energy_chunk_size),
+        init_walkers_from_trial=bool(self.init_walkers_from_trial),
+        init_walkers_burn_in=int(self.init_walkers_burn_in),
+        init_walkers_chains_per_walker=int(self.init_walkers_chains_per_walker),
+        init_walkers_infer_steps=int(self.init_walkers_infer_steps),
+        max_prop=self.max_prop,
+        seed=int(seed),
+    )
+
+
+def _make_stochastic_init_infer_pm(self):
+    hamil = getattr(self, "_hamiltonian", None)
+    if hamil is None:
+        return None
+
+    apply_ansatz = jax.vmap(lambda f: self.ansatz.apply(self.params, f))
+    eval_eloc = jax.vmap(lambda b, k: hamil.local_energy(b, k))
+    eval_slov = jax.vmap(lambda b, k: calc_slov(b, k))
+    floor = float(getattr(self, "logdens_floor", -60.0))
+    local_chunk = int(getattr(self, "local_energy_chunk_size", 0))
+    chunk = int(local_chunk * int(getattr(self, "n_samples", 1))) if local_chunk > 0 else 0
+
+    def infer_pm(fields_pair_local: Any, logsw_local: Any):
+        bra_fields = tree_map(lambda x: x[:, 0], fields_pair_local)
+        ket_fields = tree_map(lambda x: x[:, 1], fields_pair_local)
+        bra, bra_lw = apply_ansatz(bra_fields)
+        ket, ket_lw = apply_ansatz(ket_fields)
+        n_local_walkers = int(tree_leaves(ket)[0].shape[0])
+
+        if chunk <= 0 or chunk >= n_local_walkers:
+            eloc = eval_eloc(bra, ket)
+            sign, logabs = eval_slov(bra, ket)
+        else:
+            eloc_chunks = []
+            sign_chunks = []
+            logabs_chunks = []
+            for start in range(0, n_local_walkers, chunk):
+                end = min(start + chunk, n_local_walkers)
+                bra_c = tree_map(lambda x: x[start:end], bra)
+                ket_c = tree_map(lambda x: x[start:end], ket)
+                eloc_chunks.append(eval_eloc(bra_c, ket_c))
+                sign_c, logabs_c = eval_slov(bra_c, ket_c)
+                sign_chunks.append(sign_c)
+                logabs_chunks.append(logabs_c)
+            eloc = jnp.concatenate(eloc_chunks, axis=0)
+            sign = jnp.concatenate(sign_chunks, axis=0)
+            logabs = jnp.concatenate(logabs_chunks, axis=0)
+
+        logov = logabs + bra_lw + ket_lw
+        dlog = jnp.real(logov - logsw_local)
+        dlog = jnp.where(jnp.isfinite(dlog), dlog, floor)
+        dmax = lax.pmax(jnp.max(dlog), PMAP_AXIS_NAME)
+        rel_w = jnp.exp(dlog - dmax)
+
+        global_wsum = jnp.maximum(lax.psum(jnp.sum(rel_w), PMAP_AXIS_NAME), 1.0e-12)
+        global_es_num = lax.psum(jnp.sum((eloc * sign) * rel_w), PMAP_AXIS_NAME)
+        global_s_num = lax.psum(jnp.sum(sign * rel_w), PMAP_AXIS_NAME)
+
+        exp_es = global_es_num / global_wsum
+        exp_s = global_s_num / global_wsum
+        denom = jnp.real(exp_s)
+        etot = jnp.where(jnp.abs(denom) > 1.0e-12, jnp.real(exp_es) / denom, jnp.nan)
+        return jnp.real(etot), jnp.real(exp_es), jnp.real(exp_s)
+
+    return jax.pmap(infer_pm, axis_name=PMAP_AXIS_NAME)
+
+
+def _build_stochastic_init_context_local(self, n_local: int, key: Any, device: Any):
+    chains_per_walker = int(getattr(self, "init_walkers_chains_per_walker", 0))
+    if chains_per_walker <= 0:
+        chains_per_walker = int(self.n_samples)
+    n_init_chains = int(n_local * chains_per_walker)
+
+    pair_fields_shape = tree_map(
+        lambda s: jnp.asarray((2, *tuple(map(int, jnp.asarray(s).reshape(-1).tolist())))),
+        self.fields_shape,
+    )
+
+    def pair_logdens(params: Any, fields_pair: Any) -> Array:
+        bra_fields = tree_map(lambda x: x[0], fields_pair)
+        ket_fields = tree_map(lambda x: x[1], fields_pair)
+        bra, bra_lw = self.ansatz.apply(params, bra_fields)
+        ket, ket_lw = self.ansatz.apply(params, ket_fields)
+        _sign, logov = calc_slov(bra, ket)
+        logd = jnp.real(logov + bra_lw + ket_lw)
+        return jnp.where(jnp.isfinite(logd), logd, self.logdens_floor)
+
+    init_sampler = choose_sampler_maker(str(self._sampler_name))(
+        pair_logdens,
+        pair_fields_shape,
+        **dict(getattr(self, "_sampler_kwargs", {}) or {}),
+    )
+    walker_sampler = make_batched(init_sampler, n_init_chains, concat=False)
+    sampler_params = self.params
+
+    with jax.default_device(device):
+        stage_key, init_key = jax.random.split(key)
+        sample_state = walker_sampler.init(init_key, sampler_params)
+        if int(self.init_walkers_burn_in) > 0:
+            stage_key, burn_key = jax.random.split(stage_key)
+            sample_state = walker_sampler.burn_in(
+                burn_key,
+                sampler_params,
+                sample_state,
+                int(self.init_walkers_burn_in),
+            )
+
+    return _StochasticInitContext(
+        device=device,
+        root_key=key,
+        stage_key=stage_key,
+        walker_sampler=walker_sampler,
+        sampler_params=sampler_params,
+        sample_state=sample_state,
+        infer_state=sample_state,
+        chains_per_walker=chains_per_walker,
+    )
+
+
+def _sample_stochastic_infer_local(self, ctx: _StochasticInitContext):
+    with jax.default_device(ctx.device):
+        stage_key, infer_key = jax.random.split(ctx.stage_key)
+        infer_state, (infer_fields, infer_logsw) = ctx.walker_sampler.sample(
+            infer_key,
+            ctx.sampler_params,
+            ctx.infer_state,
         )
-    return walkers_arr
+    return (
+        _StochasticInitContext(
+            device=ctx.device,
+            root_key=ctx.root_key,
+            stage_key=stage_key,
+            walker_sampler=ctx.walker_sampler,
+            sampler_params=ctx.sampler_params,
+            sample_state=ctx.sample_state,
+            infer_state=infer_state,
+            chains_per_walker=ctx.chains_per_walker,
+        ),
+        infer_fields,
+        infer_logsw,
+    )
+
+
+def _finalize_stochastic_walkers_local(
+    self,
+    ctx: _StochasticInitContext,
+    n_local: int,
+    noise: float,
+):
+    with jax.default_device(ctx.device):
+        stage_key, sample_key = jax.random.split(ctx.stage_key)
+        _, (fields, _logsw) = ctx.walker_sampler.sample(
+            sample_key,
+            ctx.sampler_params,
+            ctx.sample_state,
+        )
+        fields_for_walkers = tree_map(lambda x: x[:, 1], fields)
+        walkers_all, _ = jax.vmap(lambda f: self.ansatz.apply(self.params, f))(fields_for_walkers)
+        left_fields_all = tree_map(lambda x: x[:, 0], fields)
+
+        if int(ctx.chains_per_walker) > 1:
+            stage_key, pick_key = jax.random.split(stage_key)
+            pick = jax.random.randint(pick_key, (n_local,), 0, int(ctx.chains_per_walker))
+            idx = jnp.arange(n_local)
+
+            def _pick_one(x):
+                x = x.reshape((n_local, int(ctx.chains_per_walker)) + x.shape[1:])
+                return x[idx, pick]
+
+            walkers = tree_map(_pick_one, walkers_all)
+
+            def _group(x):
+                return x.reshape((n_local, int(ctx.chains_per_walker)) + x.shape[1:])
+
+            grouped_left = tree_map(_group, left_fields_all)
+            pool_seed = _ensure_pool_field_batch_size(self, grouped_left, int(self.n_samples))
+            left_selected = tree_map(_pick_one, left_fields_all)
+            pool_seed = tree_map(lambda x, s: x.at[:, 0].set(s), pool_seed, left_selected)
+        else:
+            walkers = walkers_all
+            left_selected = left_fields_all
+            pool_seed = tree_map(
+                lambda x: jnp.repeat(x[:, None], int(self.n_samples), axis=1),
+                left_selected,
+            )
+
+        if isinstance(walkers, (tuple, list)) and len(walkers) == 2:
+            w_up, w_dn = walkers
+            walkers = (w_up.astype(jnp.complex128), w_dn.astype(jnp.complex128))
+        else:
+            walkers = walkers.astype(jnp.complex128)
+
+        if noise > 0.0:
+            if isinstance(walkers, (tuple, list)) and len(walkers) == 2:
+                _, k1, k2 = jax.random.split(ctx.root_key, 3)
+                w_up, w_dn = walkers
+                walkers = (
+                    w_up + noise * jax.random.normal(k1, w_up.shape),
+                    w_dn + noise * jax.random.normal(k2, w_dn.shape),
+                )
+            else:
+                _, kn = jax.random.split(ctx.root_key, 2)
+                walkers = walkers + noise * jax.random.normal(kn, walkers.shape)
+
+        walkers, _ = orthonormalize(walkers)
+    return walkers, pool_seed
+
+
+def _initialize_runtime_state_local(
+    self,
+    hamil: Any,
+    walkers: Any,
+    pool_seed: Any,
+    key: Any,
+    device: Any,
+    e_est_init: Any,
+) -> tuple[AFQMCState, float]:
+    trial_local = self._clone_stochastic_trial_for_runtime_init(
+        seed=int(jax.device_get(key)[0])
+    )
+    trial_local._runtime_burnin_log_enabled = False
+    trial_local._init_pool_fields_override = pool_seed
+
+    with jax.default_device(device):
+        key_out, trial_key = jax.random.split(key)
+        trial_state = trial_local.init_runtime_state(walkers, key=trial_key, reinit=True)
+        sign, logov = trial_local.calc_slov_state(walkers, trial_state)
+        sign = sign.astype(jnp.complex128)
+        logov = logov.astype(jnp.float64)
+        weights = jnp.ones((int(tree_leaves(walkers)[0].shape[0]),), dtype=jnp.float64)
+        e_sum = 0.0
+        if e_est_init is None:
+            e_local = jnp.sum(
+                jnp.real(trial_local.calc_local_energy_state(hamil, walkers, trial_state))
+            )
+            e_sum = float(jax.device_get(e_local))
+
+        state = AFQMCState(
+            walkers=walkers,
+            weights=weights,
+            sign=sign,
+            logov=logov,
+            key=key_out,
+            e_estimate=jnp.asarray(0.0, dtype=jnp.float64),
+            pop_control_shift=jnp.asarray(0.0, dtype=jnp.float64),
+            walker_fields=(
+                trial_state["walker_fields"]
+                if isinstance(trial_state, dict) and "walker_fields" in trial_state
+                else (
+                    trial_local.walker_fields
+                    if getattr(trial_local, "walker_fields", None) is not None
+                    else jnp.zeros((0, 0, 0), dtype=jnp.float64)
+                )
+            ),
+            trial_state=trial_state,
+        )
+    return state, e_sum
+
+
+def _initialize_stochastic_reference_walkers_local(
+    self,
+    n_local: int,
+    key: Any,
+    noise: float,
+    device: Any,
+) -> Any:
+    trial_local = self._clone_stochastic_trial_for_runtime_init(
+        seed=int(jax.device_get(key)[0])
+    )
+    with jax.default_device(device):
+        walkers, _ = init_walkers(trial_local, n_local, key, noise=noise)
+        if isinstance(walkers, (tuple, list)) and len(walkers) == 2:
+            w_up, w_dn = walkers
+            walkers = (w_up.astype(jnp.complex128), w_dn.astype(jnp.complex128))
+        else:
+            walkers = walkers.astype(jnp.complex128)
+    return walkers
 
 
 def _evaluate_pool_bra(self, fields: Any, logsw: Array) -> tuple[Any, Array]:
