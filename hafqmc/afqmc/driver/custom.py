@@ -1651,6 +1651,7 @@ def _run_custom_equilibration_multi(
     eq_freq = int(getattr(cfg, "log_equil_freq", 0))
     log_eq = bool(log_enabled and eq_freq > 0)
     debug_trace = bool(getattr(cfg, "log_equil_debug_trace", False))
+    sync_eq_wsum = bool(eq_freq > 0)
     proc = int(jax.process_index()) if debug_trace else 0
     eq_chunk = max(eq_freq, 1) if eq_freq > 0 else int(cfg.n_eq_steps)
 
@@ -1834,14 +1835,16 @@ def _run_custom_equilibration_multi(
                     int(cfg.n_eq_steps),
                 )
 
-        if log_eq:
+        wsum = None
+        if sync_eq_wsum:
             wsum = float(host_replicated_value(global_wsum_fn(state)))
+        if log_eq:
             if measure_equil_energy:
                 logger.info(
                     "Eql %d/%d wsum=%.3e e_mix=%.12f e_est=%.12f elapsed=%.2fs",
                     eq_done,
                     cfg.n_eq_steps,
-                    wsum,
+                    float(wsum),
                     float(e_mix),
                     float(host_replicated_value(state.e_estimate)),
                     time.time() - start,
@@ -1851,7 +1854,7 @@ def _run_custom_equilibration_multi(
                     "Eql %d/%d wsum=%.3e e_est=%.12f elapsed=%.2fs",
                     eq_done,
                     cfg.n_eq_steps,
-                    wsum,
+                    float(wsum),
                     float(host_replicated_value(state.e_estimate)),
                     time.time() - start,
                 )

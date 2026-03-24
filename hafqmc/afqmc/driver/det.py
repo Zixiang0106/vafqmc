@@ -404,6 +404,7 @@ def _run_det_equilibration(
     log_enabled = bool(getattr(cfg, "log_enabled", True))
     eq_freq = int(getattr(cfg, "log_equil_freq", 0))
     log_eq = bool(log_enabled and eq_freq > 0)
+    sync_eq_wsum = bool(eq_freq > 0)
     eq_chunk = max(eq_freq, 1) if eq_freq > 0 else int(cfg.n_eq_steps)
     if log_eq:
         logger.info(
@@ -413,7 +414,7 @@ def _run_det_equilibration(
         )
     while eq_done < cfg.n_eq_steps:
         nrun = min(eq_chunk, cfg.n_eq_steps - eq_done)
-        record_wsum = log_eq
+        record_wsum = sync_eq_wsum
         if pop_freq > 0:
             state, wsum_last, step_counter = _run_steps_with_pop_control_det(
                 state,
