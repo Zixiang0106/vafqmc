@@ -29,6 +29,7 @@ from .multi_gpu import (
     PMAP_AXIS_NAME,
     distributed_stochastic_reconfiguration,
     host_gather_state,
+    host_global_sum,
     host_replicated_state,
     host_replicated_value,
     make_local_device_keys,
@@ -608,7 +609,7 @@ def _build_initial_state_det_multi(
     prop_data = build_propagation_data(hamil, trial, cfg.dt)
     local_keys = make_local_device_keys(int(cfg.seed), n_devices, devices)
     e_est_init = getattr(cfg, "e_estimate_init", None)
-    e_sum = 0.0
+    e_sum_local: list[float] = []
     local_states = []
 
     for dev, key_i in zip(devices, local_keys):
@@ -621,7 +622,7 @@ def _build_initial_state_det_multi(
             weights = jnp.ones((n_local,), dtype=jnp.float64)
             if e_est_init is None:
                 e_local = jnp.sum(jnp.real(calc_local_energy_batch(hamil, trial, walkers)))
-                e_sum += float(jax.device_get(e_local))
+                e_sum_local.append(float(jax.device_get(e_local)))
             local_states.append(
                 AFQMCState(
                     walkers=walkers,
@@ -639,7 +640,7 @@ def _build_initial_state_det_multi(
     e_estimate = (
         jnp.asarray(float(e_est_init), dtype=jnp.float64)
         if e_est_init is not None
-        else jnp.asarray(e_sum / float(cfg.n_walkers), dtype=jnp.float64)
+        else jnp.asarray(host_global_sum(e_sum_local, devices) / float(cfg.n_walkers), dtype=jnp.float64)
     )
     local_states = [
         AFQMCState(

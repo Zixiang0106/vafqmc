@@ -34,6 +34,7 @@ from .multi_gpu import (
     PMAP_AXIS_NAME,
     distributed_stochastic_reconfiguration,
     host_gather_state,
+    host_global_sum,
     host_replicated_state,
     host_replicated_value,
     make_local_device_keys,
@@ -895,7 +896,7 @@ def _build_initial_state_custom_multi_stochastic(
             ]
             runtime_out = [f.result() for f in runtime_futs]
             local_states = [x[0] for x in runtime_out]
-            e_sum = float(sum(x[1] for x in runtime_out))
+            e_sum_local = [x[1] for x in runtime_out]
 
         logger.info(
             "End of walker burn-in: total walkers=%d.",
@@ -938,12 +939,12 @@ def _build_initial_state_custom_multi_stochastic(
             ]
             runtime_out = [f.result() for f in runtime_futs]
             local_states = [x[0] for x in runtime_out]
-            e_sum = float(sum(x[1] for x in runtime_out))
+            e_sum_local = [x[1] for x in runtime_out]
 
     e_estimate = (
         jnp.asarray(float(e_est_init), dtype=jnp.float64)
         if e_est_init is not None
-        else jnp.asarray(e_sum / float(cfg.n_walkers), dtype=jnp.float64)
+        else jnp.asarray(host_global_sum(e_sum_local, devices) / float(cfg.n_walkers), dtype=jnp.float64)
     )
     local_states = [
         AFQMCState(
@@ -1473,7 +1474,7 @@ def _build_initial_state_custom_multi(
     prop_data = build_propagation_data(hamil, trial, cfg.dt)
     local_keys = make_local_device_keys(int(cfg.seed), n_devices, devices)
     e_est_init = getattr(cfg, "e_estimate_init", None)
-    e_sum = 0.0
+    e_sum_local: list[float] = []
     local_states = []
 
     for dev, key_i in zip(devices, local_keys):
@@ -1489,7 +1490,7 @@ def _build_initial_state_custom_multi(
                 e_local = jnp.sum(
                     _calc_trial_local_energy_custom(hamil, trial, walkers, trial_state)
                 )
-                e_sum += float(jax.device_get(e_local))
+                e_sum_local.append(float(jax.device_get(e_local)))
             local_states.append(
                 AFQMCState(
                     walkers=walkers,
@@ -1507,7 +1508,7 @@ def _build_initial_state_custom_multi(
     e_estimate = (
         jnp.asarray(float(e_est_init), dtype=jnp.float64)
         if e_est_init is not None
-        else jnp.asarray(e_sum / float(cfg.n_walkers), dtype=jnp.float64)
+        else jnp.asarray(host_global_sum(e_sum_local, devices) / float(cfg.n_walkers), dtype=jnp.float64)
     )
     local_states = [
         AFQMCState(

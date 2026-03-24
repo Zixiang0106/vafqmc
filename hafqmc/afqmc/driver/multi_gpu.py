@@ -60,6 +60,15 @@ def shard_local_pytrees(local_values: Sequence[Any], devices: Sequence[Any]) -> 
     )
 
 
+def host_global_sum(local_values: Sequence[Any], devices: Sequence[Any], axis_name: str = PMAP_AXIS_NAME) -> float:
+    sharded = jax.device_put_sharded(
+        [jnp.asarray(x, dtype=jnp.float64) for x in local_values],
+        devices,
+    )
+    sum_fn = jax.pmap(lambda x: lax.psum(x, axis_name), axis_name=axis_name)
+    return float(host_replicated_value(sum_fn(sharded)))
+
+
 def host_replicated_value(x: Any) -> Any:
     return jax.device_get(x)[0]
 
@@ -214,6 +223,7 @@ __all__ = [
     "PMAP_AXIS_NAME",
     "distributed_stochastic_reconfiguration",
     "host_gather_state",
+    "host_global_sum",
     "host_replicated_state",
     "host_replicated_value",
     "make_local_device_keys",
