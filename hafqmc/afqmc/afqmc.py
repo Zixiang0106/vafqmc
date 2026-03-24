@@ -95,6 +95,8 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
         p.measure_equil_energy = out.measure_equil_energy
     if "e_estimate_init" in out:
         p.e_estimate_init = out.e_estimate_init
+    if "multi_gpu" in out:
+        p.multi_gpu = out.multi_gpu
     if "ortho_freq" in out:
         p.ortho_freq = out.ortho_freq
 
@@ -176,6 +178,7 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
     out.n_eq_steps = int(p.n_eq_steps)
     out.measure_equil_energy = bool(p.get("measure_equil_energy", True))
     out.e_estimate_init = p.get("e_estimate_init", None)
+    out.multi_gpu = bool(p.get("multi_gpu", False))
     out.ortho_freq = int(p.ortho_freq)
 
     out.log_enabled = bool(lg.get("enabled", True))

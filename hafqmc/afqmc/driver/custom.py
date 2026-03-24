@@ -25,6 +25,14 @@ from ..utils import (
 )
 from ..utils.visualization import build_energy_visualizer
 from ..walker import AFQMCState, init_walkers, stochastic_reconfiguration
+from .multi_gpu import (
+    PMAP_AXIS_NAME,
+    distributed_stochastic_reconfiguration,
+    host_gather_state,
+    host_replicated_value,
+    require_local_devices,
+    shard_local_pytrees,
+)
 
 
 def _ensure_complex_walkers(walkers: Any) -> Any:
@@ -681,6 +689,731 @@ def _measure_block_energy_custom(
     return state, _calc_block_energy_once_custom(hamil, trial, state, cfg)
 
 
+def _propagate_step_custom_multi(
+    hamil: Hamiltonian,
+    trial: Any,
+    state: AFQMCState,
+    prop_data: PropagationData,
+    cfg: AFQMCConfig,
+    total_n_walkers: int,
+    axis_name: str,
+) -> AFQMCState:
+    n_walkers = state.weights.shape[0]
+    nchol = prop_data.vhs.shape[0]
+    trial_state = state.trial_state
+
+    key, subkey = jax.random.split(state.key)
+    fields = jax.random.normal(
+        subkey, (n_walkers, nchol), dtype=jnp.real(prop_data.vhs).dtype
+    )
+
+    if trial_state is not None and hasattr(trial, "calc_force_bias_state"):
+        force_bias = trial.calc_force_bias_state(state.walkers, prop_data, trial_state)
+    else:
+        force_bias = calc_force_bias(hamil, trial, state.walkers, prop_data)
+    field_shifts = -prop_data.sqrt_dt * (1.0j * force_bias - prop_data.mf_shifts)
+    shifted_fields = fields - field_shifts
+
+    shift_term = jnp.einsum("wk,k->w", shifted_fields, prop_data.mf_shifts)
+    fb_term = jnp.einsum("wk,wk->w", fields, field_shifts) - 0.5 * jnp.einsum(
+        "wk,wk->w", field_shifts, field_shifts
+    )
+
+    walkers_new = apply_trotter(state.walkers, shifted_fields, prop_data)
+    if trial_state is not None and hasattr(trial, "calc_slov_state"):
+        sign_prop, logov_prop = trial.calc_slov_state(walkers_new, trial_state)
+    else:
+        sign_prop, logov_prop = calc_slov_batch(trial, walkers_new)
+
+    valid = jnp.isfinite(state.logov)
+    log_ratio = jnp.where(valid, logov_prop - state.logov, -jnp.inf)
+    sign_ratio = jnp.where(valid, sign_prop / state.sign, 0.0 + 0.0j)
+    ovlp_ratio = sign_ratio * jnp.exp(log_ratio)
+
+    imp = jnp.exp(
+        -prop_data.sqrt_dt * shift_term
+        + fb_term
+        + prop_data.dt * (state.pop_control_shift - prop_data.h0_prop)
+    ) * ovlp_ratio
+    theta = jnp.angle(jnp.exp(-prop_data.sqrt_dt * shift_term) * ovlp_ratio)
+    imp_ph = jnp.abs(imp) * jnp.cos(theta)
+    imp_ph = jnp.where(jnp.isnan(imp_ph), 0.0, imp_ph)
+    imp_ph = jnp.where(imp_ph < 0.0, 0.0, imp_ph)
+    imp_ph = jnp.where(imp_ph < cfg.min_weight, 0.0, imp_ph)
+    imp_ph = jnp.where(imp_ph > cfg.max_weight, 0.0, imp_ph)
+
+    sign_new, logov_new = sign_prop, logov_prop
+    walker_fields = state.walker_fields
+    if trial_state is not None and hasattr(trial, "update_tethered_samples_state"):
+        trial_state, handoff, sign_new, logov_new = trial.update_tethered_samples_state(
+            walkers_new,
+            trial_state,
+            old_sign=sign_prop,
+            old_logov=logov_prop,
+        )
+        if isinstance(trial_state, dict) and ("walker_fields" in trial_state):
+            walker_fields = trial_state["walker_fields"]
+        handoff = jnp.real(handoff)
+        handoff = jnp.where(jnp.isnan(handoff), 0.0, handoff)
+        handoff = jnp.where(handoff < 0.0, 0.0, handoff)
+        handoff = jnp.where(handoff < cfg.min_weight, 0.0, handoff)
+        handoff = jnp.where(handoff > cfg.max_weight, 0.0, handoff)
+        imp_ph = imp_ph * handoff
+
+    weights = state.weights * imp_ph
+    weights = jnp.where(weights > cfg.max_weight, 0.0, weights)
+    wsum = jnp.maximum(lax.psum(jnp.sum(weights), axis_name), 1.0e-12)
+    pop_control_shift = (
+        state.e_estimate
+        - 0.1 * jnp.log(wsum / float(total_n_walkers)) / prop_data.dt
+    )
+
+    return AFQMCState(
+        walkers=walkers_new,
+        weights=weights,
+        sign=sign_new,
+        logov=logov_new,
+        key=key,
+        e_estimate=state.e_estimate,
+        pop_control_shift=pop_control_shift,
+        walker_fields=walker_fields,
+        trial_state=trial_state,
+    )
+
+
+def _single_step_custom_multi(
+    state: AFQMCState,
+    hamil: Hamiltonian,
+    trial: Any,
+    prop_data: PropagationData,
+    cfg: AFQMCConfig,
+    total_n_walkers: int,
+    step_start: int,
+    axis_name: str,
+) -> AFQMCState:
+    state = _propagate_step_custom_multi(
+        hamil,
+        trial,
+        state,
+        prop_data,
+        cfg,
+        total_n_walkers,
+        axis_name,
+    )
+    if cfg.ortho_freq > 0:
+        do_ortho = ((jnp.asarray(step_start, dtype=jnp.int32) + 1) % int(cfg.ortho_freq)) == 0
+        state = _orthonormalize_custom(trial, state, do_ortho)
+    return state
+
+
+def _scan_steps_custom_multi(
+    state: AFQMCState,
+    hamil: Hamiltonian,
+    trial: Any,
+    prop_data: PropagationData,
+    cfg: AFQMCConfig,
+    total_n_walkers: int,
+    n_steps: int,
+    step_start: int,
+    record_wsum: bool,
+    axis_name: str,
+):
+    ortho_freq_i = int(cfg.ortho_freq)
+    step_start_i = jnp.asarray(step_start, dtype=jnp.int32)
+
+    def body(carry, _):
+        st, idx = carry
+        st = _propagate_step_custom_multi(
+            hamil,
+            trial,
+            st,
+            prop_data,
+            cfg,
+            total_n_walkers,
+            axis_name,
+        )
+        if ortho_freq_i > 0:
+            do_ortho = ((step_start_i + idx + 1) % ortho_freq_i) == 0
+            st = _orthonormalize_custom(trial, st, do_ortho)
+        wsum = lax.psum(jnp.sum(st.weights), axis_name)
+        return (st, idx + 1), wsum
+
+    (state, _), wsum_hist = lax.scan(body, (state, 0), None, length=n_steps)
+    if record_wsum:
+        return state, wsum_hist
+    return state, jnp.zeros((0,), dtype=wsum_hist.dtype)
+
+
+@dataclass
+class _CustomScanRunnerMulti:
+    hamil: Hamiltonian
+    trial: Any
+    prop_data: PropagationData
+    cfg: AFQMCConfig
+    logger: logging.Logger
+    total_n_walkers: int
+    enabled: bool = True
+    cache: dict[int, Any] = field(default_factory=dict)
+    step_fn: Any = None
+
+    def _get_scan(self, n_steps: int):
+        n_steps_i = int(n_steps)
+        fn = self.cache.get(n_steps_i)
+        if fn is None:
+            fn = jax.pmap(
+                lambda st, step0: _scan_steps_custom_multi(
+                    st,
+                    self.hamil,
+                    self.trial,
+                    self.prop_data,
+                    self.cfg,
+                    self.total_n_walkers,
+                    n_steps_i,
+                    step0,
+                    False,
+                    PMAP_AXIS_NAME,
+                ),
+                axis_name=PMAP_AXIS_NAME,
+                in_axes=(0, None),
+            )
+            self.cache[n_steps_i] = fn
+        return fn
+
+    def _get_step(self):
+        if self.step_fn is None:
+            self.step_fn = jax.pmap(
+                lambda st, step0: _single_step_custom_multi(
+                    st,
+                    self.hamil,
+                    self.trial,
+                    self.prop_data,
+                    self.cfg,
+                    self.total_n_walkers,
+                    step0,
+                    PMAP_AXIS_NAME,
+                ),
+                axis_name=PMAP_AXIS_NAME,
+                in_axes=(0, None),
+            )
+        return self.step_fn
+
+    def run_steps(self, state: AFQMCState, n_steps: int, label: str, step_start: int = 0) -> AFQMCState:
+        n_steps_i = int(n_steps)
+        if n_steps_i <= 0:
+            return state
+
+        if self.enabled:
+            try:
+                state, _ = self._get_scan(n_steps_i)(state, int(step_start))
+                return state
+            except Exception as exc:
+                self.logger.warning(
+                    "Custom-trial %s multi-gpu scan-jit failed; fallback to pmapped step loop. error=%s",
+                    label,
+                    str(exc),
+                )
+                self.enabled = False
+
+        step_fn = self._get_step()
+        for step in range(n_steps_i):
+            state = step_fn(state, int(step_start) + step)
+        return state
+
+
+def _calc_mixed_energy_custom_multi(
+    hamil: Hamiltonian,
+    trial: Any,
+    state: AFQMCState,
+    axis_name: str,
+) -> Any:
+    if state.trial_state is not None and hasattr(trial, "calc_local_energy_state"):
+        e_loc = jnp.real(trial.calc_local_energy_state(hamil, state.walkers, state.trial_state))
+    else:
+        e_loc = jnp.real(calc_local_energy_batch(hamil, trial, state.walkers))
+    local_num = jnp.sum(state.weights * e_loc)
+    local_den = jnp.sum(state.weights)
+    global_num = lax.psum(local_num, axis_name)
+    global_den = jnp.maximum(lax.psum(local_den, axis_name), 1.0e-12)
+    return global_num / global_den
+
+
+def _measure_block_energy_custom_multi(
+    hamil: Hamiltonian,
+    trial: Any,
+    state: AFQMCState,
+    cfg: AFQMCConfig,
+    axis_name: str,
+) -> tuple[AFQMCState, Any]:
+    n_meas = max(int(getattr(cfg, "n_measure_samples", 1)), 1)
+    if state.trial_state is not None and hasattr(trial, "measure_block_energy_state"):
+        trial_state, block_energy_local, sign_cur, logov_cur = trial.measure_block_energy_state(
+            hamil,
+            state.walkers,
+            state.weights,
+            state.e_estimate,
+            cfg.dt,
+            n_meas,
+            state.trial_state,
+        )
+        local_wsum = jnp.sum(state.weights)
+        global_num = lax.psum(local_wsum * block_energy_local, axis_name)
+        global_den = jnp.maximum(lax.psum(local_wsum, axis_name), 1.0e-12)
+        walker_fields = (
+            trial_state.get("walker_fields", state.walker_fields)
+            if isinstance(trial_state, dict)
+            else state.walker_fields
+        )
+        state = AFQMCState(
+            walkers=state.walkers,
+            weights=state.weights,
+            sign=sign_cur,
+            logov=logov_cur,
+            key=state.key,
+            e_estimate=state.e_estimate,
+            pop_control_shift=state.pop_control_shift,
+            walker_fields=walker_fields,
+            trial_state=trial_state,
+        )
+        return state, global_num / global_den
+
+    if state.trial_state is not None and hasattr(trial, "calc_local_energy_state"):
+        e_loc = jnp.real(trial.calc_local_energy_state(hamil, state.walkers, state.trial_state))
+    else:
+        e_loc = jnp.real(calc_local_energy_batch(hamil, trial, state.walkers))
+    clip = jnp.sqrt(2.0 / cfg.dt)
+    e_loc = jnp.where(jnp.abs(e_loc - state.e_estimate) > clip, state.e_estimate, e_loc)
+    local_num = jnp.sum(state.weights * e_loc)
+    local_den = jnp.sum(state.weights)
+    global_num = lax.psum(local_num, axis_name)
+    global_den = jnp.maximum(lax.psum(local_den, axis_name), 1.0e-12)
+    return state, global_num / global_den
+
+
+def _build_initial_state_custom_multi(
+    hamil: Hamiltonian,
+    trial: Any,
+    cfg: AFQMCConfig,
+) -> tuple[PropagationData, AFQMCState, int, int]:
+    n_devices, n_local, devices = require_local_devices(cfg.n_walkers)
+    prop_data = build_propagation_data(hamil, trial, cfg.dt)
+    local_keys = jax.random.split(jax.random.PRNGKey(cfg.seed), n_devices)
+    e_est_init = getattr(cfg, "e_estimate_init", None)
+    e_sum = 0.0
+    local_states = []
+
+    for dev, key_i in zip(devices, local_keys):
+        with jax.default_device(dev):
+            walkers, key_out = init_walkers(trial, n_local, key_i, noise=cfg.init_noise)
+            walkers = _ensure_complex_walkers(walkers)
+            trial_state, key_out = _bind_trial_runtime_state_custom(trial, walkers, key_out)
+            sign, logov = _calc_trial_overlap_custom(trial, walkers, trial_state)
+            sign = sign.astype(jnp.complex128)
+            logov = logov.astype(jnp.float64)
+            weights = jnp.ones((n_local,), dtype=jnp.float64)
+            if e_est_init is None:
+                e_local = jnp.sum(
+                    _calc_trial_local_energy_custom(hamil, trial, walkers, trial_state)
+                )
+                e_sum += float(jax.device_get(e_local))
+            local_states.append(
+                AFQMCState(
+                    walkers=walkers,
+                    weights=weights,
+                    sign=sign,
+                    logov=logov,
+                    key=key_out,
+                    e_estimate=jnp.asarray(0.0, dtype=jnp.float64),
+                    pop_control_shift=jnp.asarray(0.0, dtype=jnp.float64),
+                    walker_fields=_initial_walker_fields_custom(trial, trial_state),
+                    trial_state=trial_state,
+                )
+            )
+
+    e_estimate = (
+        jnp.asarray(float(e_est_init), dtype=jnp.float64)
+        if e_est_init is not None
+        else jnp.asarray(e_sum / float(cfg.n_walkers), dtype=jnp.float64)
+    )
+    local_states = [
+        AFQMCState(
+            walkers=st.walkers,
+            weights=st.weights,
+            sign=st.sign,
+            logov=st.logov,
+            key=st.key,
+            e_estimate=e_estimate,
+            pop_control_shift=e_estimate,
+            walker_fields=st.walker_fields,
+            trial_state=st.trial_state,
+        )
+        for st in local_states
+    ]
+    return prop_data, shard_local_pytrees(local_states, devices), n_devices, n_local
+
+
+def _update_pop_summary_host(summary: dict[str, float], state: AFQMCState, pop_stats_fn: Any) -> None:
+    n_zero_rep, wsum_rep = pop_stats_fn(state)
+    n_zero = float(host_replicated_value(n_zero_rep))
+    wsum = float(host_replicated_value(wsum_rep))
+    summary["events"] += 1.0
+    summary["n_zero_sum"] += n_zero
+    summary["n_zero_max"] = max(summary["n_zero_max"], n_zero)
+    summary["wsum_min"] = min(summary["wsum_min"], wsum)
+    summary["wsum_max"] = max(summary["wsum_max"], wsum)
+
+
+def _run_steps_with_pop_control_custom_multi(
+    state: AFQMCState,
+    runner: _CustomScanRunnerMulti,
+    pop_stats_fn: Any,
+    resample_fn: Any,
+    *,
+    n_steps: int,
+    step_counter: int,
+    pop_freq: int,
+    do_resample: bool,
+    collect_summary: bool,
+    trial: Any,
+    label: str,
+) -> tuple[AFQMCState, int, dict[str, float]]:
+    steps_done = 0
+    local_step = 0
+    summary = _init_pop_summary()
+    while steps_done < n_steps:
+        if pop_freq > 0:
+            to_pop = pop_freq - (step_counter % pop_freq)
+            nrun = min(n_steps - steps_done, to_pop)
+        else:
+            nrun = n_steps - steps_done
+        state = runner.run_steps(state, nrun, label, step_start=local_step)
+        step_counter += nrun
+        steps_done += nrun
+        local_step += nrun
+        if do_resample and pop_freq > 0 and step_counter % pop_freq == 0:
+            if collect_summary:
+                _update_pop_summary_host(summary, state, pop_stats_fn)
+            state = resample_fn(state)
+    return state, step_counter, summary
+
+
+def _run_custom_equilibration_multi(
+    state: AFQMCState,
+    runner: _CustomScanRunnerMulti,
+    hamil: Hamiltonian,
+    trial: Any,
+    cfg: AFQMCConfig,
+    logger: logging.Logger,
+    start: float,
+) -> AFQMCState:
+    log_enabled = bool(getattr(cfg, "log_enabled", True))
+    eq_freq = int(getattr(cfg, "log_equil_freq", 0))
+    log_eq = bool(log_enabled and eq_freq > 0)
+    eq_chunk = max(eq_freq, 1) if eq_freq > 0 else int(cfg.n_eq_steps)
+
+    global_wsum_fn = jax.pmap(
+        lambda st: lax.psum(jnp.sum(st.weights), PMAP_AXIS_NAME),
+        axis_name=PMAP_AXIS_NAME,
+    )
+    pop_stats_fn = jax.pmap(
+        lambda st: (
+            lax.psum(jnp.sum(jnp.real(st.weights) <= 0.0), PMAP_AXIS_NAME),
+            lax.psum(jnp.sum(st.weights), PMAP_AXIS_NAME),
+        ),
+        axis_name=PMAP_AXIS_NAME,
+    )
+    resample_fn = jax.pmap(
+        lambda st: distributed_stochastic_reconfiguration(
+            trial,
+            st,
+            PMAP_AXIS_NAME,
+        ),
+        axis_name=PMAP_AXIS_NAME,
+    )
+    mixed_energy_fn = jax.pmap(
+        lambda st: _calc_mixed_energy_custom_multi(
+            hamil,
+            trial,
+            st,
+            PMAP_AXIS_NAME,
+        ),
+        axis_name=PMAP_AXIS_NAME,
+    )
+    update_e_fn = jax.pmap(
+        lambda st, e_blk: _update_e_estimate(st, e_blk),
+        in_axes=(0, None),
+    )
+    update_shift_fn = jax.pmap(
+        lambda st, e_blk: _relax_pop_control_shift(st, e_blk),
+        in_axes=(0, None),
+    )
+
+    pop_freq = int(getattr(cfg, "pop_control_freq", 0))
+    step_counter = 0
+    eq_done = 0
+    measure_equil_energy = bool(getattr(cfg, "measure_equil_energy", True))
+    if log_eq:
+        logger.info(
+            "Equilibration sweeps: steps=%d, print_every=%d",
+            int(cfg.n_eq_steps),
+            int(eq_chunk),
+        )
+    while eq_done < cfg.n_eq_steps:
+        nrun = min(eq_chunk, cfg.n_eq_steps - eq_done)
+        if pop_freq > 0:
+            state, step_counter, _ = _run_steps_with_pop_control_custom_multi(
+                state,
+                runner,
+                pop_stats_fn,
+                resample_fn,
+                n_steps=nrun,
+                step_counter=step_counter,
+                pop_freq=pop_freq,
+                do_resample=bool(cfg.resample),
+                collect_summary=False,
+                trial=trial,
+                label="eql",
+            )
+        else:
+            state = runner.run_steps(state, nrun, "eql")
+        eq_done += nrun
+        if measure_equil_energy:
+            e_mix = float(host_replicated_value(mixed_energy_fn(state)))
+            state = update_e_fn(state, e_mix)
+            state = update_shift_fn(state, e_mix)
+
+        if cfg.resample and pop_freq <= 0:
+            state = resample_fn(state)
+
+        if log_eq:
+            wsum = float(host_replicated_value(global_wsum_fn(state)))
+            if measure_equil_energy:
+                logger.info(
+                    "Eql %d/%d wsum=%.3e e_mix=%.12f e_est=%.12f elapsed=%.2fs",
+                    eq_done,
+                    cfg.n_eq_steps,
+                    wsum,
+                    float(e_mix),
+                    float(host_replicated_value(state.e_estimate)),
+                    time.time() - start,
+                )
+            else:
+                logger.info(
+                    "Eql %d/%d wsum=%.3e e_est=%.12f elapsed=%.2fs",
+                    eq_done,
+                    cfg.n_eq_steps,
+                    wsum,
+                    float(host_replicated_value(state.e_estimate)),
+                    time.time() - start,
+                )
+    return state
+
+
+def run_afqmc_custom_multi(
+    hamil: Hamiltonian,
+    trial: Any,
+    cfg: AFQMCConfig,
+    logger: logging.Logger,
+    start: float,
+    *,
+    return_state: bool,
+    return_blocks: bool,
+):
+    prop_data, state, n_devices, n_local = _build_initial_state_custom_multi(hamil, trial, cfg)
+    logger.info(
+        "AFQMC init: dt=%.4g walkers=%d local_walkers=%d devices=%d blocks=%d "
+        "ene_measurements=%d block_steps=%d meas_samples=%d pop_freq=%d",
+        cfg.dt,
+        cfg.n_walkers,
+        n_local,
+        n_devices,
+        cfg.n_blocks,
+        max(int(getattr(cfg, "n_ene_measurements", 1)), 1),
+        cfg.n_block_steps,
+        max(int(getattr(cfg, "n_measure_samples", 1)), 1),
+        int(getattr(cfg, "pop_control_freq", 0)),
+    )
+    logger.info(
+        "Init e_est=%.12f elapsed=%.2fs",
+        float(host_replicated_value(state.e_estimate)),
+        time.time() - start,
+    )
+
+    runner = _CustomScanRunnerMulti(hamil, trial, prop_data, cfg, logger, cfg.n_walkers)
+    state = _run_custom_equilibration_multi(state, runner, hamil, trial, cfg, logger, start)
+    visualizer = build_energy_visualizer(
+        enabled=bool(getattr(cfg, "output_visualization_enabled", False)),
+        logger=logger,
+        title="AFQMC Live Energy (custom)",
+        refresh_every=int(getattr(cfg, "output_visualization_refresh_every", 1)),
+        show=bool(getattr(cfg, "output_visualization_show", False)),
+        save_path=getattr(cfg, "output_visualization_save_path", "eblock_afqmc.png"),
+    )
+
+    block_energies: list[Any] = []
+    block_weights: list[Any] = []
+    raw_rows: list[tuple[int, float, float, float, float, float]] = []
+    write_raw = bool(getattr(cfg, "output_write_raw", False))
+    raw_path = str(getattr(cfg, "output_raw_path", "raw.dat"))
+    raw_stream: TextIO | None = _open_raw_block_stream(raw_path) if write_raw else None
+    n_ene_measurements = max(int(getattr(cfg, "n_ene_measurements", 1)), 1)
+    pop_freq = int(getattr(cfg, "pop_control_freq", 0))
+    log_pop_stats = bool(getattr(cfg, "pop_control_log_stats", False))
+    log_enabled = bool(getattr(cfg, "log_enabled", True))
+    block_log_freq = int(getattr(cfg, "log_block_freq", 1))
+    step_counter = 0
+
+    global_wsum_fn = jax.pmap(
+        lambda st: lax.psum(jnp.sum(st.weights), PMAP_AXIS_NAME),
+        axis_name=PMAP_AXIS_NAME,
+    )
+    pop_stats_fn = jax.pmap(
+        lambda st: (
+            lax.psum(jnp.sum(jnp.real(st.weights) <= 0.0), PMAP_AXIS_NAME),
+            lax.psum(jnp.sum(st.weights), PMAP_AXIS_NAME),
+        ),
+        axis_name=PMAP_AXIS_NAME,
+    )
+    resample_fn = jax.pmap(
+        lambda st: distributed_stochastic_reconfiguration(
+            trial,
+            st,
+            PMAP_AXIS_NAME,
+        ),
+        axis_name=PMAP_AXIS_NAME,
+    )
+    measure_fn = jax.pmap(
+        lambda st: _measure_block_energy_custom_multi(
+            hamil,
+            trial,
+            st,
+            cfg,
+            PMAP_AXIS_NAME,
+        ),
+        axis_name=PMAP_AXIS_NAME,
+    )
+    update_shift_fn = jax.pmap(
+        lambda st, e_blk: _relax_pop_control_shift(st, e_blk),
+        in_axes=(0, None),
+    )
+    update_est_fn = jax.pmap(
+        lambda st, e_blk: _update_e_estimate(st, e_blk),
+        in_axes=(0, None),
+    )
+
+    try:
+        for blk in range(cfg.n_blocks):
+            e_num = 0.0
+            e_den = 0.0
+            pop_summary_block = _init_pop_summary()
+            pop_summary_pre_block = _init_pop_summary()
+
+            for _ in range(n_ene_measurements):
+                if pop_freq > 0:
+                    state, step_counter, pop_summary = _run_steps_with_pop_control_custom_multi(
+                        state,
+                        runner,
+                        pop_stats_fn,
+                        resample_fn,
+                        n_steps=int(cfg.n_block_steps),
+                        step_counter=step_counter,
+                        pop_freq=pop_freq,
+                        do_resample=bool(cfg.resample),
+                        collect_summary=log_pop_stats,
+                        trial=trial,
+                        label="block",
+                    )
+                    _merge_pop_summary(pop_summary_block, pop_summary)
+                else:
+                    state = runner.run_steps(state, cfg.n_block_steps, "block")
+                    step_counter += int(cfg.n_block_steps)
+                state, e_rep = measure_fn(state)
+                e_i = float(host_replicated_value(e_rep))
+                w_i = float(host_replicated_value(global_wsum_fn(state)))
+                e_num += w_i * e_i
+                e_den += w_i
+                state = update_shift_fn(state, e_i)
+
+            if cfg.resample and pop_freq <= 0:
+                if log_pop_stats:
+                    _update_pop_summary_host(pop_summary_pre_block, state, pop_stats_fn)
+                state = resample_fn(state)
+
+            block_energy = e_num / max(e_den, 1.0e-12)
+            block_energies.append(block_energy)
+            block_weights.append(e_den)
+            state = update_est_fn(state, block_energy)
+            if log_pop_stats:
+                _merge_pop_summary(pop_summary_block, pop_summary_pre_block)
+                if pop_summary_block["events"] > 0.0:
+                    ev = max(pop_summary_block["events"], 1.0)
+                    logger.info(
+                        "PopCtrl block=%d pre-resample: events=%d n_zero_mean=%.2f n_zero_max=%d "
+                        "wsum_min=%.6e wsum_max=%.6e",
+                        int(blk + 1),
+                        int(pop_summary_block["events"]),
+                        float(pop_summary_block["n_zero_sum"] / ev),
+                        int(pop_summary_block["n_zero_max"]),
+                        float(pop_summary_block["wsum_min"]),
+                        float(pop_summary_block["wsum_max"]),
+                    )
+                else:
+                    summary_now = _init_pop_summary()
+                    _update_pop_summary_host(summary_now, state, pop_stats_fn)
+                    logger.info(
+                        "PopCtrl block=%d pre-resample: events=%d n_zero_mean=%.2f n_zero_max=%d "
+                        "wsum_min=%.6e wsum_max=%.6e",
+                        int(blk + 1),
+                        0,
+                        float(summary_now["n_zero_sum"]),
+                        int(summary_now["n_zero_max"]),
+                        float(summary_now["wsum_min"]),
+                        float(summary_now["wsum_max"]),
+                    )
+            row = (
+                int(blk + 1),
+                float(block_energy),
+                float(host_replicated_value(state.e_estimate)),
+                float(host_replicated_value(global_wsum_fn(state))),
+                float(e_den),
+                float(time.time() - start),
+            )
+            raw_rows.append(row)
+            if raw_stream is not None:
+                _append_raw_block_row(raw_stream, row)
+            visualizer.update(blk + 1, float(block_energy))
+
+            if log_enabled and block_log_freq > 0 and (
+                (blk + 1) % block_log_freq == 0 or blk + 1 == cfg.n_blocks
+            ):
+                logger.info(
+                    "Block %d/%d e_blk=%.12f e_est=%.12f wsum=%.3e elapsed=%.2fs",
+                    blk + 1,
+                    cfg.n_blocks,
+                    float(block_energy),
+                    float(host_replicated_value(state.e_estimate)),
+                    float(host_replicated_value(global_wsum_fn(state))),
+                    time.time() - start,
+                )
+    finally:
+        if raw_stream is not None:
+            raw_stream.close()
+
+    if write_raw:
+        logger.info("Saved AFQMC raw block data: %s", raw_path)
+
+    final_state = host_gather_state(state) if return_state else state
+    return _finalize_outputs(
+        logger,
+        start,
+        block_energies,
+        block_weights,
+        state=final_state,
+        visualizer=visualizer,
+        return_state=return_state,
+        return_blocks=return_blocks,
+    )
+
+
 def run_afqmc_custom(
     hamil: Hamiltonian,
     trial: Any,
@@ -691,6 +1424,22 @@ def run_afqmc_custom(
     return_state: bool,
     return_blocks: bool,
 ):
+    if bool(getattr(cfg, "multi_gpu", False)):
+        if int(jax.local_device_count()) > 1:
+            return run_afqmc_custom_multi(
+                hamil,
+                trial,
+                cfg,
+                logger,
+                start,
+                return_state=return_state,
+                return_blocks=return_blocks,
+            )
+        logger.warning(
+            "cfg.propagation.multi_gpu=True but only %d local device is visible; falling back to single-device.",
+            int(jax.local_device_count()),
+        )
+
     prop_data, state = _build_initial_state_custom(hamil, trial, cfg)
     _log_init(logger, cfg, state, start)
 
@@ -815,4 +1564,4 @@ def run_afqmc_custom(
     )
 
 
-__all__ = ["run_afqmc_custom"]
+__all__ = ["run_afqmc_custom", "run_afqmc_custom_multi"]
