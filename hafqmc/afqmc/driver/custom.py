@@ -1996,6 +1996,8 @@ def run_afqmc_custom_multi(
             block_energies.append(block_energy)
             block_weights.append(e_den)
             state = update_est_fn(state, block_energy)
+            wsum_now = float(host_replicated_value(global_wsum_fn(state)))
+            e_est_now = float(host_replicated_value(state.e_estimate))
             if log_pop_stats:
                 _merge_pop_summary(pop_summary_block, pop_summary_pre_block)
                 if pop_summary_block["events"] > 0.0:
@@ -2026,8 +2028,8 @@ def run_afqmc_custom_multi(
             row = (
                 int(blk + 1),
                 float(block_energy),
-                float(host_replicated_value(state.e_estimate)),
-                float(host_replicated_value(global_wsum_fn(state))),
+                float(e_est_now),
+                float(wsum_now),
                 float(e_den),
                 float(time.time() - start),
             )
@@ -2044,8 +2046,8 @@ def run_afqmc_custom_multi(
                     blk + 1,
                     cfg.n_blocks,
                     float(block_energy),
-                    float(host_replicated_value(state.e_estimate)),
-                    float(host_replicated_value(global_wsum_fn(state))),
+                    float(e_est_now),
+                    float(wsum_now),
                     time.time() - start,
                 )
     finally:
