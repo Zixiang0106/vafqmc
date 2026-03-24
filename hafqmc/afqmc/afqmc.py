@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from pathlib import Path
 from collections.abc import Mapping
@@ -20,6 +19,7 @@ from .afqmc_config import (
     default as afqmc_default,
     stochastic_trial_default,
 )
+from ._distributed import maybe_initialize_distributed
 from .utils import build_hamiltonian_pickle, load_hamiltonian
 from .driver.custom import run_afqmc_custom
 from .driver.det import run_afqmc_det
@@ -39,54 +39,6 @@ def _get_logger(logger: Optional[logging.Logger] = None) -> logging.Logger:
         logger.addHandler(handler)
     logger.setLevel(logging.INFO)
     return logger
-
-
-def _maybe_initialize_distributed(logger: logging.Logger) -> None:
-    if hasattr(jax.distributed, "is_initialized"):
-        try:
-            if jax.distributed.is_initialized():
-                return
-        except Exception:
-            pass
-
-    coord_addr = os.environ.get("JAX_COORDINATOR_ADDRESS")
-    num_processes = os.environ.get("JAX_NUM_PROCESSES")
-    process_id = os.environ.get("JAX_PROCESS_ID")
-
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-    local_ids = None
-    if cuda_visible and cuda_visible != "-1":
-        visible_list = [x.strip() for x in cuda_visible.split(",") if x.strip()]
-        if visible_list:
-            local_ids = list(range(len(visible_list)))
-
-    if coord_addr and num_processes and process_id:
-        if local_ids is None:
-            jax.distributed.initialize()
-        else:
-            jax.distributed.initialize(local_device_ids=local_ids)
-        if int(process_id) == 0:
-            logger.info(
-                "Initialized JAX distributed: coordinator=%s process_id=%s num_processes=%s",
-                coord_addr,
-                process_id,
-                num_processes,
-            )
-        return
-
-    slurm_n_tasks = os.environ.get("SLURM_NTASKS")
-    slurm_proc_id = os.environ.get("SLURM_PROCID")
-    if slurm_n_tasks and slurm_proc_id and int(slurm_n_tasks) > 1:
-        if local_ids is None:
-            jax.distributed.initialize()
-        else:
-            jax.distributed.initialize(local_device_ids=local_ids)
-        if int(slurm_proc_id) == 0:
-            logger.info(
-                "Initialized JAX distributed from SLURM: proc_id=%s ntasks=%s",
-                slurm_proc_id,
-                slurm_n_tasks,
-            )
 
 
 def _configure_process_local_runtime(
@@ -373,7 +325,7 @@ def afqmc_energy(
     cfg_runtime = _runtime_cfg(cfg_user)
     logger = _get_logger(logger)
     if bool(getattr(cfg_runtime, "multi_gpu", False)):
-        _maybe_initialize_distributed(logger)
+        maybe_initialize_distributed(logger)
         process_index = _configure_process_local_runtime(cfg_user, cfg_runtime, logger)
         if process_index == 0:
             logger.info(
@@ -422,6 +374,7 @@ def afqmc_energy_from_pickle(
     return_state: bool = False,
     return_blocks: bool = False,
 ):
+    maybe_initialize_distributed()
     hamil = load_hamiltonian(hamil_path)
     return afqmc_energy(
         hamil,

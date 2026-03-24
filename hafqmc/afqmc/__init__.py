@@ -1,5 +1,9 @@
 """AFQMC utilities built on top of hafqmc primitives."""
 
+from ._distributed import maybe_initialize_distributed as _maybe_initialize_distributed_early
+
+_maybe_initialize_distributed_early()
+
 from .afqmc import (
     afqmc_energy,
     afqmc_energy_from_checkpoint,
