@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import logging
 import time
@@ -10,10 +11,14 @@ from typing import Any, TextIO
 
 import jax
 from jax import lax, numpy as jnp
+from jax.tree_util import tree_leaves, tree_map
 
-from ...hamiltonian import Hamiltonian
+from ...hamiltonian import Hamiltonian, calc_slov
 from ...propagator import orthonormalize
+from ...sampler import choose_sampler_maker, make_batched
 from ..afqmc_config import AFQMCConfig
+from ..trial.stochastic import VAFQMCTrial
+from ..trial.stochastic_internal_methods import _ensure_pool_field_batch_size
 from ..utils import (
     PropagationData,
     analyze_energy_blocks,
@@ -495,6 +500,440 @@ def _initial_walker_fields_custom(trial: Any, trial_state: Any):
     if hasattr(trial, "walker_fields") and getattr(trial, "walker_fields") is not None:
         return trial.walker_fields
     return jnp.zeros((0, 0, 0), dtype=jnp.float64)
+
+
+@dataclass
+class _StochasticInitContext:
+    device: Any
+    root_key: Any
+    stage_key: Any
+    walker_sampler: Any
+    sampler_params: Any
+    sample_state: Any
+    infer_state: Any
+    chains_per_walker: int
+
+
+def _clone_stochastic_trial_for_runtime_init(
+    trial: VAFQMCTrial,
+    *,
+    seed: int,
+) -> VAFQMCTrial:
+    clone = VAFQMCTrial(
+        trial.ansatz,
+        trial.params,
+        hamiltonian=getattr(trial, "_hamiltonian", None),
+        reference_wfn=trial.reference_wfn,
+        n_samples=int(trial.n_samples),
+        burn_in=int(trial.burn_in),
+        sampler_name=str(trial._sampler_name),
+        sampler_kwargs=dict(getattr(trial, "_sampler_kwargs", {}) or {}),
+        sampling_target=str(trial.sampling_target),
+        logdens_floor=float(trial.logdens_floor),
+        sample_update_steps=int(trial.sample_update_steps),
+        local_energy_chunk_size=int(trial.local_energy_chunk_size),
+        init_walkers_from_trial=bool(trial.init_walkers_from_trial),
+        init_walkers_burn_in=int(trial.init_walkers_burn_in),
+        init_walkers_chains_per_walker=int(trial.init_walkers_chains_per_walker),
+        init_walkers_infer_steps=int(trial.init_walkers_infer_steps),
+        max_prop=trial.max_prop,
+        seed=int(seed),
+    )
+    return clone
+
+
+def _make_stochastic_init_infer_pm(trial: VAFQMCTrial):
+    hamil = getattr(trial, "_hamiltonian", None)
+    if hamil is None:
+        return None
+
+    apply_ansatz = jax.vmap(lambda f: trial.ansatz.apply(trial.params, f))
+    eval_eloc = jax.vmap(lambda b, k: hamil.local_energy(b, k))
+    eval_slov = jax.vmap(lambda b, k: calc_slov(b, k))
+    floor = float(getattr(trial, "logdens_floor", -60.0))
+    local_chunk = int(getattr(trial, "local_energy_chunk_size", 0))
+    chunk = int(local_chunk * int(getattr(trial, "n_samples", 1))) if local_chunk > 0 else 0
+
+    def infer_pm(fields_pair_local: Any, logsw_local: Any):
+        bra_fields = tree_map(lambda x: x[:, 0], fields_pair_local)
+        ket_fields = tree_map(lambda x: x[:, 1], fields_pair_local)
+        bra, bra_lw = apply_ansatz(bra_fields)
+        ket, ket_lw = apply_ansatz(ket_fields)
+        n_local_walkers = int(tree_leaves(ket)[0].shape[0])
+
+        if chunk <= 0 or chunk >= n_local_walkers:
+            eloc = eval_eloc(bra, ket)
+            sign, logabs = eval_slov(bra, ket)
+        else:
+            eloc_chunks = []
+            sign_chunks = []
+            logabs_chunks = []
+            for start in range(0, n_local_walkers, chunk):
+                end = min(start + chunk, n_local_walkers)
+                bra_c = tree_map(lambda x: x[start:end], bra)
+                ket_c = tree_map(lambda x: x[start:end], ket)
+                eloc_chunks.append(eval_eloc(bra_c, ket_c))
+                sign_c, logabs_c = eval_slov(bra_c, ket_c)
+                sign_chunks.append(sign_c)
+                logabs_chunks.append(logabs_c)
+            eloc = jnp.concatenate(eloc_chunks, axis=0)
+            sign = jnp.concatenate(sign_chunks, axis=0)
+            logabs = jnp.concatenate(logabs_chunks, axis=0)
+
+        logov = logabs + bra_lw + ket_lw
+        dlog = jnp.real(logov - logsw_local)
+        dlog = jnp.where(jnp.isfinite(dlog), dlog, floor)
+        dmax = lax.pmax(jnp.max(dlog), PMAP_AXIS_NAME)
+        rel_w = jnp.exp(dlog - dmax)
+
+        global_wsum = jnp.maximum(lax.psum(jnp.sum(rel_w), PMAP_AXIS_NAME), 1.0e-12)
+        global_es_num = lax.psum(jnp.sum((eloc * sign) * rel_w), PMAP_AXIS_NAME)
+        global_s_num = lax.psum(jnp.sum(sign * rel_w), PMAP_AXIS_NAME)
+
+        exp_es = global_es_num / global_wsum
+        exp_s = global_s_num / global_wsum
+        denom = jnp.real(exp_s)
+        etot = jnp.where(jnp.abs(denom) > 1.0e-12, jnp.real(exp_es) / denom, jnp.nan)
+        return jnp.real(etot), jnp.real(exp_es), jnp.real(exp_s)
+
+    return jax.pmap(infer_pm, axis_name=PMAP_AXIS_NAME)
+
+
+def _build_stochastic_init_context_local(
+    trial: VAFQMCTrial,
+    n_local: int,
+    key: Any,
+    device: Any,
+) -> _StochasticInitContext:
+    chains_per_walker = int(getattr(trial, "init_walkers_chains_per_walker", 0))
+    if chains_per_walker <= 0:
+        chains_per_walker = int(trial.n_samples)
+    n_init_chains = int(n_local * chains_per_walker)
+
+    pair_fields_shape = tree_map(
+        lambda s: jnp.asarray((2, *tuple(map(int, jnp.asarray(s).reshape(-1).tolist())))),
+        trial.fields_shape,
+    )
+
+    def pair_logdens(params: Any, fields_pair: Any):
+        bra_fields = tree_map(lambda x: x[0], fields_pair)
+        ket_fields = tree_map(lambda x: x[1], fields_pair)
+        bra, bra_lw = trial.ansatz.apply(params, bra_fields)
+        ket, ket_lw = trial.ansatz.apply(params, ket_fields)
+        _sign, logov = calc_slov(bra, ket)
+        logd = jnp.real(logov + bra_lw + ket_lw)
+        return jnp.where(jnp.isfinite(logd), logd, trial.logdens_floor)
+
+    init_sampler = choose_sampler_maker(str(trial._sampler_name))(
+        pair_logdens,
+        pair_fields_shape,
+        **dict(getattr(trial, "_sampler_kwargs", {}) or {}),
+    )
+    walker_sampler = make_batched(init_sampler, n_init_chains, concat=False)
+    sampler_params = trial.params
+
+    with jax.default_device(device):
+        stage_key, init_key = jax.random.split(key)
+        sample_state = walker_sampler.init(init_key, sampler_params)
+        if int(trial.init_walkers_burn_in) > 0:
+            stage_key, burn_key = jax.random.split(stage_key)
+            sample_state = walker_sampler.burn_in(
+                burn_key,
+                sampler_params,
+                sample_state,
+                int(trial.init_walkers_burn_in),
+            )
+
+    return _StochasticInitContext(
+        device=device,
+        root_key=key,
+        stage_key=stage_key,
+        walker_sampler=walker_sampler,
+        sampler_params=sampler_params,
+        sample_state=sample_state,
+        infer_state=sample_state,
+        chains_per_walker=chains_per_walker,
+    )
+
+
+def _sample_stochastic_infer_local(
+    ctx: _StochasticInitContext,
+) -> tuple[_StochasticInitContext, Any, Any]:
+    with jax.default_device(ctx.device):
+        stage_key, infer_key = jax.random.split(ctx.stage_key)
+        infer_state, (infer_fields, infer_logsw) = ctx.walker_sampler.sample(
+            infer_key,
+            ctx.sampler_params,
+            ctx.infer_state,
+        )
+    return (
+        _StochasticInitContext(
+            device=ctx.device,
+            root_key=ctx.root_key,
+            stage_key=stage_key,
+            walker_sampler=ctx.walker_sampler,
+            sampler_params=ctx.sampler_params,
+            sample_state=ctx.sample_state,
+            infer_state=infer_state,
+            chains_per_walker=ctx.chains_per_walker,
+        ),
+        infer_fields,
+        infer_logsw,
+    )
+
+
+def _finalize_stochastic_walkers_local(
+    trial: VAFQMCTrial,
+    ctx: _StochasticInitContext,
+    n_local: int,
+    noise: float,
+):
+    with jax.default_device(ctx.device):
+        stage_key, sample_key = jax.random.split(ctx.stage_key)
+        _, (fields, _logsw) = ctx.walker_sampler.sample(
+            sample_key,
+            ctx.sampler_params,
+            ctx.sample_state,
+        )
+        fields_for_walkers = tree_map(lambda x: x[:, 1], fields)
+        walkers_all, _ = jax.vmap(lambda f: trial.ansatz.apply(trial.params, f))(fields_for_walkers)
+        left_fields_all = tree_map(lambda x: x[:, 0], fields)
+
+        if int(ctx.chains_per_walker) > 1:
+            stage_key, pick_key = jax.random.split(stage_key)
+            pick = jax.random.randint(pick_key, (n_local,), 0, int(ctx.chains_per_walker))
+            idx = jnp.arange(n_local)
+
+            def _pick_one(x):
+                x = x.reshape((n_local, int(ctx.chains_per_walker)) + x.shape[1:])
+                return x[idx, pick]
+
+            walkers = tree_map(_pick_one, walkers_all)
+
+            def _group(x):
+                return x.reshape((n_local, int(ctx.chains_per_walker)) + x.shape[1:])
+
+            grouped_left = tree_map(_group, left_fields_all)
+            pool_seed = _ensure_pool_field_batch_size(trial, grouped_left, int(trial.n_samples))
+            left_selected = tree_map(_pick_one, left_fields_all)
+            pool_seed = tree_map(lambda x, s: x.at[:, 0].set(s), pool_seed, left_selected)
+        else:
+            walkers = walkers_all
+            left_selected = left_fields_all
+            pool_seed = tree_map(
+                lambda x: jnp.repeat(x[:, None], int(trial.n_samples), axis=1),
+                left_selected,
+            )
+
+        walkers = _ensure_complex_walkers(walkers)
+        if noise > 0.0:
+            if isinstance(walkers, (tuple, list)) and len(walkers) == 2:
+                _, k1, k2 = jax.random.split(ctx.root_key, 3)
+                w_up, w_dn = walkers
+                walkers = (
+                    w_up + noise * jax.random.normal(k1, w_up.shape),
+                    w_dn + noise * jax.random.normal(k2, w_dn.shape),
+                )
+            else:
+                _, kn = jax.random.split(ctx.root_key, 2)
+                walkers = walkers + noise * jax.random.normal(kn, walkers.shape)
+
+        walkers, _ = orthonormalize(walkers)
+    return walkers, pool_seed
+
+
+def _initialize_runtime_state_local(
+    trial: VAFQMCTrial,
+    hamil: Hamiltonian,
+    walkers: Any,
+    pool_seed: Any,
+    key: Any,
+    device: Any,
+    e_est_init: Any,
+) -> tuple[AFQMCState, float]:
+    trial_local = _clone_stochastic_trial_for_runtime_init(trial, seed=int(jax.device_get(key)[0]))
+    trial_local._runtime_burnin_log_enabled = False
+    trial_local._init_pool_fields_override = pool_seed
+
+    with jax.default_device(device):
+        key_out, trial_key = jax.random.split(key)
+        trial_state = trial_local.init_runtime_state(walkers, key=trial_key, reinit=True)
+        sign, logov = trial_local.calc_slov_state(walkers, trial_state)
+        sign = sign.astype(jnp.complex128)
+        logov = logov.astype(jnp.float64)
+        weights = jnp.ones((int(tree_leaves(walkers)[0].shape[0]),), dtype=jnp.float64)
+        e_sum = 0.0
+        if e_est_init is None:
+            e_local = jnp.sum(jnp.real(trial_local.calc_local_energy_state(hamil, walkers, trial_state)))
+            e_sum = float(jax.device_get(e_local))
+
+        state = AFQMCState(
+            walkers=walkers,
+            weights=weights,
+            sign=sign,
+            logov=logov,
+            key=key_out,
+            e_estimate=jnp.asarray(0.0, dtype=jnp.float64),
+            pop_control_shift=jnp.asarray(0.0, dtype=jnp.float64),
+            walker_fields=_initial_walker_fields_custom(trial_local, trial_state),
+            trial_state=trial_state,
+        )
+    return state, e_sum
+
+
+def _build_initial_state_custom_multi_stochastic(
+    hamil: Hamiltonian,
+    trial: VAFQMCTrial,
+    cfg: AFQMCConfig,
+    n_devices: int,
+    n_local: int,
+    devices: Any,
+) -> tuple[PropagationData, AFQMCState, int, int]:
+    logger = logging.getLogger("hafqmc.afqmc")
+    prop_data = build_propagation_data(hamil, trial, cfg.dt)
+    local_keys = list(jax.random.split(jax.random.PRNGKey(cfg.seed), n_devices))
+    e_est_init = getattr(cfg, "e_estimate_init", None)
+
+    chains_per_walker = int(getattr(trial, "init_walkers_chains_per_walker", 0))
+    if chains_per_walker <= 0:
+        chains_per_walker = int(trial.n_samples)
+
+    if bool(getattr(trial, "init_walkers_from_trial", False)):
+        logger.info(
+            "Initializing walkers from trial sampler: n_walkers=%d local_walkers=%d devices=%d sampler=%s burn_in=%d",
+            int(cfg.n_walkers),
+            int(n_local),
+            int(n_devices),
+            str(getattr(trial, "_sampler_name", "unknown")),
+            int(trial.init_walkers_burn_in),
+        )
+        logger.info(
+            "Trial & walker burn-in: total_chains=%d (%d walkers x %d chains/walker)",
+            int(cfg.n_walkers * chains_per_walker),
+            int(cfg.n_walkers),
+            int(chains_per_walker),
+        )
+
+        with ThreadPoolExecutor(max_workers=n_devices) as executor:
+            init_ctx_futs = [
+                executor.submit(_build_stochastic_init_context_local, trial, n_local, key_i, dev)
+                for dev, key_i in zip(devices, local_keys)
+            ]
+            contexts = [f.result() for f in init_ctx_futs]
+
+            infer_steps = int(getattr(trial, "init_walkers_infer_steps", 0))
+            infer_pm = _make_stochastic_init_infer_pm(trial) if infer_steps > 0 else None
+            if infer_steps > 0 and infer_pm is not None:
+                logger.info(
+                    "Starting trial energy inference for %d steps on %d devices",
+                    int(infer_steps),
+                    int(n_devices),
+                )
+                for ii in range(infer_steps):
+                    step_futs = [executor.submit(_sample_stochastic_infer_local, ctx) for ctx in contexts]
+                    step_out = [f.result() for f in step_futs]
+                    contexts = [x[0] for x in step_out]
+                    infer_fields_local = [x[1] for x in step_out]
+                    infer_logsw_local = [x[2] for x in step_out]
+                    infer_fields = shard_local_pytrees(infer_fields_local, devices)
+                    infer_logsw = jax.device_put_sharded(infer_logsw_local, devices)
+                    e_infer_rep, exp_es_rep, exp_s_rep = infer_pm(infer_fields, infer_logsw)
+                    logger.info(
+                        "Infer %d/%d e_vafqmc=%.12f exp_es=%.12f exp_s=%.12f",
+                        ii + 1,
+                        int(infer_steps),
+                        float(host_replicated_value(e_infer_rep)),
+                        float(host_replicated_value(exp_es_rep)),
+                        float(host_replicated_value(exp_s_rep)),
+                    )
+
+            final_futs = [
+                executor.submit(_finalize_stochastic_walkers_local, trial, ctx, n_local, cfg.init_noise)
+                for ctx in contexts
+            ]
+            final_out = [f.result() for f in final_futs]
+            walkers_local = [x[0] for x in final_out]
+            pool_seed_local = [x[1] for x in final_out]
+
+            if int(getattr(trial, "burn_in", 0)) > 0:
+                logger.info(
+                    "Burning in the trial for %d steps on %d devices.",
+                    int(trial.burn_in),
+                    int(n_devices),
+                )
+
+            runtime_futs = [
+                executor.submit(
+                    _initialize_runtime_state_local,
+                    trial,
+                    hamil,
+                    walkers_i,
+                    pool_seed_i,
+                    key_i,
+                    dev,
+                    e_est_init,
+                )
+                for walkers_i, pool_seed_i, key_i, dev in zip(walkers_local, pool_seed_local, local_keys, devices)
+            ]
+            runtime_out = [f.result() for f in runtime_futs]
+            local_states = [x[0] for x in runtime_out]
+            e_sum = float(sum(x[1] for x in runtime_out))
+
+        logger.info(
+            "End of walker burn-in: total walkers=%d.",
+            int(cfg.n_walkers),
+        )
+    else:
+        e_sum = 0.0
+        local_states = []
+        for dev, key_i in zip(devices, local_keys):
+            with jax.default_device(dev):
+                walkers, key_out = init_walkers(trial, n_local, key_i, noise=cfg.init_noise)
+                walkers = _ensure_complex_walkers(walkers)
+                trial_state, key_out = _bind_trial_runtime_state_custom(trial, walkers, key_out)
+                sign, logov = _calc_trial_overlap_custom(trial, walkers, trial_state)
+                sign = sign.astype(jnp.complex128)
+                logov = logov.astype(jnp.float64)
+                weights = jnp.ones((n_local,), dtype=jnp.float64)
+                if e_est_init is None:
+                    e_local = jnp.sum(
+                        _calc_trial_local_energy_custom(hamil, trial, walkers, trial_state)
+                    )
+                    e_sum += float(jax.device_get(e_local))
+                local_states.append(
+                    AFQMCState(
+                        walkers=walkers,
+                        weights=weights,
+                        sign=sign,
+                        logov=logov,
+                        key=key_out,
+                        e_estimate=jnp.asarray(0.0, dtype=jnp.float64),
+                        pop_control_shift=jnp.asarray(0.0, dtype=jnp.float64),
+                        walker_fields=_initial_walker_fields_custom(trial, trial_state),
+                        trial_state=trial_state,
+                    )
+                )
+
+    e_estimate = (
+        jnp.asarray(float(e_est_init), dtype=jnp.float64)
+        if e_est_init is not None
+        else jnp.asarray(e_sum / float(cfg.n_walkers), dtype=jnp.float64)
+    )
+    local_states = [
+        AFQMCState(
+            walkers=st.walkers,
+            weights=st.weights,
+            sign=st.sign,
+            logov=st.logov,
+            key=st.key,
+            e_estimate=e_estimate,
+            pop_control_shift=e_estimate,
+            walker_fields=st.walker_fields,
+            trial_state=st.trial_state,
+        )
+        for st in local_states
+    ]
+    return prop_data, shard_local_pytrees(local_states, devices), n_devices, n_local
 
 
 def _build_initial_state_custom(
@@ -995,6 +1434,16 @@ def _build_initial_state_custom_multi(
     cfg: AFQMCConfig,
 ) -> tuple[PropagationData, AFQMCState, int, int]:
     n_devices, n_local, devices = require_local_devices(cfg.n_walkers)
+    if isinstance(trial, VAFQMCTrial):
+        return _build_initial_state_custom_multi_stochastic(
+            hamil,
+            trial,
+            cfg,
+            n_devices,
+            n_local,
+            devices,
+        )
+
     prop_data = build_propagation_data(hamil, trial, cfg.dt)
     local_keys = jax.random.split(jax.random.PRNGKey(cfg.seed), n_devices)
     e_est_init = getattr(cfg, "e_estimate_init", None)
