@@ -781,6 +781,20 @@ def _initialize_runtime_state_local(
     return state, e_sum
 
 
+def _initialize_stochastic_reference_walkers_local(
+    trial: VAFQMCTrial,
+    n_local: int,
+    key: Any,
+    noise: float,
+    device: Any,
+) -> Any:
+    trial_local = _clone_stochastic_trial_for_runtime_init(trial, seed=int(jax.device_get(key)[0]))
+    with jax.default_device(device):
+        walkers, _ = init_walkers(trial_local, n_local, key, noise=noise)
+        walkers = _ensure_complex_walkers(walkers)
+    return walkers
+
+
 def _build_initial_state_custom_multi_stochastic(
     hamil: Hamiltonian,
     trial: VAFQMCTrial,
@@ -884,35 +898,43 @@ def _build_initial_state_custom_multi_stochastic(
             int(cfg.n_walkers),
         )
     else:
-        e_sum = 0.0
-        local_states = []
-        for dev, key_i in zip(devices, local_keys):
-            with jax.default_device(dev):
-                walkers, key_out = init_walkers(trial, n_local, key_i, noise=cfg.init_noise)
-                walkers = _ensure_complex_walkers(walkers)
-                trial_state, key_out = _bind_trial_runtime_state_custom(trial, walkers, key_out)
-                sign, logov = _calc_trial_overlap_custom(trial, walkers, trial_state)
-                sign = sign.astype(jnp.complex128)
-                logov = logov.astype(jnp.float64)
-                weights = jnp.ones((n_local,), dtype=jnp.float64)
-                if e_est_init is None:
-                    e_local = jnp.sum(
-                        _calc_trial_local_energy_custom(hamil, trial, walkers, trial_state)
-                    )
-                    e_sum += float(jax.device_get(e_local))
-                local_states.append(
-                    AFQMCState(
-                        walkers=walkers,
-                        weights=weights,
-                        sign=sign,
-                        logov=logov,
-                        key=key_out,
-                        e_estimate=jnp.asarray(0.0, dtype=jnp.float64),
-                        pop_control_shift=jnp.asarray(0.0, dtype=jnp.float64),
-                        walker_fields=_initial_walker_fields_custom(trial, trial_state),
-                        trial_state=trial_state,
-                    )
+        with ThreadPoolExecutor(max_workers=n_devices) as executor:
+            walkers_futs = [
+                executor.submit(
+                    _initialize_stochastic_reference_walkers_local,
+                    trial,
+                    n_local,
+                    key_i,
+                    cfg.init_noise,
+                    dev,
                 )
+                for key_i, dev in zip(local_keys, devices)
+            ]
+            walkers_local = [f.result() for f in walkers_futs]
+
+            if int(getattr(trial, "burn_in", 0)) > 0:
+                logger.info(
+                    "Burning in the trial for %d steps on %d devices.",
+                    int(trial.burn_in),
+                    int(n_devices),
+                )
+
+            runtime_futs = [
+                executor.submit(
+                    _initialize_runtime_state_local,
+                    trial,
+                    hamil,
+                    walkers_i,
+                    None,
+                    key_i,
+                    dev,
+                    e_est_init,
+                )
+                for walkers_i, key_i, dev in zip(walkers_local, local_keys, devices)
+            ]
+            runtime_out = [f.result() for f in runtime_futs]
+            local_states = [x[0] for x in runtime_out]
+            e_sum = float(sum(x[1] for x in runtime_out))
 
     e_estimate = (
         jnp.asarray(float(e_est_init), dtype=jnp.float64)
