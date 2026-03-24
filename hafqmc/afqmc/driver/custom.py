@@ -1554,6 +1554,10 @@ def _update_pop_summary_host(summary: dict[str, float], state: AFQMCState, pop_s
     summary["wsum_max"] = max(summary["wsum_max"], wsum)
 
 
+def _block_ready_tree(x: Any) -> Any:
+    return tree_map(lambda y: y.block_until_ready() if hasattr(y, "block_until_ready") else y, x)
+
+
 def _run_steps_with_pop_control_custom_multi(
     state: AFQMCState,
     runner: _CustomScanRunnerMulti,
@@ -1591,6 +1595,8 @@ def _run_steps_with_pop_control_custom_multi(
                 str(bool(do_resample)),
             )
         state = runner.run_steps(state, nrun, label, step_start=local_step)
+        if debug_trace:
+            _ = _block_ready_tree(state.weights)
         if debug_trace and logger is not None:
             logger.info(
                 "Trace %s chunk-done: steps_done=%d/%d step_counter=%d local_step=%d nrun=%d",
@@ -1615,6 +1621,8 @@ def _run_steps_with_pop_control_custom_multi(
                     int(pop_freq),
                 )
             state = resample_fn(state)
+            if debug_trace:
+                _ = _block_ready_tree(state.weights)
             if debug_trace and logger is not None:
                 logger.info(
                     "Trace %s resample-done: step_counter=%d pop_freq=%d",
@@ -1733,6 +1741,8 @@ def _run_custom_equilibration_multi(
                 )
             state = runner.run_steps(state, nrun, "eql")
             if debug_trace:
+                _ = _block_ready_tree(state.weights)
+            if debug_trace:
                 logger.info(
                     "Trace eql chunk-done: steps_done=%d/%d nrun=%d mode=no-pop-control",
                     int(eq_done + nrun),
@@ -1749,6 +1759,7 @@ def _run_custom_equilibration_multi(
                     int(cfg.n_eq_steps),
                 )
                 local_num_rep, local_den_rep = mixed_energy_terms_fn(state)
+                _ = _block_ready_tree((local_num_rep, local_den_rep))
                 logger.info(
                     "Trace eql mixed-energy-local-done: eq_done=%d/%d",
                     int(eq_done),
@@ -1760,6 +1771,7 @@ def _run_custom_equilibration_multi(
                     int(cfg.n_eq_steps),
                 )
                 global_num_rep, global_den_rep = mixed_energy_reduce_fn(local_num_rep, local_den_rep)
+                _ = _block_ready_tree((global_num_rep, global_den_rep))
                 e_mix = float(host_replicated_value(global_num_rep / global_den_rep))
                 logger.info(
                     "Trace eql mixed-energy-reduce-done: eq_done=%d/%d",
@@ -1769,7 +1781,10 @@ def _run_custom_equilibration_multi(
             else:
                 if debug_trace:
                     logger.info("Trace eql mixed-energy-start: eq_done=%d/%d", int(eq_done), int(cfg.n_eq_steps))
-                e_mix = float(host_replicated_value(mixed_energy_fn(state)))
+                e_mix_rep = mixed_energy_fn(state)
+                if debug_trace:
+                    _ = _block_ready_tree(e_mix_rep)
+                e_mix = float(host_replicated_value(e_mix_rep))
             if debug_trace:
                 logger.info("Trace eql mixed-energy-done: eq_done=%d/%d", int(eq_done), int(cfg.n_eq_steps))
             state = update_e_fn(state, e_mix)
