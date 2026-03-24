@@ -1399,15 +1399,24 @@ def _calc_mixed_energy_custom_multi(
     state: AFQMCState,
     axis_name: str,
 ) -> Any:
+    local_num, local_den = _calc_mixed_energy_terms_custom_multi(hamil, trial, state)
+    global_num = lax.psum(local_num, axis_name)
+    global_den = jnp.maximum(lax.psum(local_den, axis_name), 1.0e-12)
+    return global_num / global_den
+
+
+def _calc_mixed_energy_terms_custom_multi(
+    hamil: Hamiltonian,
+    trial: Any,
+    state: AFQMCState,
+) -> tuple[Any, Any]:
     if state.trial_state is not None and hasattr(trial, "calc_local_energy_state"):
         e_loc = jnp.real(trial.calc_local_energy_state(hamil, state.walkers, state.trial_state))
     else:
         e_loc = jnp.real(calc_local_energy_batch(hamil, trial, state.walkers))
     local_num = jnp.sum(state.weights * e_loc)
     local_den = jnp.sum(state.weights)
-    global_num = lax.psum(local_num, axis_name)
-    global_den = jnp.maximum(lax.psum(local_den, axis_name), 1.0e-12)
-    return global_num / global_den
+    return local_num, local_den
 
 
 def _measure_block_energy_custom_multi(
@@ -1659,6 +1668,24 @@ def _run_custom_equilibration_multi(
         ),
         axis_name=PMAP_AXIS_NAME,
     )
+    mixed_energy_terms_fn = None
+    mixed_energy_reduce_fn = None
+    if debug_trace:
+        mixed_energy_terms_fn = jax.pmap(
+            lambda st: _calc_mixed_energy_terms_custom_multi(
+                hamil,
+                trial,
+                st,
+            ),
+            axis_name=PMAP_AXIS_NAME,
+        )
+        mixed_energy_reduce_fn = jax.pmap(
+            lambda num, den: (
+                lax.psum(num, PMAP_AXIS_NAME),
+                jnp.maximum(lax.psum(den, PMAP_AXIS_NAME), 1.0e-12),
+            ),
+            axis_name=PMAP_AXIS_NAME,
+        )
     update_e_fn = jax.pmap(
         lambda st, e_blk: _update_e_estimate(st, e_blk),
         in_axes=(0, None),
@@ -1714,9 +1741,35 @@ def _run_custom_equilibration_multi(
                 )
         eq_done += nrun
         if measure_equil_energy:
-            if debug_trace:
+            if debug_trace and mixed_energy_terms_fn is not None and mixed_energy_reduce_fn is not None:
                 logger.info("Trace eql mixed-energy-start: eq_done=%d/%d", int(eq_done), int(cfg.n_eq_steps))
-            e_mix = float(host_replicated_value(mixed_energy_fn(state)))
+                logger.info(
+                    "Trace eql mixed-energy-local-start: eq_done=%d/%d",
+                    int(eq_done),
+                    int(cfg.n_eq_steps),
+                )
+                local_num_rep, local_den_rep = mixed_energy_terms_fn(state)
+                logger.info(
+                    "Trace eql mixed-energy-local-done: eq_done=%d/%d",
+                    int(eq_done),
+                    int(cfg.n_eq_steps),
+                )
+                logger.info(
+                    "Trace eql mixed-energy-reduce-start: eq_done=%d/%d",
+                    int(eq_done),
+                    int(cfg.n_eq_steps),
+                )
+                global_num_rep, global_den_rep = mixed_energy_reduce_fn(local_num_rep, local_den_rep)
+                e_mix = float(host_replicated_value(global_num_rep / global_den_rep))
+                logger.info(
+                    "Trace eql mixed-energy-reduce-done: eq_done=%d/%d",
+                    int(eq_done),
+                    int(cfg.n_eq_steps),
+                )
+            else:
+                if debug_trace:
+                    logger.info("Trace eql mixed-energy-start: eq_done=%d/%d", int(eq_done), int(cfg.n_eq_steps))
+                e_mix = float(host_replicated_value(mixed_energy_fn(state)))
             if debug_trace:
                 logger.info("Trace eql mixed-energy-done: eq_done=%d/%d", int(eq_done), int(cfg.n_eq_steps))
             state = update_e_fn(state, e_mix)
