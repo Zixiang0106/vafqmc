@@ -1,4 +1,4 @@
-"""Single-host multi-GPU helpers for walker-sharded AFQMC."""
+"""Distributed multi-GPU helpers for walker-sharded AFQMC."""
 
 from __future__ import annotations
 
@@ -25,15 +25,32 @@ _RUNTIME_STATE_BATCH_KEYS = (
 
 
 def require_local_devices(n_walkers: int) -> tuple[int, int, Sequence[Any]]:
-    n_devices = int(jax.local_device_count())
+    n_devices = int(jax.device_count())
+    n_local_devices = int(jax.local_device_count())
+    n_processes = int(jax.process_count())
+
     if n_devices <= 1:
-        raise ValueError("multi_gpu walker distribution requires at least 2 visible local devices.")
+        raise ValueError("multi_gpu walker distribution requires at least 2 visible devices.")
+    if n_local_devices <= 0:
+        raise ValueError("No local devices are visible to the current JAX process.")
+    if n_processes > 1 and n_devices != n_local_devices * n_processes:
+        raise ValueError(
+            "AFQMC distributed multi-GPU currently assumes each process exposes the same "
+            "number of local devices."
+        )
     if int(n_walkers) % n_devices != 0:
         raise ValueError(
-            f"n_walkers={int(n_walkers)} must be divisible by visible local devices={n_devices}."
+            f"n_walkers={int(n_walkers)} must be divisible by total visible devices={n_devices}."
         )
     n_local = int(n_walkers) // n_devices
-    return n_devices, n_local, tuple(jax.local_devices()[:n_devices])
+    return n_devices, n_local, tuple(jax.local_devices()[:n_local_devices])
+
+
+def make_local_device_keys(seed: int, n_devices: int, devices: Sequence[Any]) -> tuple[Any, ...]:
+    n_local_devices = int(len(devices))
+    start = int(jax.process_index()) * n_local_devices
+    all_keys = jax.random.split(jax.random.PRNGKey(int(seed)), int(n_devices))
+    return tuple(all_keys[start : start + n_local_devices])
 
 
 def shard_local_pytrees(local_values: Sequence[Any], devices: Sequence[Any]) -> Any:
@@ -45,6 +62,13 @@ def shard_local_pytrees(local_values: Sequence[Any], devices: Sequence[Any]) -> 
 
 def host_replicated_value(x: Any) -> Any:
     return jax.device_get(x)[0]
+
+
+def _host_first_replica(x: Any) -> Any:
+    arr = jax.device_get(x)
+    if getattr(arr, "ndim", 0) == 0:
+        return arr
+    return arr[0]
 
 
 def _host_unshard_batch(x: Any) -> Any:
@@ -74,6 +98,23 @@ def host_gather_state(state: AFQMCState) -> AFQMCState:
         pop_control_shift=host_replicated_value(state.pop_control_shift),
         walker_fields=_host_unshard_batch(state.walker_fields),
         trial_state=_host_gather_runtime_state(state.trial_state),
+    )
+
+
+def host_replicated_state(state: AFQMCState) -> AFQMCState:
+    trial_state = None
+    if state.trial_state is not None:
+        trial_state = tree_map(_host_first_replica, state.trial_state)
+    return AFQMCState(
+        walkers=tree_map(_host_first_replica, state.walkers),
+        weights=_host_first_replica(state.weights),
+        sign=_host_first_replica(state.sign),
+        logov=_host_first_replica(state.logov),
+        key=_host_first_replica(state.key),
+        e_estimate=_host_first_replica(state.e_estimate),
+        pop_control_shift=_host_first_replica(state.pop_control_shift),
+        walker_fields=_host_first_replica(state.walker_fields),
+        trial_state=trial_state,
     )
 
 
@@ -113,6 +154,21 @@ def _slice_runtime_state(runtime_state: Any, axis_name: str, n_local: int) -> An
             runtime_state[key],
         )
     return sliced
+
+
+def replicate_state(state: AFQMCState, axis_name: str = PMAP_AXIS_NAME) -> AFQMCState:
+    global_key = lax.all_gather(state.key, axis_name)[0]
+    return AFQMCState(
+        walkers=tree_map(lambda x: _all_gather_flat(x, axis_name), state.walkers),
+        weights=_all_gather_flat(state.weights, axis_name),
+        sign=_all_gather_flat(state.sign, axis_name),
+        logov=_all_gather_flat(state.logov, axis_name),
+        key=global_key,
+        e_estimate=state.e_estimate,
+        pop_control_shift=state.pop_control_shift,
+        walker_fields=_all_gather_flat(state.walker_fields, axis_name),
+        trial_state=_gather_runtime_state(state.trial_state, axis_name),
+    )
 
 
 def distributed_stochastic_reconfiguration(
@@ -158,7 +214,10 @@ __all__ = [
     "PMAP_AXIS_NAME",
     "distributed_stochastic_reconfiguration",
     "host_gather_state",
+    "host_replicated_state",
     "host_replicated_value",
+    "make_local_device_keys",
+    "replicate_state",
     "require_local_devices",
     "shard_local_pytrees",
 ]

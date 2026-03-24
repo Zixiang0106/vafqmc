@@ -34,7 +34,10 @@ from .multi_gpu import (
     PMAP_AXIS_NAME,
     distributed_stochastic_reconfiguration,
     host_gather_state,
+    host_replicated_state,
     host_replicated_value,
+    make_local_device_keys,
+    replicate_state,
     require_local_devices,
     shard_local_pytrees,
 )
@@ -805,7 +808,8 @@ def _build_initial_state_custom_multi_stochastic(
 ) -> tuple[PropagationData, AFQMCState, int, int]:
     logger = logging.getLogger("hafqmc.afqmc")
     prop_data = build_propagation_data(hamil, trial, cfg.dt)
-    local_keys = list(jax.random.split(jax.random.PRNGKey(cfg.seed), n_devices))
+    n_local_devices = int(len(devices))
+    local_keys = list(make_local_device_keys(int(cfg.seed), n_devices, devices))
     e_est_init = getattr(cfg, "e_estimate_init", None)
 
     chains_per_walker = int(getattr(trial, "init_walkers_chains_per_walker", 0))
@@ -828,7 +832,7 @@ def _build_initial_state_custom_multi_stochastic(
             int(chains_per_walker),
         )
 
-        with ThreadPoolExecutor(max_workers=n_devices) as executor:
+        with ThreadPoolExecutor(max_workers=n_local_devices) as executor:
             init_ctx_futs = [
                 executor.submit(_build_stochastic_init_context_local, trial, n_local, key_i, dev)
                 for dev, key_i in zip(devices, local_keys)
@@ -898,7 +902,7 @@ def _build_initial_state_custom_multi_stochastic(
             int(cfg.n_walkers),
         )
     else:
-        with ThreadPoolExecutor(max_workers=n_devices) as executor:
+        with ThreadPoolExecutor(max_workers=n_local_devices) as executor:
             walkers_futs = [
                 executor.submit(
                     _initialize_stochastic_reference_walkers_local,
@@ -1467,7 +1471,7 @@ def _build_initial_state_custom_multi(
         )
 
     prop_data = build_propagation_data(hamil, trial, cfg.dt)
-    local_keys = jax.random.split(jax.random.PRNGKey(cfg.seed), n_devices)
+    local_keys = make_local_device_keys(int(cfg.seed), n_devices, devices)
     e_est_init = getattr(cfg, "e_estimate_init", None)
     e_sum = 0.0
     local_states = []
@@ -1711,8 +1715,9 @@ def run_afqmc_custom_multi(
 
     runner = _CustomScanRunnerMulti(hamil, trial, prop_data, cfg, logger, cfg.n_walkers)
     state = _run_custom_equilibration_multi(state, runner, hamil, trial, cfg, logger, start)
+    is_root_process = int(jax.process_index()) == 0
     visualizer = build_energy_visualizer(
-        enabled=bool(getattr(cfg, "output_visualization_enabled", False)),
+        enabled=bool(getattr(cfg, "output_visualization_enabled", False)) and is_root_process,
         logger=logger,
         title="AFQMC Live Energy (custom)",
         refresh_every=int(getattr(cfg, "output_visualization_refresh_every", 1)),
@@ -1723,7 +1728,7 @@ def run_afqmc_custom_multi(
     block_energies: list[Any] = []
     block_weights: list[Any] = []
     raw_rows: list[tuple[int, float, float, float, float, float]] = []
-    write_raw = bool(getattr(cfg, "output_write_raw", False))
+    write_raw = bool(getattr(cfg, "output_write_raw", False)) and is_root_process
     raw_path = str(getattr(cfg, "output_raw_path", "raw.dat"))
     raw_stream: TextIO | None = _open_raw_block_stream(raw_path) if write_raw else None
     n_ene_measurements = max(int(getattr(cfg, "n_ene_measurements", 1)), 1)
@@ -1872,7 +1877,14 @@ def run_afqmc_custom_multi(
     if write_raw:
         logger.info("Saved AFQMC raw block data: %s", raw_path)
 
-    final_state = host_gather_state(state) if return_state else state
+    if return_state:
+        gather_state_fn = jax.pmap(
+            lambda st: replicate_state(st, PMAP_AXIS_NAME),
+            axis_name=PMAP_AXIS_NAME,
+        )
+        final_state = host_replicated_state(gather_state_fn(state))
+    else:
+        final_state = state
     return _finalize_outputs(
         logger,
         start,
@@ -1896,7 +1908,7 @@ def run_afqmc_custom(
     return_blocks: bool,
 ):
     if bool(getattr(cfg, "multi_gpu", False)):
-        if int(jax.local_device_count()) > 1:
+        if int(jax.device_count()) > 1:
             return run_afqmc_custom_multi(
                 hamil,
                 trial,
@@ -1907,8 +1919,8 @@ def run_afqmc_custom(
                 return_blocks=return_blocks,
             )
         logger.warning(
-            "cfg.propagation.multi_gpu=True but only %d local device is visible; falling back to single-device.",
-            int(jax.local_device_count()),
+            "cfg.propagation.multi_gpu=True but only %d total visible device is available; falling back to single-device.",
+            int(jax.device_count()),
         )
 
     prop_data, state = _build_initial_state_custom(hamil, trial, cfg)
