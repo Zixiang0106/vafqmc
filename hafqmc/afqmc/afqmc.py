@@ -52,7 +52,8 @@ def _configure_process_local_runtime(
         cfg_runtime.output_write_hparams = False
         cfg_runtime.output_write_raw = False
         cfg_runtime.output_visualization_enabled = False
-        logger.disabled = True
+        if not bool(getattr(cfg_runtime, "log_equil_debug_trace", False)):
+            logger.disabled = True
     return process_index
 
 

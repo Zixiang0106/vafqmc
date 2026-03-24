@@ -1577,6 +1577,7 @@ def _run_steps_with_pop_control_custom_multi(
     steps_done = 0
     local_step = 0
     summary = _init_pop_summary()
+    proc = int(jax.process_index()) if debug_trace else 0
     while steps_done < n_steps:
         if pop_freq > 0:
             to_pop = pop_freq - (step_counter % pop_freq)
@@ -1585,7 +1586,8 @@ def _run_steps_with_pop_control_custom_multi(
             nrun = n_steps - steps_done
         if debug_trace and logger is not None:
             logger.info(
-                "Trace %s chunk-start: steps_done=%d/%d step_counter=%d local_step=%d nrun=%d do_resample=%s",
+                "Trace proc=%d %s chunk-start: steps_done=%d/%d step_counter=%d local_step=%d nrun=%d do_resample=%s",
+                int(proc),
                 label,
                 int(steps_done),
                 int(n_steps),
@@ -1599,7 +1601,8 @@ def _run_steps_with_pop_control_custom_multi(
             _ = _block_ready_tree(state.weights)
         if debug_trace and logger is not None:
             logger.info(
-                "Trace %s chunk-done: steps_done=%d/%d step_counter=%d local_step=%d nrun=%d",
+                "Trace proc=%d %s chunk-done: steps_done=%d/%d step_counter=%d local_step=%d nrun=%d",
+                int(proc),
                 label,
                 int(steps_done + nrun),
                 int(n_steps),
@@ -1615,7 +1618,8 @@ def _run_steps_with_pop_control_custom_multi(
                 _update_pop_summary_host(summary, state, pop_stats_fn)
             if debug_trace and logger is not None:
                 logger.info(
-                    "Trace %s resample-start: step_counter=%d pop_freq=%d",
+                    "Trace proc=%d %s resample-start: step_counter=%d pop_freq=%d",
+                    int(proc),
                     label,
                     int(step_counter),
                     int(pop_freq),
@@ -1625,7 +1629,8 @@ def _run_steps_with_pop_control_custom_multi(
                 _ = _block_ready_tree(state.weights)
             if debug_trace and logger is not None:
                 logger.info(
-                    "Trace %s resample-done: step_counter=%d pop_freq=%d",
+                    "Trace proc=%d %s resample-done: step_counter=%d pop_freq=%d",
+                    int(proc),
                     label,
                     int(step_counter),
                     int(pop_freq),
@@ -1645,7 +1650,8 @@ def _run_custom_equilibration_multi(
     log_enabled = bool(getattr(cfg, "log_enabled", True))
     eq_freq = int(getattr(cfg, "log_equil_freq", 0))
     log_eq = bool(log_enabled and eq_freq > 0)
-    debug_trace = bool(log_enabled and getattr(cfg, "log_equil_debug_trace", False))
+    debug_trace = bool(getattr(cfg, "log_equil_debug_trace", False))
+    proc = int(jax.process_index()) if debug_trace else 0
     eq_chunk = max(eq_freq, 1) if eq_freq > 0 else int(cfg.n_eq_steps)
 
     global_wsum_fn = jax.pmap(
@@ -1734,7 +1740,8 @@ def _run_custom_equilibration_multi(
         else:
             if debug_trace:
                 logger.info(
-                    "Trace eql chunk-start: steps_done=%d/%d nrun=%d mode=no-pop-control",
+                    "Trace proc=%d eql chunk-start: steps_done=%d/%d nrun=%d mode=no-pop-control",
+                    int(proc),
                     int(eq_done),
                     int(cfg.n_eq_steps),
                     int(nrun),
@@ -1744,7 +1751,8 @@ def _run_custom_equilibration_multi(
                 _ = _block_ready_tree(state.weights)
             if debug_trace:
                 logger.info(
-                    "Trace eql chunk-done: steps_done=%d/%d nrun=%d mode=no-pop-control",
+                    "Trace proc=%d eql chunk-done: steps_done=%d/%d nrun=%d mode=no-pop-control",
+                    int(proc),
                     int(eq_done + nrun),
                     int(cfg.n_eq_steps),
                     int(nrun),
@@ -1752,21 +1760,29 @@ def _run_custom_equilibration_multi(
         eq_done += nrun
         if measure_equil_energy:
             if debug_trace and mixed_energy_terms_fn is not None and mixed_energy_reduce_fn is not None:
-                logger.info("Trace eql mixed-energy-start: eq_done=%d/%d", int(eq_done), int(cfg.n_eq_steps))
                 logger.info(
-                    "Trace eql mixed-energy-local-start: eq_done=%d/%d",
+                    "Trace proc=%d eql mixed-energy-start: eq_done=%d/%d",
+                    int(proc),
+                    int(eq_done),
+                    int(cfg.n_eq_steps),
+                )
+                logger.info(
+                    "Trace proc=%d eql mixed-energy-local-start: eq_done=%d/%d",
+                    int(proc),
                     int(eq_done),
                     int(cfg.n_eq_steps),
                 )
                 local_num_rep, local_den_rep = mixed_energy_terms_fn(state)
                 _ = _block_ready_tree((local_num_rep, local_den_rep))
                 logger.info(
-                    "Trace eql mixed-energy-local-done: eq_done=%d/%d",
+                    "Trace proc=%d eql mixed-energy-local-done: eq_done=%d/%d",
+                    int(proc),
                     int(eq_done),
                     int(cfg.n_eq_steps),
                 )
                 logger.info(
-                    "Trace eql mixed-energy-reduce-start: eq_done=%d/%d",
+                    "Trace proc=%d eql mixed-energy-reduce-start: eq_done=%d/%d",
+                    int(proc),
                     int(eq_done),
                     int(cfg.n_eq_steps),
                 )
@@ -1774,28 +1790,49 @@ def _run_custom_equilibration_multi(
                 _ = _block_ready_tree((global_num_rep, global_den_rep))
                 e_mix = float(host_replicated_value(global_num_rep / global_den_rep))
                 logger.info(
-                    "Trace eql mixed-energy-reduce-done: eq_done=%d/%d",
+                    "Trace proc=%d eql mixed-energy-reduce-done: eq_done=%d/%d",
+                    int(proc),
                     int(eq_done),
                     int(cfg.n_eq_steps),
                 )
             else:
                 if debug_trace:
-                    logger.info("Trace eql mixed-energy-start: eq_done=%d/%d", int(eq_done), int(cfg.n_eq_steps))
+                    logger.info(
+                        "Trace proc=%d eql mixed-energy-start: eq_done=%d/%d",
+                        int(proc),
+                        int(eq_done),
+                        int(cfg.n_eq_steps),
+                    )
                 e_mix_rep = mixed_energy_fn(state)
                 if debug_trace:
                     _ = _block_ready_tree(e_mix_rep)
                 e_mix = float(host_replicated_value(e_mix_rep))
             if debug_trace:
-                logger.info("Trace eql mixed-energy-done: eq_done=%d/%d", int(eq_done), int(cfg.n_eq_steps))
+                logger.info(
+                    "Trace proc=%d eql mixed-energy-done: eq_done=%d/%d",
+                    int(proc),
+                    int(eq_done),
+                    int(cfg.n_eq_steps),
+                )
             state = update_e_fn(state, e_mix)
             state = update_shift_fn(state, e_mix)
 
         if cfg.resample and pop_freq <= 0:
             if debug_trace:
-                logger.info("Trace eql resample-start: eq_done=%d/%d", int(eq_done), int(cfg.n_eq_steps))
+                logger.info(
+                    "Trace proc=%d eql resample-start: eq_done=%d/%d",
+                    int(proc),
+                    int(eq_done),
+                    int(cfg.n_eq_steps),
+                )
             state = resample_fn(state)
             if debug_trace:
-                logger.info("Trace eql resample-done: eq_done=%d/%d", int(eq_done), int(cfg.n_eq_steps))
+                logger.info(
+                    "Trace proc=%d eql resample-done: eq_done=%d/%d",
+                    int(proc),
+                    int(eq_done),
+                    int(cfg.n_eq_steps),
+                )
 
         if log_eq:
             wsum = float(host_replicated_value(global_wsum_fn(state)))
