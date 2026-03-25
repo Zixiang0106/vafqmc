@@ -1,4 +1,4 @@
-"""Custom-trial AFQMC driver internals."""
+"""Stochastic-trial AFQMC driver internals."""
 
 from __future__ import annotations
 
@@ -142,7 +142,7 @@ def append_raw_block_row(
     f.flush()
 
 
-def _bind_trial_runtime_state_custom(trial: Any, walkers: Any, key: Any) -> tuple[Any, Any]:
+def _bind_trial_runtime_state_stochastic(trial: Any, walkers: Any, key: Any) -> tuple[Any, Any]:
     trial_state = None
     if hasattr(trial, "bind_walkers"):
         if hasattr(trial, "init_runtime_state"):
@@ -156,13 +156,13 @@ def _bind_trial_runtime_state_custom(trial: Any, walkers: Any, key: Any) -> tupl
     return trial_state, key
 
 
-def _calc_trial_overlap_custom(trial: Any, walkers: Any, trial_state: Any):
+def _calc_trial_overlap_stochastic(trial: Any, walkers: Any, trial_state: Any):
     if trial_state is not None and hasattr(trial, "calc_slov_state"):
         return trial.calc_slov_state(walkers, trial_state)
     return calc_slov_batch(trial, walkers)
 
 
-def _calc_trial_local_energy_custom(
+def _calc_trial_local_energy_stochastic(
     hamil: Hamiltonian,
     trial: Any,
     walkers: Any,
@@ -173,7 +173,7 @@ def _calc_trial_local_energy_custom(
     return jnp.real(calc_local_energy_batch(hamil, trial, walkers))
 
 
-def _initial_walker_fields_custom(trial: Any, trial_state: Any):
+def _initial_walker_fields_stochastic(trial: Any, trial_state: Any):
     if isinstance(trial_state, dict) and ("walker_fields" in trial_state):
         return trial_state["walker_fields"]
     if hasattr(trial, "walker_fields") and getattr(trial, "walker_fields") is not None:
@@ -181,7 +181,7 @@ def _initial_walker_fields_custom(trial: Any, trial_state: Any):
     return jnp.zeros((0, 0, 0), dtype=jnp.float64)
 
 
-def _propagate_step_custom(
+def _propagate_step_stochastic(
     hamil: Hamiltonian,
     trial: Any,
     state: AFQMCState,
@@ -268,7 +268,7 @@ def _propagate_step_custom(
     )
 
 
-def _calc_mixed_energy_custom(hamil: Hamiltonian, trial: Any, state: AFQMCState) -> Any:
+def _calc_mixed_energy_stochastic(hamil: Hamiltonian, trial: Any, state: AFQMCState) -> Any:
     if state.trial_state is not None and hasattr(trial, "calc_local_energy_state"):
         e_loc = jnp.real(trial.calc_local_energy_state(hamil, state.walkers, state.trial_state))
     else:
@@ -277,7 +277,7 @@ def _calc_mixed_energy_custom(hamil: Hamiltonian, trial: Any, state: AFQMCState)
     return jnp.sum(state.weights * e_loc) / wsum
 
 
-def _calc_block_energy_once_custom(
+def _calc_block_energy_once_stochastic(
     hamil: Hamiltonian,
     trial: Any,
     state: AFQMCState,
@@ -293,7 +293,7 @@ def _calc_block_energy_once_custom(
     return jnp.sum(state.weights * e_loc) / wsum
 
 
-def _orthonormalize_custom(
+def _orthonormalize_stochastic(
     trial: Any,
     state: AFQMCState,
     do_ortho: jnp.ndarray,
@@ -335,7 +335,7 @@ def _orthonormalize_custom(
     return lax.cond(do_ortho, _apply, lambda _: state, operand=None)
 
 
-def _scan_steps_custom(
+def _scan_steps_stochastic(
     state: AFQMCState,
     hamil: Hamiltonian,
     trial: Any,
@@ -350,10 +350,10 @@ def _scan_steps_custom(
 
     def body(carry, _):
         st, idx = carry
-        st = _propagate_step_custom(hamil, trial, st, prop_data, cfg)
+        st = _propagate_step_stochastic(hamil, trial, st, prop_data, cfg)
         if ortho_freq_i > 0:
             do_ortho = ((step_start_i + idx + 1) % ortho_freq_i) == 0
-            st = _orthonormalize_custom(trial, st, do_ortho)
+            st = _orthonormalize_stochastic(trial, st, do_ortho)
         wsum = jnp.sum(st.weights)
         return (st, idx + 1), wsum
 
@@ -364,7 +364,7 @@ def _scan_steps_custom(
 
 
 @dataclass
-class _CustomScanRunner:
+class _StochasticScanRunner:
     """Run custom-trial propagation with scan+jit and one-way Python fallback."""
 
     hamil: Hamiltonian
@@ -380,7 +380,7 @@ class _CustomScanRunner:
         fn = self.cache.get(n_steps_i)
         if fn is None:
             fn = jax.jit(
-                lambda st, step0: _scan_steps_custom(
+                lambda st, step0: _scan_steps_stochastic(
                     st,
                     self.hamil,
                     self.trial,
@@ -405,19 +405,19 @@ class _CustomScanRunner:
                 return state
             except Exception as exc:
                 self.logger.warning(
-                    "Custom-trial %s scan-jit failed; fallback to python loop. error=%s",
+                    "Stochastic-trial %s scan-jit failed; fallback to python loop. error=%s",
                     label,
                     str(exc),
                 )
                 self.enabled = False
 
         for step in range(n_steps_i):
-            state = _propagate_step_custom(self.hamil, self.trial, state, self.prop_data, self.cfg)
+            state = _propagate_step_stochastic(self.hamil, self.trial, state, self.prop_data, self.cfg)
             if self.cfg.ortho_freq > 0 and (int(step_start) + step + 1) % self.cfg.ortho_freq == 0:
-                state = _orthonormalize_custom(self.trial, state, jnp.asarray(True))
+                state = _orthonormalize_stochastic(self.trial, state, jnp.asarray(True))
         return state
 
-def _build_initial_state_custom_multi_stochastic(
+def _build_initial_state_stochastic_multi_from_trial(
     hamil: Hamiltonian,
     trial: VAFQMCTrial,
     cfg: AFQMCConfig,
@@ -578,7 +578,7 @@ def _build_initial_state_custom_multi_stochastic(
     return prop_data, shard_local_pytrees(local_states, devices), n_devices, n_local
 
 
-def _build_initial_state_custom(
+def _build_initial_state_stochastic(
     hamil: Hamiltonian,
     trial: Any,
     cfg: AFQMCConfig,
@@ -588,15 +588,15 @@ def _build_initial_state_custom(
     walkers, key = init_walkers(trial, cfg.n_walkers, key, noise=cfg.init_noise)
     walkers = ensure_complex_walkers(walkers)
 
-    trial_state, key = _bind_trial_runtime_state_custom(trial, walkers, key)
-    sign, logov = _calc_trial_overlap_custom(trial, walkers, trial_state)
+    trial_state, key = _bind_trial_runtime_state_stochastic(trial, walkers, key)
+    sign, logov = _calc_trial_overlap_stochastic(trial, walkers, trial_state)
     sign = sign.astype(jnp.complex128)
     logov = logov.astype(jnp.float64)
     weights = jnp.ones((cfg.n_walkers,), dtype=jnp.float64)
 
     e_est_init = getattr(cfg, "e_estimate_init", None)
     if e_est_init is None:
-        e_samples = _calc_trial_local_energy_custom(hamil, trial, walkers, trial_state)
+        e_samples = _calc_trial_local_energy_stochastic(hamil, trial, walkers, trial_state)
         e_estimate = jnp.sum(e_samples) / cfg.n_walkers
     else:
         e_estimate = jnp.asarray(float(e_est_init), dtype=jnp.float64)
@@ -609,13 +609,13 @@ def _build_initial_state_custom(
         key=key,
         e_estimate=e_estimate,
         pop_control_shift=e_estimate,
-        walker_fields=_initial_walker_fields_custom(trial, trial_state),
+        walker_fields=_initial_walker_fields_stochastic(trial, trial_state),
         trial_state=trial_state,
     )
     return prop_data, state
 
 
-def _resample_state_custom(trial: Any, state: AFQMCState) -> AFQMCState:
+def _resample_state_stochastic(trial: Any, state: AFQMCState) -> AFQMCState:
     key_new, subkey = jax.random.split(state.key)
     state = AFQMCState(
         walkers=state.walkers,
@@ -631,9 +631,9 @@ def _resample_state_custom(trial: Any, state: AFQMCState) -> AFQMCState:
     return stochastic_reconfiguration(trial, state, subkey)
 
 
-def _run_steps_with_pop_control_custom(
+def _run_steps_with_pop_control_stochastic(
     state: AFQMCState,
-    runner: _CustomScanRunner,
+    runner: _StochasticScanRunner,
     *,
     n_steps: int,
     step_counter: int,
@@ -655,13 +655,13 @@ def _run_steps_with_pop_control_custom(
         steps_done += nrun
         local_step += nrun
         if do_resample and pop_freq > 0 and step_counter % pop_freq == 0:
-            state = _resample_state_custom(trial, state)
+            state = _resample_state_stochastic(trial, state)
     return state, step_counter
 
 
-def _run_custom_equilibration(
+def _run_stochastic_equilibration(
     state: AFQMCState,
-    runner: _CustomScanRunner,
+    runner: _StochasticScanRunner,
     hamil: Hamiltonian,
     trial: Any,
     cfg: AFQMCConfig,
@@ -686,7 +686,7 @@ def _run_custom_equilibration(
     while eq_done < cfg.n_eq_steps:
         nrun = min(eq_chunk, cfg.n_eq_steps - eq_done)
         if pop_freq > 0:
-            state, step_counter = _run_steps_with_pop_control_custom(
+            state, step_counter = _run_steps_with_pop_control_stochastic(
                 state,
                 runner,
                 n_steps=nrun,
@@ -700,12 +700,12 @@ def _run_custom_equilibration(
             state = runner.run_steps(state, nrun, "eql")
         eq_done += nrun
         if measure_equil_energy:
-            e_mix = _calc_mixed_energy_custom(hamil, trial, state)
+            e_mix = _calc_mixed_energy_stochastic(hamil, trial, state)
             state = update_e_estimate(state, e_mix)
             state = relax_pop_control_shift(state, e_mix)
 
         if cfg.resample and pop_freq <= 0:
-            state = _resample_state_custom(trial, state)
+            state = _resample_state_stochastic(trial, state)
 
         if log_eq:
             if measure_equil_energy:
@@ -730,7 +730,7 @@ def _run_custom_equilibration(
     return state
 
 
-def _measure_block_energy_custom(
+def _measure_block_energy_stochastic(
     hamil: Hamiltonian,
     trial: Any,
     state: AFQMCState,
@@ -765,10 +765,10 @@ def _measure_block_energy_custom(
         )
         return state, block_energy
 
-    return state, _calc_block_energy_once_custom(hamil, trial, state, cfg)
+    return state, _calc_block_energy_once_stochastic(hamil, trial, state, cfg)
 
 
-def _propagate_step_custom_multi(
+def _propagate_step_stochastic_multi(
     hamil: Hamiltonian,
     trial: Any,
     state: AFQMCState,
@@ -860,7 +860,7 @@ def _propagate_step_custom_multi(
     )
 
 
-def _single_step_custom_multi(
+def _single_step_stochastic_multi(
     state: AFQMCState,
     hamil: Hamiltonian,
     trial: Any,
@@ -870,7 +870,7 @@ def _single_step_custom_multi(
     step_start: int,
     axis_name: str,
 ) -> AFQMCState:
-    state = _propagate_step_custom_multi(
+    state = _propagate_step_stochastic_multi(
         hamil,
         trial,
         state,
@@ -881,11 +881,11 @@ def _single_step_custom_multi(
     )
     if cfg.ortho_freq > 0:
         do_ortho = ((jnp.asarray(step_start, dtype=jnp.int32) + 1) % int(cfg.ortho_freq)) == 0
-        state = _orthonormalize_custom(trial, state, do_ortho)
+        state = _orthonormalize_stochastic(trial, state, do_ortho)
     return state
 
 
-def _scan_steps_custom_multi(
+def _scan_steps_stochastic_multi(
     state: AFQMCState,
     hamil: Hamiltonian,
     trial: Any,
@@ -903,7 +903,7 @@ def _scan_steps_custom_multi(
 
     def body(carry, _):
         st, idx = carry
-        st = _propagate_step_custom_multi(
+        st = _propagate_step_stochastic_multi(
             hamil,
             trial,
             st,
@@ -914,7 +914,7 @@ def _scan_steps_custom_multi(
         )
         if ortho_freq_i > 0:
             do_ortho = ((step_start_i + idx + 1) % ortho_freq_i) == 0
-            st = _orthonormalize_custom(trial, st, do_ortho)
+            st = _orthonormalize_stochastic(trial, st, do_ortho)
         if record_wsum:
             wsum = lax.psum(jnp.sum(st.weights), axis_name)
         else:
@@ -928,7 +928,7 @@ def _scan_steps_custom_multi(
 
 
 @dataclass
-class _CustomScanRunnerMulti:
+class _StochasticScanRunnerMulti:
     hamil: Hamiltonian
     trial: Any
     prop_data: PropagationData
@@ -944,7 +944,7 @@ class _CustomScanRunnerMulti:
         fn = self.cache.get(n_steps_i)
         if fn is None:
             fn = jax.pmap(
-                lambda st, step0: _scan_steps_custom_multi(
+                lambda st, step0: _scan_steps_stochastic_multi(
                     st,
                     self.hamil,
                     self.trial,
@@ -965,7 +965,7 @@ class _CustomScanRunnerMulti:
     def _get_step(self):
         if self.step_fn is None:
             self.step_fn = jax.pmap(
-                lambda st, step0: _single_step_custom_multi(
+                lambda st, step0: _single_step_stochastic_multi(
                     st,
                     self.hamil,
                     self.trial,
@@ -991,7 +991,7 @@ class _CustomScanRunnerMulti:
                 return state
             except Exception as exc:
                 self.logger.warning(
-                    "Custom-trial %s multi-gpu scan-jit failed; fallback to pmapped step loop. error=%s",
+                    "Stochastic-trial %s multi-gpu scan-jit failed; fallback to pmapped step loop. error=%s",
                     label,
                     str(exc),
                 )
@@ -1003,19 +1003,19 @@ class _CustomScanRunnerMulti:
         return state
 
 
-def _calc_mixed_energy_custom_multi(
+def _calc_mixed_energy_stochastic_multi(
     hamil: Hamiltonian,
     trial: Any,
     state: AFQMCState,
     axis_name: str,
 ) -> Any:
-    local_num, local_den = _calc_mixed_energy_terms_custom_multi(hamil, trial, state)
+    local_num, local_den = _calc_mixed_energy_terms_stochastic_multi(hamil, trial, state)
     global_num = lax.psum(local_num, axis_name)
     global_den = jnp.maximum(lax.psum(local_den, axis_name), 1.0e-12)
     return global_num / global_den
 
 
-def _calc_mixed_energy_terms_custom_multi(
+def _calc_mixed_energy_terms_stochastic_multi(
     hamil: Hamiltonian,
     trial: Any,
     state: AFQMCState,
@@ -1029,7 +1029,7 @@ def _calc_mixed_energy_terms_custom_multi(
     return local_num, local_den
 
 
-def _measure_block_energy_custom_multi(
+def _measure_block_energy_stochastic_multi(
     hamil: Hamiltonian,
     trial: Any,
     state: AFQMCState,
@@ -1081,14 +1081,14 @@ def _measure_block_energy_custom_multi(
     return state, global_num / global_den
 
 
-def _build_initial_state_custom_multi(
+def _build_initial_state_stochastic_multi(
     hamil: Hamiltonian,
     trial: Any,
     cfg: AFQMCConfig,
 ) -> tuple[PropagationData, AFQMCState, int, int]:
     n_devices, n_local, devices = require_local_devices(cfg.n_walkers)
     if isinstance(trial, VAFQMCTrial):
-        return _build_initial_state_custom_multi_stochastic(
+        return _build_initial_state_stochastic_multi_from_trial(
             hamil,
             trial,
             cfg,
@@ -1107,14 +1107,14 @@ def _build_initial_state_custom_multi(
         with jax.default_device(dev):
             walkers, key_out = init_walkers(trial, n_local, key_i, noise=cfg.init_noise)
             walkers = ensure_complex_walkers(walkers)
-            trial_state, key_out = _bind_trial_runtime_state_custom(trial, walkers, key_out)
-            sign, logov = _calc_trial_overlap_custom(trial, walkers, trial_state)
+            trial_state, key_out = _bind_trial_runtime_state_stochastic(trial, walkers, key_out)
+            sign, logov = _calc_trial_overlap_stochastic(trial, walkers, trial_state)
             sign = sign.astype(jnp.complex128)
             logov = logov.astype(jnp.float64)
             weights = jnp.ones((n_local,), dtype=jnp.float64)
             if e_est_init is None:
                 e_local = jnp.sum(
-                    _calc_trial_local_energy_custom(hamil, trial, walkers, trial_state)
+                    _calc_trial_local_energy_stochastic(hamil, trial, walkers, trial_state)
                 )
                 e_sum_local.append(float(jax.device_get(e_local)))
             local_states.append(
@@ -1126,7 +1126,7 @@ def _build_initial_state_custom_multi(
                     key=key_out,
                     e_estimate=jnp.asarray(0.0, dtype=jnp.float64),
                     pop_control_shift=jnp.asarray(0.0, dtype=jnp.float64),
-                    walker_fields=_initial_walker_fields_custom(trial, trial_state),
+                    walker_fields=_initial_walker_fields_stochastic(trial, trial_state),
                     trial_state=trial_state,
                 )
             )
@@ -1156,9 +1156,9 @@ def _build_initial_state_custom_multi(
     return prop_data, shard_local_pytrees(local_states, devices), n_devices, n_local
 
 
-def _run_steps_with_pop_control_custom_multi(
+def _run_steps_with_pop_control_stochastic_multi(
     state: AFQMCState,
-    runner: _CustomScanRunnerMulti,
+    runner: _StochasticScanRunnerMulti,
     resample_fn: Any,
     *,
     n_steps: int,
@@ -1184,9 +1184,9 @@ def _run_steps_with_pop_control_custom_multi(
     return state, step_counter
 
 
-def _run_custom_equilibration_multi(
+def _run_stochastic_equilibration_multi(
     state: AFQMCState,
-    runner: _CustomScanRunnerMulti,
+    runner: _StochasticScanRunnerMulti,
     hamil: Hamiltonian,
     trial: Any,
     cfg: AFQMCConfig,
@@ -1212,7 +1212,7 @@ def _run_custom_equilibration_multi(
         axis_name=PMAP_AXIS_NAME,
     )
     mixed_energy_fn = jax.pmap(
-        lambda st: _calc_mixed_energy_custom_multi(
+        lambda st: _calc_mixed_energy_stochastic_multi(
             hamil,
             trial,
             st,
@@ -1242,7 +1242,7 @@ def _run_custom_equilibration_multi(
     while eq_done < cfg.n_eq_steps:
         nrun = min(eq_chunk, cfg.n_eq_steps - eq_done)
         if pop_freq > 0:
-            state, step_counter = _run_steps_with_pop_control_custom_multi(
+            state, step_counter = _run_steps_with_pop_control_stochastic_multi(
                 state,
                 runner,
                 resample_fn,
@@ -1290,7 +1290,7 @@ def _run_custom_equilibration_multi(
     return state
 
 
-def run_afqmc_custom_multi(
+def run_afqmc_stochastic_multi(
     hamil: Hamiltonian,
     trial: Any,
     cfg: AFQMCConfig,
@@ -1300,7 +1300,7 @@ def run_afqmc_custom_multi(
     return_state: bool,
     return_blocks: bool,
 ):
-    prop_data, state, n_devices, n_local = _build_initial_state_custom_multi(hamil, trial, cfg)
+    prop_data, state, n_devices, n_local = _build_initial_state_stochastic_multi(hamil, trial, cfg)
     logger.info(
         "AFQMC init: dt=%.4g walkers=%d local_walkers=%d devices=%d blocks=%d "
         "ene_measurements=%d block_steps=%d meas_samples=%d pop_freq=%d",
@@ -1320,13 +1320,13 @@ def run_afqmc_custom_multi(
         time.time() - start,
     )
 
-    runner = _CustomScanRunnerMulti(hamil, trial, prop_data, cfg, logger, cfg.n_walkers)
-    state = _run_custom_equilibration_multi(state, runner, hamil, trial, cfg, logger, start)
+    runner = _StochasticScanRunnerMulti(hamil, trial, prop_data, cfg, logger, cfg.n_walkers)
+    state = _run_stochastic_equilibration_multi(state, runner, hamil, trial, cfg, logger, start)
     is_root_process = int(jax.process_index()) == 0
     visualizer = build_energy_visualizer(
         enabled=bool(getattr(cfg, "output_visualization_enabled", False)) and is_root_process,
         logger=logger,
-        title="AFQMC Live Energy (custom)",
+        title="AFQMC Live Energy (stochastic)",
         refresh_every=int(getattr(cfg, "output_visualization_refresh_every", 1)),
         show=bool(getattr(cfg, "output_visualization_show", False)),
         save_path=getattr(cfg, "output_visualization_save_path", "eblock_afqmc.png"),
@@ -1357,7 +1357,7 @@ def run_afqmc_custom_multi(
         axis_name=PMAP_AXIS_NAME,
     )
     measure_fn = jax.pmap(
-        lambda st: _measure_block_energy_custom_multi(
+        lambda st: _measure_block_energy_stochastic_multi(
             hamil,
             trial,
             st,
@@ -1382,7 +1382,7 @@ def run_afqmc_custom_multi(
 
             for _ in range(n_ene_measurements):
                 if pop_freq > 0:
-                    state, step_counter = _run_steps_with_pop_control_custom_multi(
+                    state, step_counter = _run_steps_with_pop_control_stochastic_multi(
                         state,
                         runner,
                         resample_fn,
@@ -1463,7 +1463,7 @@ def run_afqmc_custom_multi(
     )
 
 
-def run_afqmc_custom(
+def run_afqmc_stochastic(
     hamil: Hamiltonian,
     trial: Any,
     cfg: AFQMCConfig,
@@ -1475,7 +1475,7 @@ def run_afqmc_custom(
 ):
     if bool(getattr(cfg, "multi_gpu", False)):
         if int(jax.device_count()) > 1:
-            return run_afqmc_custom_multi(
+            return run_afqmc_stochastic_multi(
                 hamil,
                 trial,
                 cfg,
@@ -1489,15 +1489,15 @@ def run_afqmc_custom(
             int(jax.device_count()),
         )
 
-    prop_data, state = _build_initial_state_custom(hamil, trial, cfg)
+    prop_data, state = _build_initial_state_stochastic(hamil, trial, cfg)
     log_init(logger, cfg, state, start)
 
-    custom_runner = _CustomScanRunner(hamil, trial, prop_data, cfg, logger)
-    state = _run_custom_equilibration(state, custom_runner, hamil, trial, cfg, logger, start)
+    stochastic_runner = _StochasticScanRunner(hamil, trial, prop_data, cfg, logger)
+    state = _run_stochastic_equilibration(state, stochastic_runner, hamil, trial, cfg, logger, start)
     visualizer = build_energy_visualizer(
         enabled=bool(getattr(cfg, "output_visualization_enabled", False)),
         logger=logger,
-        title="AFQMC Live Energy (custom)",
+        title="AFQMC Live Energy (stochastic)",
         refresh_every=int(getattr(cfg, "output_visualization_refresh_every", 1)),
         show=bool(getattr(cfg, "output_visualization_show", False)),
         save_path=getattr(cfg, "output_visualization_save_path", "eblock_afqmc.png"),
@@ -1522,9 +1522,9 @@ def run_afqmc_custom(
 
             for _ in range(n_ene_measurements):
                 if pop_freq > 0:
-                    state, step_counter = _run_steps_with_pop_control_custom(
+                    state, step_counter = _run_steps_with_pop_control_stochastic(
                         state,
-                        custom_runner,
+                        stochastic_runner,
                         n_steps=int(cfg.n_block_steps),
                         step_counter=step_counter,
                         pop_freq=pop_freq,
@@ -1533,16 +1533,16 @@ def run_afqmc_custom(
                         label="block",
                     )
                 else:
-                    state = custom_runner.run_steps(state, cfg.n_block_steps, "block")
+                    state = stochastic_runner.run_steps(state, cfg.n_block_steps, "block")
                     step_counter += int(cfg.n_block_steps)
-                state, e_i = _measure_block_energy_custom(hamil, trial, state, cfg)
+                state, e_i = _measure_block_energy_stochastic(hamil, trial, state, cfg)
                 w_i = jnp.maximum(jnp.sum(state.weights), 1.0e-12)
                 e_num = e_num + w_i * e_i
                 e_den = e_den + w_i
                 state = relax_pop_control_shift(state, e_i)
 
             if cfg.resample and pop_freq <= 0:
-                state = _resample_state_custom(trial, state)
+                state = _resample_state_stochastic(trial, state)
 
             block_energy = e_num / jnp.maximum(e_den, 1.0e-12)
             block_energies.append(block_energy)
@@ -1592,4 +1592,4 @@ def run_afqmc_custom(
     )
 
 
-__all__ = ["run_afqmc_custom", "run_afqmc_custom_multi"]
+__all__ = ["run_afqmc_stochastic", "run_afqmc_stochastic_multi"]

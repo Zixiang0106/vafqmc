@@ -20,9 +20,9 @@ from .afqmc_config import (
     stochastic_trial_default,
 )
 from ._distributed import maybe_initialize_distributed
-from .utils import build_hamiltonian_pickle, load_hamiltonian
-from .driver.custom import run_afqmc_custom
 from .driver.det import run_afqmc_det
+from .driver.stochastic import run_afqmc_stochastic
+from .utils import build_hamiltonian_pickle, load_hamiltonian
 from .trial.cassci import CASSCITrial
 from .trial.single_det import as_spin_det, is_single_det_trial
 from .trial.stochastic import VAFQMCTrial
@@ -350,7 +350,7 @@ def afqmc_energy(
             return_blocks=return_blocks,
         )
 
-    return run_afqmc_custom(
+    return run_afqmc_stochastic(
         hamil,
         trial,
         cfg_runtime,
