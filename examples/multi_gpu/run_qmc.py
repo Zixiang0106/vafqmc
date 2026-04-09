@@ -13,7 +13,7 @@ cfg.trial_type = "stochastic"
 # ---------------------------------------------------------------------------
 # Propagation
 # ---------------------------------------------------------------------------
-cfg.propagation.dt = 0.005
+cfg.propagation.dt = 0.0025
 cfg.propagation.n_walkers = 200
 cfg.propagation.n_block_steps = 50
 cfg.propagation.n_ene_measurements = 1
@@ -52,7 +52,7 @@ cfg.pop_control.max_weight = 100.0
 # ---------------------------------------------------------------------------
 # Stochastic (VAFQMC) trial
 # ---------------------------------------------------------------------------
-cfg.stochastic_trial.checkpoint = "checkpoints/checkpoint.pkl"
+cfg.stochastic_trial.checkpoint = "checkpoint.pkl"
 cfg.stochastic_trial.hparams_path = "hparams.yml"
 cfg.stochastic_trial.n_samples = 40
 cfg.stochastic_trial.burn_in = 100
@@ -66,5 +66,5 @@ cfg.stochastic_trial.init_walkers_from_trial = True
 cfg.stochastic_trial.init_walkers_infer_steps = 10
 cfg.stochastic_trial.init_walkers_burn_in = 100
 
-e, err = afqmc_energy_from_pickle("hamiltonian.pkl", cfg=cfg)
+e, err = afqmc_energy_from_pickle("AFQMC_hamiltonian.pkl", cfg=cfg)
 print("E =", float(e), "+/-", float(err))
