@@ -29,6 +29,7 @@ def propagation_default() -> ConfigDict:
             "n_eq_steps": 150,
             "measure_equil_energy": True,
             "e_estimate_init": None,
+            "multi_gpu": False,
             "ortho_freq": 10,
         }
     )
@@ -40,7 +41,6 @@ def log_default() -> ConfigDict:
             "enabled": True,
             "block_freq": 1,
             "equil_freq": 0,
-            "pop_control_stats": False,
         }
     )
 

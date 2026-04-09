@@ -8,6 +8,7 @@ from pathlib import Path
 from collections.abc import Mapping
 from typing import Any, Optional
 
+import jax
 from ml_collections import ConfigDict
 
 from ..hamiltonian import Hamiltonian
@@ -18,9 +19,10 @@ from .afqmc_config import (
     default as afqmc_default,
     stochastic_trial_default,
 )
-from .utils import build_hamiltonian_pickle, load_hamiltonian
-from .driver.custom import run_afqmc_custom
+from ._distributed import maybe_initialize_distributed
 from .driver.det import run_afqmc_det
+from .driver.stochastic import run_afqmc_stochastic
+from .utils import build_hamiltonian_pickle, load_hamiltonian
 from .trial.cassci import CASSCITrial
 from .trial.single_det import as_spin_det, is_single_det_trial
 from .trial.stochastic import VAFQMCTrial
@@ -37,6 +39,20 @@ def _get_logger(logger: Optional[logging.Logger] = None) -> logging.Logger:
         logger.addHandler(handler)
     logger.setLevel(logging.INFO)
     return logger
+
+
+def _configure_process_local_runtime(
+    cfg_runtime: ConfigDict,
+    logger: logging.Logger,
+) -> int:
+    process_index = int(jax.process_index())
+    if process_index != 0:
+        cfg_runtime.log_enabled = False
+        cfg_runtime.output_write_hparams = False
+        cfg_runtime.output_write_raw = False
+        cfg_runtime.output_visualization_enabled = False
+        logger.disabled = True
+    return process_index
 
 
 def _to_cfg(cfg: Any | None) -> ConfigDict:
@@ -95,6 +111,8 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
         p.measure_equil_energy = out.measure_equil_energy
     if "e_estimate_init" in out:
         p.e_estimate_init = out.e_estimate_init
+    if "multi_gpu" in out:
+        p.multi_gpu = out.multi_gpu
     if "ortho_freq" in out:
         p.ortho_freq = out.ortho_freq
 
@@ -104,8 +122,6 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
         pop.resample = out.resample
     if "pop_control_freq" in out:
         pop.freq = out.pop_control_freq
-    if "pop_control_log_stats" in out:
-        lg.pop_control_stats = out.pop_control_log_stats
     if "min_weight" in out:
         pop.min_weight = out.min_weight
     if "max_weight" in out:
@@ -176,6 +192,7 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
     out.n_eq_steps = int(p.n_eq_steps)
     out.measure_equil_energy = bool(p.get("measure_equil_energy", True))
     out.e_estimate_init = p.get("e_estimate_init", None)
+    out.multi_gpu = bool(p.get("multi_gpu", False))
     out.ortho_freq = int(p.ortho_freq)
 
     out.log_enabled = bool(lg.get("enabled", True))
@@ -185,7 +202,6 @@ def _runtime_cfg(cfg: ConfigDict) -> ConfigDict:
     out.init_noise = float(pop.init_noise)
     out.resample = bool(pop.resample)
     out.pop_control_freq = int(pop.get("freq", 0))
-    out.pop_control_log_stats = bool(lg.get("pop_control_stats", False))
     out.min_weight = float(pop.min_weight)
     out.max_weight = float(pop.max_weight)
     out.output_write_raw = bool(otp.get("write_raw", False))
@@ -304,6 +320,16 @@ def afqmc_energy(
     cfg_user = _to_cfg(cfg)
     cfg_runtime = _runtime_cfg(cfg_user)
     logger = _get_logger(logger)
+    if bool(getattr(cfg_runtime, "multi_gpu", False)):
+        maybe_initialize_distributed(logger)
+        process_index = _configure_process_local_runtime(cfg_runtime, logger)
+        if process_index == 0:
+            logger.info(
+                "AFQMC distributed runtime: total_devices=%d local_devices=%d processes=%d",
+                int(jax.device_count()),
+                int(jax.local_device_count()),
+                int(jax.process_count()),
+            )
     start = time.time()
 
     if bool(getattr(cfg_runtime, "output_write_hparams", False)):
@@ -324,7 +350,7 @@ def afqmc_energy(
             return_blocks=return_blocks,
         )
 
-    return run_afqmc_custom(
+    return run_afqmc_stochastic(
         hamil,
         trial,
         cfg_runtime,
@@ -344,6 +370,7 @@ def afqmc_energy_from_pickle(
     return_state: bool = False,
     return_blocks: bool = False,
 ):
+    maybe_initialize_distributed()
     hamil = load_hamiltonian(hamil_path)
     return afqmc_energy(
         hamil,

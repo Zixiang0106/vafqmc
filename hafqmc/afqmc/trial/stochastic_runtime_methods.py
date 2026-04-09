@@ -226,7 +226,7 @@ def bind_walkers(
                     "Stage-1 handoff fields ignored due to shape mismatch for bind_walkers."
                 )
 
-        if requested_burn > 0:
+        if requested_burn > 0 and bool(getattr(self, "_runtime_burnin_log_enabled", True)):
             logger.info(
                 "Burning in the trial for %d steps.",
                 requested_burn,

@@ -84,7 +84,6 @@ Tune parameters in `examples/afqmc/run_afqmc.py` (or your own script using `AFQM
 - `enabled`: global AFQMC logging switch.
 - `equil_freq`: equilibration print frequency.
 - `block_freq`: production block print frequency.
-- `pop_control_stats`: print population-control min/max/mean statistics.
 
 `output`:
 - `write_raw`, `raw_path`: write per-block raw data.

@@ -15,17 +15,24 @@ from ...sampler import choose_sampler_maker, make_batched
 from ...utils import load_pickle
 from ..utils import extract_params, load_ansatz_cfg_from_hparams, normalize_ansatz_params
 from .stochastic_internal_methods import (
+    _build_stochastic_init_context_local,
     _build_logdens,
     _calc_overlap_bundle_from_cache,
+    _clone_stochastic_trial_for_runtime_init,
     _collapse_rdm,
     _ensure_bound_pool,
+    _finalize_stochastic_walkers_local,
     _evaluate_pool_bra,
     _fields_to_flat,
     _fields_tree_to_flat,
     _get_force_bias_fn,
     _get_local_energy_fn,
     _init_pool_state,
+    _initialize_runtime_state_local,
+    _initialize_stochastic_reference_walkers_local,
+    _make_stochastic_init_infer_pm,
     _sample_pool_step,
+    _sample_stochastic_infer_local,
     _sample_walkers_from_trial,
     _update_pool_cache,
 )
@@ -290,6 +297,13 @@ class VAFQMCTrial:
     _fields_to_flat = _fields_to_flat
     _fields_tree_to_flat = _fields_tree_to_flat
     _sample_walkers_from_trial = _sample_walkers_from_trial
+    _clone_stochastic_trial_for_runtime_init = _clone_stochastic_trial_for_runtime_init
+    _make_stochastic_init_infer_pm = _make_stochastic_init_infer_pm
+    _build_stochastic_init_context_local = _build_stochastic_init_context_local
+    _sample_stochastic_infer_local = _sample_stochastic_infer_local
+    _finalize_stochastic_walkers_local = _finalize_stochastic_walkers_local
+    _initialize_runtime_state_local = _initialize_runtime_state_local
+    _initialize_stochastic_reference_walkers_local = _initialize_stochastic_reference_walkers_local
     _evaluate_pool_bra = _evaluate_pool_bra
     _update_pool_cache = _update_pool_cache
     _init_pool_state = _init_pool_state
